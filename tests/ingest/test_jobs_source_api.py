@@ -232,3 +232,23 @@ def test_health_returns_503_when_db_probe_fails(api, monkeypatch):
     assert body["queue_depth"] is None
     assert body["embed_model"] == "bge-m3"
     assert HEALTH_KEYS <= set(body)
+
+
+def test_health_returns_503_when_stats_raises(api, monkeypatch):
+    make, _ = api
+    client = make("wang")
+    from app import server
+
+    class _Service:
+        def stats(self):
+            raise RuntimeError("db gone")
+
+    monkeypatch.setattr(server, "_service", _Service())
+    monkeypatch.setattr(server, "_service_error", None)
+    resp = client.get("/api/health")
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["db"].startswith("error:")
+    assert HEALTH_KEYS <= set(body)

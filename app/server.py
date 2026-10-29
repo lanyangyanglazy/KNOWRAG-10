@@ -421,7 +421,25 @@ def health():
                 "queue_depth": None,
             },
         )
-    stats = _service.stats()
+    # pg 后端的 stats() 要查库：启动后数据库故障必须仍是 503，而不是 FastAPI 500。
+    try:
+        stats = _service.stats()
+    except Exception as exc:  # noqa: BLE001 - stats 在 pg 后端要查库，故障必须仍是 503
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "docs": None,
+                "chunks": None,
+                "skipped_docs": 0,
+                "skipped_files": [],
+                "max_distance": max_distance(),
+                "embed_model": None,
+                "db": f"error: {type(exc).__name__}",
+                "queue_depth": None,
+            },
+        )
     issues = stats.get("load_issues", [])
     payload = {
         "ok": True,

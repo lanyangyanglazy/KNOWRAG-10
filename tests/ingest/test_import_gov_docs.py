@@ -126,3 +126,20 @@ def test_import_dir_reports_bad_file_and_continues(conn, tmp_path, audited):
     assert by_file["good.md"]["error"] is None
     assert "classification" in by_file["bad.md"]["error"]
     assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 1
+
+
+def test_audit_failure_does_not_flip_import_result(conn, tmp_path, monkeypatch):
+    def boom(record):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(importer, "write_audit", boom)
+    path = _write(tmp_path / "测试.md")
+
+    result = importer.import_file(conn, path, settings=_settings(tmp_path))
+
+    assert result["skipped"] is False
+    assert result["error"] is None
+    assert conn.execute(
+        "SELECT count(*) AS n FROM documents").fetchone()["n"] == 1
+    assert conn.execute(
+        "SELECT count(*) AS n FROM jobs WHERE kind='embed'").fetchone()["n"] == 1

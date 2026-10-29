@@ -187,6 +187,21 @@ def test_pg_visible_documents_is_explicitly_unsupported(service):
         service.visible_documents(get_user("zhang"))
 
 
+def test_null_classification_is_never_retrievable(service, conn):
+    _seed(conn, classification=None, title="未定级")
+    user = get_user("zhang")
+
+    assert service.visible_docs(user) == []
+
+    result = service.retrieve(user, "预算")
+
+    assert result.visible_chunks == 0
+    assert result.visible_docs == 0
+    assert result.reason == "no_visible_docs"
+    assert result.docs == []
+    assert service.embedder.calls == 0
+
+
 def test_faiss_mode_reports_backend(monkeypatch):
     monkeypatch.setattr(
         rs, "build_or_load_index",

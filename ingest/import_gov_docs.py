@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -31,6 +32,8 @@ from ingest.storage import FileStore
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = BASE_DIR / "data" / "gov_docs"
 REQUIRED_FIELDS = ("doc_id", "title", "dept", "classification")
+
+logger = logging.getLogger("ingest.import")
 
 
 def _effective_date(raw, filename: str) -> date | None:
@@ -115,12 +118,16 @@ def import_file(conn: Connection, path: Path, *, created_by: str = "import",
         conn.rollback()
         raise
 
-    write_audit({
-        "event": "ingest.import", "action": "import", "actor": created_by,
-        "document_id": str(doc["id"]), "version_id": str(version["id"]),
-        "doc_id": doc_id, "file": path.name,
-        "classification": meta["classification"], "sha256": sha256,
-    })
+    # 审计是证据而非事务参与者：文档/版本/任务已提交，审计失败不能把导入翻转成失败。
+    try:
+        write_audit({
+            "event": "ingest.import", "action": "import", "actor": created_by,
+            "document_id": str(doc["id"]), "version_id": str(version["id"]),
+            "doc_id": doc_id, "file": path.name,
+            "classification": meta["classification"], "sha256": sha256,
+        })
+    except Exception as exc:  # noqa: BLE001 - 导入已提交，审计失败只影响审计文件
+        logger.warning("导入审计写入失败（数据已提交）：%s", exc)
     return {
         "file": path.name, "doc_id": doc_id,
         "document_id": str(doc["id"]), "version_id": str(version["id"]),
