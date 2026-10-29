@@ -173,12 +173,32 @@ def _drop_vba_elements(pattern: re.Pattern[bytes], data: bytes) -> bytes:
     return pattern.sub(keep, data)
 
 
+# 宏文档主部件内容类型 -> 非宏等价类型；键为全小写，匹配忽略大小写。
+_MACRO_MAIN_TYPES = {
+    b"application/vnd.ms-word.document.macroenabled.main+xml":
+        b"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    b"application/vnd.ms-excel.sheet.macroenabled.main+xml":
+        b"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+}
+_MACRO_MAIN_CT = re.compile(
+    b"|".join(re.escape(key) for key in _MACRO_MAIN_TYPES),
+    re.IGNORECASE,
+)
+
+
+def _normalize_macro_types(data: bytes) -> bytes:
+    """把 [Content_Types].xml 中宏主部件的内容类型改为非宏等价类型。"""
+    return _MACRO_MAIN_CT.sub(
+        lambda match: _MACRO_MAIN_TYPES[match.group(0).lower()], data
+    )
+
+
 def _clean_part(name: str, data: bytes) -> bytes:
     lower = name.lower()
     if lower.endswith(".rels"):
         return _drop_vba_elements(_RELATIONSHIP, data)
     if lower == "[content_types].xml":
-        return _drop_vba_elements(_OVERRIDE, data)
+        return _normalize_macro_types(_drop_vba_elements(_OVERRIDE, data))
     return data
 
 
@@ -186,9 +206,12 @@ def strip_macros(src: Path, dst: Path) -> bool:
     """复制 OOXML 归档并剥离宏部件；返回是否剥离过（False = 未发现宏部件）。
 
     对所有 ``*.rels`` 成员删除 Type/Target 引用 vbaProject 的 Relationship
-    （忽略大小写），并在 ``[Content_Types].xml`` 中删除对应 Override，
-    同时删除任意目录下的 ``vbaProject*.bin``（含签名部件）。因此 DOCX 与
-    XLSX 的产物都能被 python-docx / openpyxl 正常打开。
+    （忽略大小写），并在 ``[Content_Types].xml`` 中删除对应 Override，同时把
+    宏文档主部件的内容类型（Word ``document.macroEnabled.main+xml``、Excel
+    ``sheet.macroEnabled.main+xml``，忽略大小写）规范化为对应的非宏类型；
+    另删除任意目录下的 ``vbaProject*.bin``（含签名部件）。因此真实 .docm/.xlsm
+    改名后剥离成功时，DOCX 产物应能被 python-docx 打开，XLSX 产物应能被
+    openpyxl 打开。
 
     归档本身损坏、成员数据缺失/CRC 校验失败、目标写入 IO 失败等 zip/IO 错误
     不会返回 True 或 False，而是抛出 ``ingest.errors.Quarantined``（HTTP 423），

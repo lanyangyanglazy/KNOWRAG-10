@@ -16,15 +16,25 @@ _VBA_REL = (
     b'Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" '
     b'Target="vbaProject.bin"/>'
 )
+_DOC_MAIN_CT = (b"application/vnd.openxmlformats-officedocument"
+                b".wordprocessingml.document.main+xml")
+_MACRO_DOC_MAIN_CT = b"application/vnd.ms-word.document.macroEnabled.main+xml"
 
 
-def _build_macro_docx(path: Path) -> Path:
-    """用 python-docx 造真实 DOCX，再注入 vbaProject 部件与关系（模拟 .docm 改名）。"""
+def _build_macro_docx(path: Path, macro_main_type: bool = False) -> Path:
+    """用 python-docx 造真实 DOCX，再注入 vbaProject 部件与关系（模拟 .docm 改名）。
+
+    ``macro_main_type=True`` 时还把主文档部件的内容类型改写为 macroEnabled，
+    模拟真正的 .docm 直接改名为 .docx 的情形（仅注入 vba 部件并不够）。
+    """
     src = build_docx(path.with_suffix(".src.docx"), [(None, "hello")])
     with zipfile.ZipFile(src) as zin, zipfile.ZipFile(
             path, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
             data = zin.read(info)
+            if info.filename == "[Content_Types].xml" and macro_main_type:
+                assert _DOC_MAIN_CT in data
+                data = data.replace(_DOC_MAIN_CT, _MACRO_DOC_MAIN_CT)
             if info.filename == "word/_rels/document.xml.rels":
                 data = data.replace(b"</Relationships>",
                                     _VBA_REL + b"</Relationships>")
@@ -97,6 +107,19 @@ def test_strips_docx_macro_and_keeps_document_parseable(tmp_path):
         rels = zf.read("word/_rels/document.xml.rels").lower()
     assert b"vbaproject" not in rels
 
+    assert [p.text for p in Document(clean).paragraphs] == ["hello"]
+
+
+def test_strips_renamed_docm_and_normalizes_content_type(tmp_path):
+    path = _build_macro_docx(tmp_path / "disguised.docx", macro_main_type=True)
+    assert sniff_file(path, "disguised.docx").macro is True
+
+    clean = tmp_path / "clean.docx"
+    assert strip_macros(path, clean) is True
+    with zipfile.ZipFile(clean) as zf:
+        content_types = zf.read("[Content_Types].xml")
+    assert b"macroEnabled" not in content_types
+    assert _DOC_MAIN_CT in content_types
     assert [p.text for p in Document(clean).paragraphs] == ["hello"]
 
 
