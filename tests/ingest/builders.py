@@ -2,14 +2,19 @@ from pathlib import Path
 
 from docx import Document
 from openpyxl import Workbook
+from openpyxl.styles import Font
 
 
-def build_xlsx(path: Path, rows: list[list], sheet: str = "Sheet1") -> Path:
+def build_xlsx(path: Path, rows: list[list], sheet: str = "Sheet1",
+               bold_rows: tuple[int, ...] = ()) -> Path:
     wb = Workbook()
     ws = wb.active
     ws.title = sheet
-    for row in rows:
+    for r, row in enumerate(rows, start=1):
         ws.append(row)
+        if r in bold_rows:
+            for cell in ws[r]:
+                cell.font = Font(bold=True)
     wb.save(path)
     return path
 
