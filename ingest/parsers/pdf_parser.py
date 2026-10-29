@@ -50,8 +50,18 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
+def _display_bbox(page, bbox) -> list[float]:
+    """把 ``get_text`` 的未旋转 bbox 转成显示空间（无旋转时保持不变）。
+
+    pdfplumber 的表格 bbox 也在显示空间（``page.rotation_matrix`` 变换后）；
+    只有统一到同一坐标系，文本块与表格才能做重叠去重并正确回源。
+    """
+    rect = pymupdf.Rect(bbox) * page.rotation_matrix
+    return [float(v) for v in rect]
+
+
 def _blocks_for_page(page) -> list[dict]:
-    """抽取一页的文本块：文本、bbox、字号与加粗标记（图片块跳过）。"""
+    """抽取一页的文本块：文本、显示空间 bbox、字号与加粗标记（图片块跳过）。"""
     data = page.get_text("dict")
     result: list[dict] = []
     for block in data.get("blocks", []):
@@ -71,7 +81,7 @@ def _blocks_for_page(page) -> list[dict]:
             continue
         result.append({
             "text": text,
-            "bbox": [float(v) for v in block["bbox"]],
+            "bbox": _display_bbox(page, block["bbox"]),
             "size": max(sizes or [0.0]),
             "bold": bold,
         })
@@ -128,6 +138,8 @@ def _grid_from_extracted(name: str, extracted: list[list] | None) -> SheetGrid |
     if not any(cell.strip() for row in rows for cell in row):
         return None
     width = max(len(row) for row in rows)
+    if width < 2:  # 页面边框等单列伪表，与 DocxParser 一样丢弃
+        return None
     rows = [row + [""] * (width - len(row)) for row in rows]
     return SheetGrid(
         name=name, hidden=False,
@@ -206,13 +218,23 @@ class PdfParser:
         return None, None
 
     def _collect(self, path: Path) -> tuple[list[list[dict]], list[list[dict]],
-                                            int, int, bool]:
-        """逐页收集文本块与 pdfplumber 表格；返回 (文本, 表格, 页数, 字符数, 有图片)。"""
+                                            int, int, bool, list[Warning]]:
+        """逐页收集文本块与 pdfplumber 表格。
+
+        返回 (文本, 表格, 页数, 字符数, 有图片, 警告)。字符数同时计入表格
+        单元格文本，纯表格页才不会被误判成扫描件；表格发现/提取失败按页、
+        按表记 ``parse_partial`` 后继续，不中断整份 PDF。
+        """
         page_blocks: list[list[dict]] = []
         page_tables: list[list[dict]] = []
+        warnings: list[Warning] = []
         total_chars = 0
         has_image = False
-        with pymupdf.open(path) as doc:
+        try:
+            doc = pymupdf.open(path)
+        except Exception as exc:  # 损坏文件在打开阶段就失败，统一转 ParseError
+            raise ParseError(f"无法打开 PDF：{exc}") from exc
+        with doc:
             if doc.needs_pass:
                 raise ParseError("PDF 已加密")
             if doc.page_count > self.settings.max_pdf_pages:
@@ -222,14 +244,32 @@ class PdfParser:
                     plumber_page = plumber.pages[index]
                     table_bboxes: list[list[float]] = []
                     tables: list[dict] = []
-                    for found in plumber_page.find_tables():
+                    try:
+                        # 迭代 TableFinder 才会真正识别网格，失败按页隔离
+                        found_tables = list(plumber_page.find_tables())
+                    except Exception as exc:
+                        warnings.append(Warning(
+                            code="parse_partial",
+                            detail=f"page {index + 1} tables: {exc}"))
+                        found_tables = []
+                    for found in found_tables:
+                        try:
+                            extracted = found.extract()
+                        except Exception as exc:  # 单表提取失败同样隔离
+                            warnings.append(Warning(
+                                code="parse_partial",
+                                detail=f"page {index + 1} table: {exc}"))
+                            continue
                         grid = _grid_from_extracted(
-                            f"page{index + 1}", found.extract())
+                            f"page{index + 1}", extracted)
                         if grid is None:
                             continue
                         bbox = [float(v) for v in found.bbox]
                         table_bboxes.append(bbox)
                         tables.append({"grid": grid, "bbox": bbox})
+                        total_chars += sum(
+                            len(cell.text)
+                            for row in grid.rows for cell in row)
                     page_tables.append(tables)
                     blocks = [
                         b for b in _blocks_for_page(page)
@@ -240,13 +280,13 @@ class PdfParser:
                     total_chars += sum(len(b["text"]) for b in blocks)
                     has_image = has_image or bool(page.get_images())
             page_count = doc.page_count
-        return page_blocks, page_tables, page_count, total_chars, has_image
+        return page_blocks, page_tables, page_count, total_chars, has_image, \
+            warnings
 
     def parse(self, path: Path) -> DocModel:
-        page_blocks, page_tables, page_count, total_chars, has_image = \
-            self._collect(path)
+        page_blocks, page_tables, page_count, total_chars, has_image, \
+            warnings = self._collect(path)
 
-        warnings: list[Warning] = []
         if total_chars < 50 and has_image:
             warnings.append(Warning(
                 code="scanned_pdf", detail="疑似扫描件，P0 不做 OCR"))

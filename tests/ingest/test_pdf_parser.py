@@ -6,6 +6,7 @@ import pytest
 
 from ingest.config import Settings, get_settings
 from ingest.errors import TooLarge
+from ingest.parsers.base import ParseError
 from ingest.parsers.pdf_parser import PdfParser
 from ingest.parsers.table_build import build_table as real_build_table
 
@@ -113,6 +114,13 @@ def test_page_limit_is_enforced(tmp_path):
         PdfParser(settings=settings).parse(path)
 
 
+def test_corrupt_pdf_raises_parse_error(tmp_path):
+    path = tmp_path / "broken.pdf"
+    path.write_bytes(b"%PDF-1.7\nbroken\n%%EOF")
+    with pytest.raises(ParseError):
+        PdfParser().parse(path)
+
+
 def test_table_is_extracted_with_bbox(tmp_path):
     import pymupdf as fitz
 
@@ -140,13 +148,74 @@ def test_table_is_extracted_with_bbox(tmp_path):
     assert len(tables[0].columns) == 3
 
 
+def test_rotated_page_bboxes_use_display_space(tmp_path):
+    # 90 度旋转页：文本 bbox 与 pdfplumber 表格 bbox 必须统一到显示空间，
+    # 否则表格单元格文本会重复成段落，且回源坐标不可比。
+    import pymupdf as fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    rows = [["Dept", "Q1", "Q2"], ["A", "120", "130"], ["B", "98", "101"]]
+    _draw_table(page, 100, rows)
+    page.insert_text((72, 50), "Report", fontname="helv", fontsize=14)
+    page.set_rotation(90)
+    path = tmp_path / "rotated.pdf"
+    doc.save(path)
+    doc.close()
+
+    model = PdfParser().parse(path)
+    tables = model.tables()
+    assert len(tables) == 1
+    assert tables[0].bbox[0] > 500  # 显示空间里表格落在页面右侧（约 x=652）
+
+    cell_fragments = ("Dept", "Q1", "Q2", "120", "130", "98", "101")
+    paragraphs = [b for b in model.blocks if b.type == "paragraph"]
+    assert not any(fragment in b.text
+                   for b in paragraphs for fragment in cell_fragments)
+
+    # 旋转后显示区域为 842 x 595；所有块 bbox 都必须落在该区域内。
+    for block in model.blocks:
+        x0, y0, x1, y1 = block.bbox
+        assert 0 <= x0 < x1 <= 842
+        assert 0 <= y0 < y1 <= 595
+
+    title = [b for b in model.blocks if b.text == "Report"]
+    assert title
+    # 未旋转空间下 x0 应为 72；归一化后约 788，只有转换过的块才会在右侧。
+    assert title[0].bbox[0] > 700
+
+
+def test_table_only_page_with_image_is_not_scanned(tmp_path):
+    # 文本全部落在表格里时，单元格字符数也要计入扫描件判定。
+    import pymupdf as fitz
+
+    doc = fitz.open()
+    page = doc.new_page()
+    rows = [["Department", "First Quarter", "Second Quarter"],
+            ["Administration", "120", "130"],
+            ["Finance", "98", "101"]]
+    _draw_table(page, 100, rows)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 20, 20), False)
+    page.insert_image(fitz.Rect(420, 420, 440, 440), pixmap=pix)
+    path = tmp_path / "table_with_image.pdf"
+    doc.save(path)
+    doc.close()
+
+    model = PdfParser().parse(path)
+    assert len(model.tables()) == 1
+    assert not any(w.code == "scanned_pdf" for w in model.warnings)
+
+
 def test_template_is_preferred_over_accepted_rules(tmp_path):
     # 裁决：模板 > 规则 > LLM。规则本可接受该表，模板命中后 source/confidence
     # 必须来自模板。
     path = tmp_path / "table.pdf"
     rows = [["Dept", "Q1", "Q2"], ["A", "120", "130"], ["B", "98", "101"]]
     _table_pdf(path, rows)
-    assert PdfParser().parse(path).tables()[0].source == "heuristic"
+    plain = PdfParser().parse(path)
+    assert plain.tables()[0].source == "heuristic"
+    # 规则不仅“接受”了候选，确实把第 1 行定为表头，模板优先才有意义。
+    assert plain.tables()[0].header_rows == [1]
 
     template = _template(["dept", "q1", "q2"], ["部门", "一季度", "二季度"])
     table = PdfParser(templates=[template]).parse(path).tables()[0]
