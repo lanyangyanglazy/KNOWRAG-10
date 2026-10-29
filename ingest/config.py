@@ -42,6 +42,8 @@ class Settings:
     fusion_top: int = 5
     workers: int = 2
     queue_max: int = 200
+    keep_versions: int = 3
+    keep_days: int = 180
 
     @property
     def max_file_bytes(self) -> int:
@@ -81,4 +83,6 @@ def get_settings() -> Settings:
         fusion_top=_int("FUSION_TOP", 5),
         workers=_int("INGEST_WORKERS", 2),
         queue_max=_int("INGEST_QUEUE_MAX", 200),
+        keep_versions=_int("INGEST_KEEP_VERSIONS", 3),
+        keep_days=_int("INGEST_KEEP_DAYS", 180),
     )

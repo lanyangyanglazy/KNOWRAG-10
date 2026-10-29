@@ -53,6 +53,11 @@ def get_version(conn: Connection, version_id: str) -> dict | None:
     return conn.execute("SELECT * FROM doc_versions WHERE id=%s", (version_id,)).fetchone()
 
 
+def lock_version(conn: Connection, version_id: str) -> dict | None:
+    return conn.execute("SELECT * FROM doc_versions WHERE id=%s FOR UPDATE",
+                        (version_id,)).fetchone()
+
+
 def list_versions(conn: Connection, document_id: str) -> list[dict]:
     return conn.execute(
         "SELECT * FROM doc_versions WHERE document_id=%s ORDER BY version_no DESC",

@@ -8,6 +8,7 @@ from psycopg import Connection
 
 from app.audit import write_audit
 from ingest import repository as repo
+from ingest.activation import activate_version, purge_document
 from ingest.config import Settings, get_settings
 from ingest.embedding import embed_version
 from ingest.errors import Quarantined
@@ -192,5 +193,90 @@ def handle_embed(conn: Connection, payload: dict) -> None:
     embed_version(conn, payload["version_id"])
 
 
-HANDLERS = {"parse": handle_parse, "embed": handle_embed}
-DEAD_LETTER_HOOKS = {"parse": handle_parse_dead_letter}
+def _job_error(conn: Connection, job_id: int, default: str) -> str:
+    row = conn.execute("SELECT last_error FROM jobs WHERE id=%s",
+                       (job_id,)).fetchone()
+    return (row or {}).get("last_error") or default
+
+
+def _fail_version(conn: Connection, job: dict, *, reason: str,
+                  default: str) -> str | None:
+    """把版本标 failed 并生成 parse_warning 复核项，供嵌入/激活死信共用。
+
+    返回错误文本用于审计；数据库写入失败返回 None（连审计也放弃）。
+    文档已被 purge 时版本行不存在，必须跳过 INSERT 复核项——外键错误
+    会逃出 run_job 直接杀死 worker 循环。本函数绝不外抛。
+    """
+    version_id = job["payload"]["version_id"]
+    try:
+        error = _job_error(conn, job["id"], default)
+        if repo.get_version(conn, version_id) is None:
+            return error
+        repo.set_version_status(conn, version_id, "failed", error=error)
+        repo.ensure_review_item(conn, version_id, "parse_warning",
+                                {"reason": reason, "error": error})
+        conn.commit()
+        return error
+    except Exception:  # noqa: BLE001 - 钩子不得外抛，否则杀死 worker 循环
+        conn.rollback()
+        return None
+
+
+def handle_embed_dead_letter(conn: Connection, job: dict) -> None:
+    error = _fail_version(conn, job, reason="embed_failed", default="embed failed")
+    if error is None:
+        return
+    try:
+        write_audit({"action": "embed_failed",
+                     "version_id": str(job["payload"]["version_id"]),
+                     "detail": error})
+    except Exception:  # noqa: BLE001 - 证据已由 versions.error 与复核项持久化
+        pass
+
+
+def handle_activate(conn: Connection, payload: dict) -> None:
+    activate_version(conn, payload["version_id"])
+
+
+def handle_activate_dead_letter(conn: Connection, job: dict) -> None:
+    error = _fail_version(conn, job, reason="activate_failed",
+                          default="activate failed")
+    if error is None:
+        return
+    try:
+        write_audit({"action": "activate_failed",
+                     "version_id": str(job["payload"]["version_id"]),
+                     "detail": error})
+    except Exception:  # noqa: BLE001 - 证据已由 versions.error 与复核项持久化
+        pass
+
+
+def handle_purge(conn: Connection, payload: dict) -> None:
+    purge_document(conn, payload["document_id"])
+
+
+def handle_purge_dead_letter(conn: Connection, job: dict) -> None:
+    # 文档行仍在（墓碑），但切片/版本可能已删一半；只记录审计供人工重跑 purge。
+    # 不写数据库：进死信时 worker 已 rollback，且复发原因也可能来自数据库本身。
+    try:
+        write_audit({"action": "delete",
+                     "doc_id": job["payload"].get("document_id"),
+                     "detail": {"stage": "purge_failed", "job_id": job["id"],
+                                "error": _job_error(conn, job["id"],
+                                                    "purge failed")}})
+    except Exception:  # noqa: BLE001 - 钩子不得外抛
+        pass
+
+
+HANDLERS = {
+    "parse": handle_parse,
+    "embed": handle_embed,
+    "activate": handle_activate,
+    "purge": handle_purge,
+}
+DEAD_LETTER_HOOKS = {
+    "parse": handle_parse_dead_letter,
+    "embed": handle_embed_dead_letter,
+    "activate": handle_activate_dead_letter,
+    "purge": handle_purge_dead_letter,
+}
