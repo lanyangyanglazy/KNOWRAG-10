@@ -54,3 +54,12 @@ def test_ingest_js_calls_documented_endpoints():
     for fragment in ("/api/documents", "/api/jobs/", "/api/versions/",
                      "/api/chunks/", "/api/me"):
         assert fragment in js
+
+
+def test_ingest_controls_have_accessible_names():
+    html = client().get("/").text
+    js = client().get("/static/ingest.js").text
+    assert 'aria-label="解析进度"' in html
+    assert 'aria-describedby="ingest-job-status"' in html
+    assert 'aria-label="waive 理由"' in js
+    assert 'for="ingest-waive-reason"' in js

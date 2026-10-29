@@ -33,13 +33,36 @@
     return match ? Number(match[2]) : 1;
   };
 
+  // FastAPI 校错时 detail 是数组；拼成可读中文，避免界面显示 [object Object]
+  function formatDetail(detail) {
+    if (Array.isArray(detail)) {
+      return detail.map((entry) => {
+        if (entry == null) return "";
+        if (typeof entry !== "object") return String(entry);
+        const loc = Array.isArray(entry.loc)
+          ? entry.loc.filter((part) => part !== "body").join(".")
+          : "";
+        const msg = entry.msg || entry.message || "";
+        if (loc && msg) return `${loc}：${msg}`;
+        if (msg) return String(msg);
+        if (loc) return loc;
+        try { return JSON.stringify(entry); } catch (_) { return ""; }
+      }).filter(Boolean).join("；");
+    }
+    if (detail && typeof detail === "object") {
+      return detail.msg || detail.message || JSON.stringify(detail);
+    }
+    return detail ? String(detail) : "";
+  }
+
   async function api(path, options = {}) {
     const response = await fetch(path, { credentials: "same-origin", ...options });
     const text = await response.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = { detail: text }; }
     if (!response.ok) {
-      const error = new Error((data && (data.detail || data.code)) || `HTTP ${response.status}`);
+      const detail = data ? formatDetail(data.detail || data.code) : "";
+      const error = new Error(detail || `HTTP ${response.status}`);
       error.status = response.status;
       error.code = data && data.code;
       throw error;
@@ -47,7 +70,16 @@
     return data;
   }
 
+  // 提示条位于 #ingest-view 内；视图隐藏时先切过去，否则提示不可见
+  function revealIngestView() {
+    if (!$("ingest-view").classList.contains("hidden")) return;
+    $("login-view").classList.add("hidden");
+    $("chat-view").classList.add("hidden");
+    $("ingest-view").classList.remove("hidden");
+  }
+
   function showAlert(message, ok = false) {
+    revealIngestView();
     const el = $("ingest-alert");
     el.textContent = message;
     el.classList.toggle("ok", ok);
@@ -59,6 +91,12 @@
 
   async function open() {
     clearAlert();
+    // 每次进入文档库都重置复核/回源状态，避免复用上一次残留的复核表单
+    $("ingest-review-panel").classList.add("hidden");
+    $("ingest-source-panel").classList.add("hidden");
+    currentVersion = null;
+    currentDoc = null;
+    currentTables = [];
     try {
       me = await api("/api/me");
     } catch (err) {
@@ -76,6 +114,7 @@
 
   function close() {
     $("ingest-view").classList.add("hidden");
+    $("ingest-review-panel").classList.add("hidden");
     $("ingest-source-panel").classList.add("hidden");
     $("chat-view").classList.remove("hidden");
   }
@@ -159,11 +198,17 @@
     const docs = data.items || [];
     $("ingest-library-empty").classList.toggle("hidden", docs.length > 0);
     $("ingest-library-body").innerHTML = docs.map((doc) => {
+      // 已下线/清理中的文档不能追加版本或再次下线，只保留复核（及管理员删除）
+      const closed = doc.status === "inactive" || doc.status === "deleting";
       const actions = [
         `<button type="button" class="link-action" data-action="review">复核</button>`,
-        `<button type="button" class="link-action" data-action="version">新版本</button>`,
-        `<button type="button" class="link-action" data-action="deactivate">下线</button>`,
       ];
+      if (!closed) {
+        actions.push(
+          `<button type="button" class="link-action" data-action="version">新版本</button>`,
+          `<button type="button" class="link-action" data-action="deactivate">下线</button>`,
+        );
+      }
       if (me && (me.user.roles || []).includes("admin")) {
         actions.push(`<button type="button" class="link-action" data-action="delete">删除</button>`);
       }
@@ -185,7 +230,7 @@
     const select = $("ingest-version-target");
     const previous = select.value;
     select.innerHTML = `<option value="">新建文档</option>` + docs
-      .filter((doc) => doc.status !== "inactive")
+      .filter((doc) => doc.status !== "inactive" && doc.status !== "deleting")
       .map((doc) => `<option value="${esc(doc.id)}">${esc(doc.title)}（v${esc(doc.version_no ?? "—")}）</option>`)
       .join("");
     if ([...select.options].some((option) => option.value === previous)) {
@@ -349,17 +394,26 @@
     const roles = (me && me.user.roles) || [];
     const canReview = roles.includes("reviewer") || roles.includes("admin");
     const actionable = canReview && ["needs_review", "failed"].includes(data.status);
-    const secretPending = canReview && currentDoc.classification === 2
-      && data.status === "needs_review";
+    const openItems = data.open_items || [];
+    // 降密后文档密级已不是 2，但服务端仍要求对挂起的密级复核项再投一票
+    const secretItem = openItems.some((item) =>
+      item.kind === "classification" && item.payload &&
+      (item.payload.reason === "secret_two_person" ||
+        item.payload.reason === "secret_downgrade"));
+    const secretPending = actionable && (currentDoc.classification === 2 || secretItem);
+    // 服务端禁止 waive 任何密级复核项
+    const hasOpenClassification = openItems.some((item) => item.kind === "classification");
     $("ingest-review-actions").innerHTML = `
       <button type="button" class="btn btn-primary btn-sm" id="ingest-confirm-btn"
         ${actionable ? "" : "disabled"}>确认结构</button>
       ${secretPending ? `<button type="button" class="btn btn-outline btn-sm" id="ingest-approve-btn">秘密级二次确认</button>` : ""}
       <label class="ingest-inline"><input type="checkbox" id="ingest-review-template"> 保存为版式模板</label>
       <span class="ingest-waive">
-        <input type="text" id="ingest-waive-reason" placeholder="waive 理由">
+        <label class="ingest-inline" for="ingest-waive-reason">waive 理由</label>
+        <input type="text" id="ingest-waive-reason" placeholder="填写后申请豁免"
+               aria-label="waive 理由">
         <button type="button" class="btn btn-outline btn-sm" id="ingest-waive-btn"
-          ${actionable && currentDoc.classification !== 2 ? "" : "disabled"}>申请豁免</button>
+          ${actionable && currentDoc.classification !== 2 && !hasOpenClassification ? "" : "disabled"}>申请豁免</button>
       </span>`;
     $("ingest-confirm-btn").addEventListener("click", submitConfirm);
     if ($("ingest-approve-btn")) $("ingest-approve-btn").addEventListener("click", submitApprove);
@@ -493,17 +547,12 @@
         <p class="ingest-hint">${esc(data.filename)} · ${esc(locator.chunk_type || "正文")}</p>
         <p class="ingest-source-locator">${esc(parts.join(" · ") || "该切片没有可定位的结构信息")}</p>
         <pre class="ingest-source-content">${esc(data.content)}</pre>`;
-      if (!me) {
-        await open();
-      } else {
-        $("login-view").classList.add("hidden");
-        $("chat-view").classList.add("hidden");
-        $("ingest-view").classList.remove("hidden");
-        await loadLibrary();
-      }
+      // 统一经 open() 进入文档库：会重置复核台状态，避免残留上一次的复核表单
+      await open();
       $("ingest-source-panel").classList.remove("hidden");
       $("ingest-source-panel").scrollIntoView({ block: "start", behavior: "smooth" });
     } catch (err) {
+      if (err.status === 401) return location.reload();
       showAlert(err.message || "无法定位原文");
     }
   }

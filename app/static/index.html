@@ -699,7 +699,8 @@
             <button type="submit" class="btn btn-primary btn-sm" id="ingest-submit">上传并解析</button>
             <span class="ingest-hint" id="ingest-job-status"></span>
           </div>
-          <progress class="ingest-progress hidden" id="ingest-progress" max="100" value="0"></progress>
+          <progress class="ingest-progress hidden" id="ingest-progress" max="100" value="0"
+                    aria-label="解析进度" aria-describedby="ingest-job-status"></progress>
         </form>
       </section>
 
