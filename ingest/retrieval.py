@@ -178,7 +178,7 @@ def _fuse(dense: list[Hit], sparse: list[Hit], *, top: int) -> list[Hit]:
     return ordered[:top]
 
 
-def _expand_table_neighbors(conn: Connection, hits: list[Hit], *,
+def _expand_table_neighbors(conn: Connection, user: User, hits: list[Hit], *,
                             limit: int = NEIGHBOR_LIMIT) -> list[Hit]:
     if limit <= 0:
         return []
@@ -197,11 +197,14 @@ def _expand_table_neighbors(conn: Connection, hits: list[Hit], *,
                 WHERE c.version_id = %s AND c.chunk_type = 'table_rows'
                   AND c.active AND d.status = 'active'
                   AND d.deleted_at IS NULL
+                  AND c.classification IS NOT NULL
+                  AND c.classification <= %s
+                  AND (c.classification = 0 OR c.dept = %s)
                   AND c.metadata->>'table_key' = %s
                   AND c.ordinal = ANY(%s)
                   AND NOT (c.id = ANY(%s))
                 ORDER BY c.ordinal""",
-            (hit.version_id, table_key,
+            (hit.version_id, user.max_level, user.dept, table_key,
              [hit.ordinal - 1, hit.ordinal + 1], list(selected)),
         ).fetchall()
         for row in rows:
@@ -239,7 +242,7 @@ def retrieve(conn: Connection, user: User, query: str, *,
     outcome.best_distance = dense[0].distance if dense else None
 
     fused = _fuse(dense, sparse, top=settings.fusion_top)
-    outcome.hits = fused + _expand_table_neighbors(conn, fused)
+    outcome.hits = fused + _expand_table_neighbors(conn, user, fused)
 
     if outcome.best_distance is None:
         outcome.reason = "no_dense_hits"

@@ -66,11 +66,13 @@ def _doc(conn, *, dept="综合处", classification=1, title="预算说明"):
 
 
 def _add_chunk(conn, doc, version, ordinal, content, vector, *,
-               chunk_type="text", extra=None, active=True):
+               chunk_type="text", extra=None, active=True,
+               classification=None):
+    level = doc["classification"] if classification is None else classification
     chunk_id = f"{doc['id']}@v1#{ordinal}"
     metadata = {
         "chunk_id": chunk_id, "chunk_type": chunk_type, "title": doc["title"],
-        "dept": doc["dept"], "classification": doc["classification"],
+        "dept": doc["dept"], "classification": level,
         "source": "a.xlsx", **(extra or {}),
     }
     tokens = " ".join(tokenize(content))
@@ -81,7 +83,7 @@ def _add_chunk(conn, doc, version, ordinal, content, vector, *,
            VALUES (%s,%s,%s,%s,%s,%s,to_tsvector('simple', %s),%s,'bge-m3',
                    %s,%s,%s,%s,%s)""",
         (doc["id"], version["id"], ordinal, chunk_type, content, tokens, tokens,
-         Vector(vector), doc["dept"], doc["classification"], Jsonb(metadata),
+         Vector(vector), doc["dept"], level, Jsonb(metadata),
          uuid.uuid4().hex + uuid.uuid4().hex, active))
     conn.commit()
     return chunk_id
@@ -122,6 +124,7 @@ def test_dense_and_sparse_fuse_by_rrf(conn):
     ids = [h.chunk_id for h in outcome.hits]
     assert ids[0] == sparse_chunk   # 双路命中，RRF 分数更高
     assert dense_chunk in ids
+    assert len(ids) == len(set(ids))   # RRF 按 chunks.id 去重
     assert outcome.sparse_hits >= 1
     assert outcome.grounded is True
 
@@ -213,3 +216,25 @@ def test_hits_carry_citation_fields(conn):
     assert hit.effective_date == ""
     assert hit.metadata["source"] == "a.xlsx"
     assert hit.expanded is False
+
+
+def test_neighbor_expansion_respects_acl(conn):
+    user = _user()
+    doc, version = _doc(conn)
+    _add_chunk(conn, doc, version, 0, "第 1-10 行 其他 内容", _vec(1),
+               chunk_type="table_rows",
+               extra={"table_key": "t1", "row_range": "1-10"})
+    _add_chunk(conn, doc, version, 1, "第 11-20 行 预算 数据", _vec(0),
+               chunk_type="table_rows",
+               extra={"table_key": "t1", "row_range": "11-20"})
+    # 同版本里混入更高密级的邻片：不得借邻片扩展泄露
+    _add_chunk(conn, doc, version, 2, "第 21-30 行 秘密 内容", _vec(2),
+               chunk_type="table_rows", classification=2,
+               extra={"table_key": "t1", "row_range": "21-30"})
+    settings = replace(get_settings(), dense_top=1, sparse_top=1)
+
+    outcome = retrieval.retrieve(conn, user, "预算", settings=settings,
+                                 embedder=FakeEmbedder(_vec(0)))
+
+    assert [h.ordinal for h in outcome.hits] == [1, 0]
+    assert [h.expanded for h in outcome.hits] == [False, True]
