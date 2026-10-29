@@ -34,6 +34,8 @@ class Settings:
     header_margin: float = 0.12
     header_llm: str = "auto"
     embed_dim: int = 1024
+    embed_model: str = "bge-m3"
+    ollama_base_url: str = "http://127.0.0.1:11434"
     embed_qps: int = 30
     dense_top: int = 50
     sparse_top: int = 50
@@ -70,6 +72,9 @@ def get_settings() -> Settings:
         header_margin=_float("HEADER_MARGIN", 0.12),
         header_llm=os.getenv("HEADER_LLM", "auto"),
         embed_dim=_int("EMBED_DIM", 1024),
+        embed_model=os.getenv("INGEST_EMBED_MODEL", "bge-m3"),
+        ollama_base_url=os.getenv("INGEST_OLLAMA_BASE_URL",
+                                  "http://127.0.0.1:11434"),
         embed_qps=_int("EMBED_QPS", 30),
         dense_top=_int("DENSE_TOP", 50),
         sparse_top=_int("SPARSE_TOP", 50),

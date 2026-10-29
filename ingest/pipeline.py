@@ -9,6 +9,7 @@ from psycopg import Connection
 from app.audit import write_audit
 from ingest import repository as repo
 from ingest.config import Settings, get_settings
+from ingest.embedding import embed_version
 from ingest.errors import Quarantined
 from ingest.parsers import get_parser
 from ingest.queue import enqueue
@@ -187,5 +188,9 @@ def handle_parse_dead_letter(conn: Connection, job: dict) -> None:
         pass
 
 
-HANDLERS = {"parse": handle_parse}
+def handle_embed(conn: Connection, payload: dict) -> None:
+    embed_version(conn, payload["version_id"])
+
+
+HANDLERS = {"parse": handle_parse, "embed": handle_embed}
 DEAD_LETTER_HOOKS = {"parse": handle_parse_dead_letter}
