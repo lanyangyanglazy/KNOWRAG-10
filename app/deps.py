@@ -63,6 +63,19 @@ def client_ip(request: Request) -> str:
     return server._client_ip(request)
 
 
+def _audit_safe(value: object) -> object:
+    """递归把审计字段规整成 JSON 可序列化值；不认识的类型原样返回。"""
+    if isinstance(value, dict):
+        return {key: _audit_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_audit_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_audit_safe(item) for item in value)
+    if isinstance(value, UUID):
+        return str(value)
+    return value
+
+
 def audit_event(request: Request, user: User, action: str, **fields) -> None:
     """
     写结构化审计。
@@ -82,7 +95,7 @@ def audit_event(request: Request, user: User, action: str, **fields) -> None:
         "ip": client_ip(request),
     }
     for key, value in fields.items():
-        record[key] = str(value) if isinstance(value, UUID) else value
+        record[key] = _audit_safe(value)
     try:
         server.write_audit(record)
     except OSError as exc:

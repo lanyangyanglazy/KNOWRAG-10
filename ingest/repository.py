@@ -60,6 +60,21 @@ def list_versions(conn: Connection, document_id: str) -> list[dict]:
     ).fetchall()
 
 
+# 详情接口用的列投影：排除 ir（可能很大且含内部结构）与 storage_path（落盘路径不外泄）。
+_VERSION_SUMMARY_FIELDS = """
+    id, document_id, version_no, sha256, filename, mime, size_bytes,
+    parser, parser_version, status, warnings, error, created_at, activated_at
+"""
+
+
+def list_version_summaries(conn: Connection, document_id: str) -> list[dict]:
+    return conn.execute(
+        f"""SELECT {_VERSION_SUMMARY_FIELDS} FROM doc_versions
+            WHERE document_id=%s ORDER BY version_no DESC""",
+        (document_id,),
+    ).fetchall()
+
+
 def set_version_status(conn: Connection, version_id: str, status: str, *,
                        ir: object = None, warnings: list | None = None,
                        error: str | None = None) -> None:

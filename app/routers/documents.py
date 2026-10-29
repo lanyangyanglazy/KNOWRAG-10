@@ -50,7 +50,7 @@ def _store(request: Request, user: User, conn: Connection, file: UploadFile,
         conn, file.file, file.filename or "", file.content_type,
         created_by=user.username, dept=target_dept, classification=level,
         effective_date=parse_date(effective_date), title=title,
-        document_id=document_id,
+        document_id=document_id, max_level=user.max_level,
     )
     audit_event(request, user, "upload", doc_id=result["document_id"],
                 version_id=result["version_id"], classification=level,
@@ -139,7 +139,7 @@ def get_document(document_id: str, user: User = Depends(current_user),
            WHERE v.document_id=%s AND r.status='open'""",
         (document_id,),
     ).fetchone()["n"]
-    return {"document": doc, "versions": repo.list_versions(conn, document_id),
+    return {"document": doc, "versions": repo.list_version_summaries(conn, document_id),
             "open_reviews": int(open_reviews)}
 
 
@@ -152,6 +152,9 @@ def deactivate(document_id: str, request: Request,
         raise HTTPException(status_code=404, detail="文档不存在")
     if not _can_manage(user, doc):
         raise HTTPException(status_code=403, detail="无权下线该文档")
+    # 管理权限之外还要求检索可见性：同部门但密级超过上限的文档同样不能下线。
+    if not _visible(user, doc):
+        raise HTTPException(status_code=403, detail="无权访问该文档")
     result = deactivate_document(conn, document_id, actor=user.username)
     audit_event(request, user, "deactivate", doc_id=document_id,
                 classification=doc["classification"])

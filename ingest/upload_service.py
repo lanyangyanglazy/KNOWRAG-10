@@ -31,6 +31,7 @@ def save_upload(conn: Connection, src: BinaryIO, filename: str,
                 content_type: str | None, *, created_by: str, dept: str,
                 classification: int | None, effective_date: date | None = None,
                 title: str | None = None, document_id: str | None = None,
+                max_level: int | None = None,
                 settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     suffix = Path(filename).suffix.lower()
@@ -68,6 +69,13 @@ def save_upload(conn: Connection, src: BinaryIO, filename: str,
             raise DocumentInactive("文档已删除，不能追加版本")
         if doc["dept"] != dept:
             raise Forbidden("只能为本部门文档追加版本")
+        if (max_level is not None and doc["classification"] is not None
+                and doc["classification"] > max_level):
+            raise Forbidden("无权访问该文档")
+        # 密级只能「未定级 → 具体值」补齐，任何已有密级的变更（含 admin）都必须走复核。
+        if (classification is not None and doc["classification"] is not None
+                and classification != doc["classification"]):
+            raise Forbidden("密级变更需走复核流程")
         updates: dict = {}
         if classification is not None:
             updates["classification"] = classification
