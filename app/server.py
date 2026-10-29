@@ -381,6 +381,9 @@ def health():
 
     原实现无论是否初始化都返回 200 + ok=false，K8s/LB 探针会把「未就绪」
     当成「健康」，流量在冷启动或 Ollama 故障时仍然打进来。
+
+    仅当配置了 INGEST_DB_URL（pg 模式）才探测数据库与队列；FAISS 单机模式下
+    没有 DB，不能因为「连不上库」把原有部署判为不健康。
     """
     if _service is None:
         return JSONResponse(
@@ -392,14 +395,32 @@ def health():
         )
     stats = _service.stats()
     issues = stats.get("load_issues", [])
-    return {
+    payload = {
         "ok": True,
         "docs": stats["docs"],
         "chunks": stats["chunks"],
         "skipped_docs": len(issues),
         "skipped_files": [item["file"] for item in issues],
         "max_distance": max_distance(),
+        # faiss 模式是 EMBED_MODEL，pg 模式是 INGEST_EMBED_MODEL——由 stats 给出，别在这里猜
+        "embed_model": stats["embed_model"],
     }
+    from ingest.config import get_settings
+
+    if get_settings().db_url:
+        try:
+            from ingest.db import connection
+            from ingest.queue import queue_depth
+
+            with connection() as conn:
+                conn.execute("SELECT 1")
+                payload["queue_depth"] = queue_depth(conn)
+            payload["db"] = "ok"
+        except Exception as exc:  # noqa: BLE001 - 探针要把依赖故障暴露为 503
+            payload["ok"] = False
+            payload["db"] = f"error: {type(exc).__name__}"
+            return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 @app.post("/api/history/clear")
@@ -592,12 +613,16 @@ if (DIST_DIR / "assets").exists():
 
 
 from app.routers import documents as documents_api
+from app.routers import jobs as jobs_api
 from app.routers import review as review_api
+from app.routers import source as source_api
 from app.routers import templates as templates_api
 
 app.include_router(documents_api.router)
 app.include_router(review_api.router)
 app.include_router(templates_api.router)
+app.include_router(jobs_api.router)
+app.include_router(source_api.router)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from urllib.parse import quote
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from ingest import repository as repo
+from ingest.queue import enqueue
+
+
+def seed_version(db_url: str, *, dept: str = "财务处",
+                 classification: int | None = 1) -> tuple[str, str]:
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        doc = repo.create_document(conn, title="预算", dept=dept,
+                                   classification=classification,
+                                   effective_date=None, created_by="wang")
+        version = repo.create_version(
+            conn, document_id=doc["id"], version_no=2, sha256="c" * 64,
+            filename="预算.xlsx", mime="application/octet-stream", size_bytes=10,
+            storage_path="cc/" + "c" * 64, parser="xlsx", parser_version="0.1.0")
+        conn.commit()
+        return doc["id"], version["id"]
+
+
+def seed_chunk(db_url: str, doc_id: str, version_id: str, *,
+               classification: int = 1, active: bool = True) -> str:
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        conn.execute(
+            """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type, content,
+                   content_tokens, embed_model, dept, classification, metadata,
+                   chunk_hash, active)
+               VALUES (%s, %s, 7, 'table_rows', '第 3-4 行：综合处 100',
+                       '第 3-4 行 综合处 100', 'bge-m3', '财务处', %s, %s, %s, %s)""",
+            (doc_id, version_id, classification,
+             Jsonb({"chunk_type": "table_rows", "sheet": "2025预算",
+                    "cell_range": "A3:B4", "row_range": "3-4"}),
+             "d" * 64, active),
+        )
+        conn.execute("UPDATE documents SET status='active', current_version_id=%s WHERE id=%s",
+                     (version_id, doc_id))
+        conn.commit()
+    return f"{doc_id}@v2#7"
+
+
+def chunk_url(chunk_id: str) -> str:
+    # chunk_id 含 `#`，直接拼 URL 会被 httpx 当成 fragment 丢掉，必须百分号编码。
+    return f"/api/chunks/{quote(chunk_id, safe='')}/source"
+
+
+def test_job_status_and_sse(api):
+    make, db_url = api
+    _, version_id = seed_version(db_url)
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        job_id = enqueue(conn, "parse", {"version_id": str(version_id)}, priority=50)
+    client = make("wang")
+
+    status = client.get(f"/api/jobs/{job_id}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "queued"
+
+    # SSE 对未完成任务会持续推送，测试只验证终态事件立即返回。
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        conn.execute("UPDATE jobs SET status='done', finished_at=now() WHERE id=%s", (job_id,))
+        conn.commit()
+    done = client.get(f"/api/jobs/{job_id}/events")
+    assert done.status_code == 200
+    assert "event: job.done" in done.text
+    assert '"status": "done"' in done.text
+
+
+def test_job_visibility_is_department_scoped(api):
+    make, db_url = api
+    _, version_id = seed_version(db_url)
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        job_id = enqueue(conn, "parse", {"version_id": str(version_id)}, priority=50)
+
+    li = make("li")
+    assert li.get(f"/api/jobs/{job_id}").status_code == 404
+    chen = make("chen")
+    assert chen.get(f"/api/jobs/{job_id}").status_code == 200
+
+
+def test_chunk_source_returns_locator_and_rechecks_acl(api):
+    make, db_url = api
+    doc_id, version_id = seed_version(db_url)
+    chunk_id = seed_chunk(db_url, doc_id, version_id)
+
+    wang = make("wang")
+    resp = wang.get(chunk_url(chunk_id))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["locator"]["sheet"] == "2025预算"
+    assert body["locator"]["cell_range"] == "A3:B4"
+    assert body["filename"] == "预算.xlsx"
+
+    zhang = make("zhang")  # 综合处：内部级不可见
+    assert zhang.get(chunk_url(chunk_id)).status_code == 404
+    assert wang.get("/api/chunks/not-a-chunk-id/source").status_code == 404
+
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        conn.execute("UPDATE chunks SET active=false")
+        conn.commit()
+    assert wang.get(chunk_url(chunk_id)).status_code == 404
+
+
+def test_public_chunk_is_visible_cross_department(api):
+    make, db_url = api
+    doc_id, version_id = seed_version(db_url, classification=0)
+    chunk_id = seed_chunk(db_url, doc_id, version_id, classification=0)
+
+    zhang = make("zhang")
+    assert zhang.get(chunk_url(chunk_id)).status_code == 200
+
+
+def test_health_reports_db_and_queue(api, monkeypatch):
+    make, _ = api
+    client = make("wang")
+    from app import server
+
+    class _Service:
+        def stats(self):
+            # health() 直接透传 stats 的 embed_model：faiss=bge-m3、pg=INGEST_EMBED_MODEL
+            return {"docs": 0, "chunks": 0, "embed_model": "bge-m3"}
+
+    monkeypatch.setattr(server, "_service", _Service())
+    monkeypatch.setattr(server, "_service_error", None)
+    resp = client.get("/api/health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["db"] == "ok"
+    assert body["queue_depth"] == 0
+    assert body["embed_model"]
+    # 既有字段必须保留，避免前端/探针消费方回归。
+    assert body["skipped_docs"] == 0
+    assert body["skipped_files"] == []
+
+
+def test_health_returns_503_when_db_probe_fails(api, monkeypatch):
+    make, _ = api
+    client = make("wang")
+    from app import server
+    import ingest.db as ingest_db
+
+    class _Service:
+        def stats(self):
+            return {"docs": 0, "chunks": 0, "embed_model": "bge-m3"}
+
+    @contextmanager
+    def broken_connection():
+        raise RuntimeError("db down")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(server, "_service", _Service())
+    monkeypatch.setattr(server, "_service_error", None)
+    monkeypatch.setattr(ingest_db, "connection", broken_connection)
+    resp = client.get("/api/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["db"] == "error: RuntimeError"
