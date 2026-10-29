@@ -4,6 +4,22 @@
 
 > 本项目展示 RAG 系统的完整实现：文档加载 → 向量索引 → 相似度检索 → LLM 生成答案
 
+## 🏛️ 政府级扩展（试点原型，可运行）
+
+在原有教学项目之上，增加了一套**权限感知 + 审计**的政务问答原型：
+
+- 方案设计：[docs/政府级RAG改造方案.md](docs/政府级RAG改造方案.md)（现状差距、目标架构、密级治理、拒答策略、分期路线）
+- 可运行原型：[app/README.md](app/README.md)（FastAPI + SSE 流式 + 文档级 ACL + 审计日志）
+
+```bash
+# 在仓库根目录启动（需 Ollama 已运行）
+# 首次先复制 .env.example 为 .env，并设置 DEMO_PASSWORD 与 SESSION_SECRET
+uv run uvicorn app.server:app --host 127.0.0.1 --port 8000
+# 浏览器打开 http://127.0.0.1:8000 ，输入演示口令后，用不同账号对比可见范围
+```
+
+核心原则：**权限层必须位于检索层之前**——先按用户裁剪候选集，再检索，最后生成；没有依据直接拒答，不调用 LLM。浏览器页面同时解决了内置终端无法输入中文的问题。
+
 ## 🎯 项目目标
 
 - 理解 RAG（检索增强生成）的工作原理
@@ -16,10 +32,12 @@
 - **LangChain**：LLM 应用框架（核心组件 + LCEL）
 - **langchain-ollama**：Ollama 官方集成（ChatOllama / OllamaEmbeddings）
 - **langchain-deepseek**：DeepSeek 官方集成（ChatDeepSeek，可选，在线 LLM）
-- **Ollama**：本地运行 LLM（deepseek-r1:1.5b）与 Embedding（nomic-embed-text）
+- **Ollama**：本地运行 LLM（默认 deepseek-r1:1.5b，可换 qwen3:4b）与 Embedding（默认 nomic-embed-text，可换 bge-m3）
 - **FAISS**：向量数据库（稠密检索）
 - **BM25（rank-bm25）**：倒排索引（稀疏检索）
 - **jieba**：中文分词（让 BM25 在中文语料上真正生效）
+- **FastAPI + Uvicorn**：政务原型的 HTTP 服务与 SSE 流式接口
+- **itsdangerous**：签名 Cookie 会话
 - **python-dotenv**：从 .env 加载环境变量（安全管理 API Key）
 - **RRF 融合算法**：多路检索结果合并
 - **Python 3.11+**
@@ -40,6 +58,11 @@ ollama serve
 # 4. 下载所需模型（如果未安装）
 ollama pull deepseek-r1:1.5b
 ollama pull nomic-embed-text
+
+# （可选，推荐）中文效果更好的组合，然后在 .env 中指定：
+# ollama pull qwen3:4b && ollama pull bge-m3
+# OLLAMA_LLM_MODEL=qwen3:4b
+# EMBED_MODEL=bge-m3
 
 # 5.（可选）使用在线 DeepSeek 时，复制环境变量模板并填入 API Key
 cp .env.example .env
@@ -119,18 +142,27 @@ DeepSeek **不提供 Embedding API**，因此本项目在在线模式下依然�
 
 ```
 langchain-rag-tutorial/
-├── README.md              # 本文件
-├── main.py                # 主程序
-├── pyproject.toml         # 依赖配置
-├── .env.example           # 环境变量模板（复制为 .env 使用，.env 已被 gitignore）
+├── README.md                    # 本文件
+├── main.py                      # 教学主线：单文件 RAG（FAISS + BM25 + RRF + 多轮 + 流式）
+├── pyproject.toml               # 依赖配置
+├── .env.example                 # 环境变量模板（复制为 .env 使用，.env 已被 gitignore）
 ├── data/
-│   └── knowledge_base.txt # 知识库文件
-├── faiss_index/           # 持久化的向量索引（运行时生成）
-│   ├── index.faiss
-│   ├── index.pkl
-│   └── index.meta.json    # 索引指纹（内容 hash 等，用于判断是否需要重建）
-└── tests/                 # 单元测试
-    └── test_main.py
+│   ├── knowledge_base.txt       # 教学用知识库
+│   └── gov_docs/                # 政务演示语料（4 篇，front matter 标注部门与密级）
+├── app/                         # 政务试点原型（权限 + 审计 + SSE）
+│   ├── README.md
+│   ├── users.py                 # 演示用户 + can_view()
+│   ├── rag_service.py           # 密级解析 / 检索前裁剪 / 拒答 / 流式生成
+│   ├── server.py                # FastAPI 路由 / 会话 / SSE / 审计
+│   └── static/index.html        # 单页前端（无外部依赖）
+├── docs/
+│   └── 政府级RAG改造方案.md      # 差距分析、目标架构、分期路线
+├── faiss_index/                 # 教学索引（运行时生成）
+├── web_index/                   # 政务索引（运行时生成）
+├── logs/                        # 审计日志 audit.jsonl（运行时生成，已 gitignore）
+└── tests/                       # 单元测试
+    ├── test_main.py
+    └── test_web.py
 ```
 
 ## 💡 核心代码流程
@@ -155,11 +187,12 @@ langchain-rag-tutorial/
 ## 🚀 扩展方向
 
 1. **更多数据源**：PDF、Word、网页
-2. **多文档管理**：支持多个知识库
-3. **聊天历史**：支持多轮对话
-4. **Web UI**：用 Gradio 或 Streamlit 做网页界面
-5. **API 服务**：用 FastAPI 部署成 REST API
-6. **生产级混合检索**：本项目手写 RRF 便于讲清原理；落地时可直接用 LangChain 官方 [`EnsembleRetriever`](https://reference.langchain.com/python/langchain-classic/retrievers/ensemble/EnsembleRetriever)（langchain 1.x 位于 `langchain_classic` 包，内置 RRF 融合），组合 BM25 与向量检索器，省去自维护融合逻辑
+2. **多文档管理**：政务原型已按「文档 + 部门 + 密级」管理多文件语料
+3. **聊天历史**：✅ 已实现（追问改写 + 最近 3 轮）
+4. **Web UI**：✅ 已实现（`app/static/index.html`，单页、离线可用）
+5. **API 服务**：✅ 已实现（FastAPI + SSE 流式接口）
+6. **权限与审计**：✅ 试点原型（`app/`），检索前裁剪 + JSONL 审计
+7. **生产级混合检索**：本项目手写 RRF 便于讲清原理；落地时可直接用 LangChain 官方 [`EnsembleRetriever`](https://reference.langchain.com/python/langchain-classic/retrievers/ensemble/EnsembleRetriever)（langchain 1.x 位于 `langchain_classic` 包，内置 RRF 融合），组合 BM25 与向量检索器，省去自维护融合逻辑
 
 ## 📚 相关链接
 

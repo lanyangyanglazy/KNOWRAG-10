@@ -386,5 +386,105 @@ class TestIndexIntegrity:
         assert not (idx_dir / "bm25_index.pkl").exists(), "BM25 不应再持久化"
 
 
+class TestMultiTurn:
+    """测试多轮对话：追问改写与历史消息渲染"""
+
+    def test_condense_question_without_history_skips_llm(self):
+        import main
+
+        class _NoCallLLM:
+            def invoke(self, *args, **kwargs):
+                raise AssertionError("首轮无历史时不应调用 LLM")
+
+        assert main.condense_question(_NoCallLLM(), [], "什么是 RAG？") == "什么是 RAG？"
+
+    def test_condense_question_rewrites_with_history(self):
+        import main
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        class _FixedLLM:
+            def invoke(self, messages):
+                return AIMessage(content="RAG 解决了什么问题")
+
+        history = [
+            HumanMessage(content="什么是 RAG？"),
+            AIMessage(content="RAG 是检索增强生成。"),
+        ]
+        assert main.condense_question(_FixedLLM(), history, "它解决了什么问题？") == "RAG 解决了什么问题"
+
+    def test_condense_question_falls_back_when_rewrite_empty(self):
+        import main
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        class _EmptyLLM:
+            def invoke(self, messages):
+                return AIMessage(content="   ")
+
+        history = [HumanMessage(content="问"), AIMessage(content="答")]
+        assert main.condense_question(_EmptyLLM(), history, "它呢？") == "它呢？"
+
+    def test_rag_prompt_renders_history_between_system_and_human(self):
+        import main
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        history = [HumanMessage(content="问1"), AIMessage(content="答1")]
+        messages = main.RAG_PROMPT.invoke(
+            {"context": "上下文X", "question": "问题Y", "history": history}
+        ).to_messages()
+        assert [m.type for m in messages] == ["system", "human", "ai", "human"]
+        assert messages[1].content == "问1"
+        assert "上下文X" in messages[-1].content
+
+
+class TestStreaming:
+    """测试流式输出与跨分片 <think> 过滤"""
+
+    def test_strip_think_stream_across_chunks(self):
+        import main
+
+        chunks = ["<thi", "nk>推理", "过程</think>答案"]
+        assert "".join(main.strip_think_stream(chunks)) == "答案"
+
+    def test_strip_think_stream_plain_text(self):
+        import main
+
+        chunks = ["纯文本", "答案"]
+        assert "".join(main.strip_think_stream(chunks)) == "纯文本答案"
+
+    def test_answer_question_streams_and_returns_answer(self, monkeypatch, capsys):
+        import main
+        from langchain_core.messages import AIMessageChunk
+
+        monkeypatch.setattr(main, "hybrid_search", lambda *a, **k: [])
+
+        class _StreamLLM:
+            def stream(self, messages):
+                for t in ["答", "案"]:
+                    yield AIMessageChunk(content=t)
+
+            def invoke(self, messages):
+                raise AssertionError("流式路径不应调用 invoke")
+
+        answer = main.answer_question("问题", None, None, [], [], _StreamLLM(), [])
+        assert answer == "答案"
+        assert "答" in capsys.readouterr().out
+
+    def test_answer_question_returns_empty_on_interrupt(self, monkeypatch, capsys):
+        """流式中断（Ctrl+C）返回空答案，主循环据此不写入历史"""
+        import main
+        from langchain_core.messages import AIMessageChunk
+
+        monkeypatch.setattr(main, "hybrid_search", lambda *a, **k: [])
+
+        class _InterruptLLM:
+            def stream(self, messages):
+                yield AIMessageChunk(content="半")
+                raise KeyboardInterrupt
+
+        answer = main.answer_question("问题", None, None, [], [], _InterruptLLM(), [])
+        assert answer == ""
+        assert "已中断" in capsys.readouterr().out
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

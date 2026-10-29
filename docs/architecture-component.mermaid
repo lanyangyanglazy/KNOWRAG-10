@@ -1,0 +1,61 @@
+flowchart TB
+    subgraph Edge[接入层]
+        Web[单页/嵌入前端]
+        APIGW[API 网关 / 限流 / 鉴权]
+    end
+
+    subgraph App[应用服务层 无状态 / 多副本]
+        Sess[会话与多轮记忆<br/>Redis]
+        Orchestr[编排层<br/>LangGraph / LCEL]
+        Rewrite[查询改写 / 子问题分解]
+        ACL[权限前置裁剪<br/>复用 app/users.can_view]
+        Gen[生成 + 引用标注 + 拒答]
+    end
+
+    subgraph Retr[检索层]
+        Fanout[多路召回 Fan-out]
+        Dense[(稠密检索<br/>Qdrant / pgvector)]
+        Sparse[(稀疏检索<br/>BM25 / OpenSearch)]
+        SQL[(结构化检索<br/>表格/元数据)]
+        RRF[RRF 融合]
+        Rerank[Cross-Encoder Rerank]
+        Grade[相关性/忠实度门禁]
+    end
+
+    subgraph Ing[摄取流水线 异步 Worker]
+        Upload[上传 / 安全扫描]
+        Parse[解析适配器<br/>docx/xlsx/pdf]
+        Chunk[切片 / 语义分块]
+        Embd[嵌入 Batch]
+        IndexW[写索引 + 元数据]
+    end
+
+    subgraph Data[数据层]
+        PG[(PostgreSQL<br/>元数据/版本/ACL/任务队列)]
+        VDB[(向量库<br/>稠密+稀疏)]
+        ObjStore[(原件存储<br/>fs / S3 / 加密卷)]
+        Audit[(审计库<br/>JSONL / 独立加密)]
+    end
+
+    subgraph X[横切能力]
+        Cache[(缓存<br/>语义缓存/检索缓存<br/>Redis)]
+        Obs[可观测性<br/>OTel + Langfuse + Prometheus]
+        Eval[评测体系<br/>RAGAS 离线集 + CI 门禁]
+        CI[CI/CD + 容器化<br/>Docker / K8s]
+    end
+
+    Web --> APIGW --> Sess
+    Sess --> Orchestr
+    Orchestr --> Rewrite --> ACL
+    ACL --> Fanout
+    Fanout --> Dense & Sparse & SQL
+    Dense & Sparse & SQL --> RRF --> Rerank --> Grade --> Gen
+    Gen --> Web
+    Upload --> Parse --> Chunk --> Embd --> IndexW
+    IndexW --> PG & VDB & ObjStore
+    ACL -.元数据/ACL.-> PG
+    Gen -.审计.-> Audit
+    Retr -.命中缓存.-> Cache
+    Gen -.span.-> Obs
+    Eval -.回归门禁.-> CI
+    Obs -.指标.-> CI

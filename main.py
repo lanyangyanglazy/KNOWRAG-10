@@ -36,7 +36,8 @@ from typing import List
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document as LCDocument
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -96,6 +97,7 @@ CHINESE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
 RETRIEVE_K = 5   # 每个检索器取多少条
 FUSION_K = 5     # 融合后最终送给 LLM 的文档数
 RRF_K = 60       # RRF 融合参数，越大两种检索结果越均衡
+MAX_HISTORY_TURNS = 3  # 多轮对话保留的最近轮数（1 轮 = 1 问 + 1 答）
 
 
 # ============== 中文分词 ==============
@@ -406,8 +408,19 @@ def hybrid_search(vectorstore, bm25, doc_texts, documents, query: str) -> List[L
 # 用 ChatPromptTemplate 而非裸字符串，规范 system/human 角色，便于复用与切换模型。
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system", "你是一个严谨的问答助手。请只基于下面提供的上下文回答问题；"
-               "如果上下文中没有相关内容，请如实说明，不要编造。"),
+               "如果上下文中没有相关内容，请如实说明，不要编造。"
+               "如果用户的问题是对之前对话的追问，请结合对话历史理解其中的指代。"),
+    MessagesPlaceholder("history", optional=True),
     ("human", "上下文：\n{context}\n\n问题：{question}"),
+])
+
+# 追问改写 Prompt：把「它有什么缺点？」这类依赖上下文的追问还原成独立问题，
+# 否则检索环节拿到的查询里没有主语，稠密/稀疏检索都会跑偏。
+CONDENSE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "你是查询改写助手。根据对话历史，把用户最新的追问改写成一个不依赖上下文、"
+               "可独立检索的完整问题。只输出改写后的问题本身，不要解释，不要回答问题。"),
+    MessagesPlaceholder("history"),
+    ("human", "{question}"),
 ])
 
 
@@ -426,12 +439,74 @@ def clean_response(text: str) -> str:
     return cleaned or text
 
 
-def answer_question(question: str, vectorstore, bm25, doc_texts, documents, llm) -> None:
+def strip_think_stream(texts):
     """
-    回答用户问题（使用混合检索）
+    增量过滤流式文本中的 <think>...</think> 推理段，纯文本原样透传。
+
+    流式分片可能把标签切开（如 "<thi" + "nk>"），对单个分片做正则会失效，
+    所以保留最多 6 个字符的尾部缓冲，等下一个分片拼接后再判断。
     """
+    open_tag, close_tag = "<think>", "</think>"
+    buf, in_think = "", False
+
+    for text in texts:
+        buf += text or ""
+        out = []
+        while True:
+            if in_think:
+                idx = buf.find(close_tag)
+                if idx == -1:
+                    buf = buf[-(len(close_tag) - 1):]  # 只留可能是半个关闭标签的尾部
+                    break
+                buf = buf[idx + len(close_tag):]
+                in_think = False
+            else:
+                idx = buf.find(open_tag)
+                if idx == -1:
+                    keep = len(open_tag) - 1
+                    if len(buf) > keep:
+                        out.append(buf[:-keep])
+                        buf = buf[-keep:]
+                    break
+                out.append(buf[:idx])
+                buf = buf[idx + len(open_tag):]
+                in_think = True
+        if out:
+            yield "".join(out)
+
+    if buf and not in_think:
+        yield buf
+
+
+def condense_question(llm, history, question: str) -> str:
+    """
+    把依赖上下文的追问改写成独立问题（如「它有什么缺点？」→「BM25 有什么缺点？」）。
+
+    - 无历史（首轮）：原样返回，不调用 LLM，零额外开销
+    - 改写结果为空：回退原问题，避免把空字符串送去检索
+    """
+    if not history:
+        return question
+    messages = CONDENSE_PROMPT.invoke({"history": history, "question": question})
+    rewritten = clean_response(llm.invoke(messages).content).strip()
+    if not rewritten:
+        return question
+    if rewritten != question:
+        print(f"   🔀 追问改写：「{question}」→「{rewritten}」")
+    return rewritten
+
+
+def answer_question(question: str, vectorstore, bm25, doc_texts, documents, llm, history=None) -> str:
+    """
+    回答用户问题（使用混合检索 + 多轮历史），返回答案文本供主循环写入历史。
+    """
+    history = history or []
+
+    # 检索用改写后的独立问题（能处理指代），生成仍用用户原问题
+    search_query = condense_question(llm, history, question)
+
     # 混合检索 Top-K 相关文档
-    docs = hybrid_search(vectorstore, bm25, doc_texts, documents, question)
+    docs = hybrid_search(vectorstore, bm25, doc_texts, documents, search_query)
 
     # 构建上下文
     context = "\n\n".join([doc.page_content for doc in docs])
@@ -442,21 +517,40 @@ def answer_question(question: str, vectorstore, bm25, doc_texts, documents, llm)
         preview = doc.page_content[:60].replace("\n", " ")
         print(f"   [{i}] {preview}...")
 
-    # 用 ChatPromptTemplate 渲染 system + human 消息（规范的 prompt，便于复用与切换模型）
-    messages = RAG_PROMPT.invoke({"context": context, "question": question})
-    # LLM.invoke 接收消息，返回 AIMessage（本地 ChatOllama 与在线 ChatDeepSeek 均适用），取 .content 得到字符串
-    response = llm.invoke(messages)
-    # 在线 deepseek-reasoner 会把推理放进 additional_kwargs["reasoning_content"]，可选展示
-    reasoning = response.additional_kwargs.get("reasoning_content") if response.additional_kwargs else None
-    if reasoning:
-        print(f"🧠 (推理过程) {reasoning[:200]}...")
-    answer = clean_response(response.content)
-    print(f"\n✅ 答案:\n{answer}")
+    # 用 ChatPromptTemplate 渲染 system + 历史 + human 消息（规范的 prompt，便于复用与切换模型）
+    messages = RAG_PROMPT.invoke({"context": context, "question": question, "history": history})
+
+    # 流式生成：逐分片打印（过滤 <think> 推理段），同时累积完整答案写入历史
+    reasoning_parts = []
+
+    def _text_stream():
+        for chunk in llm.stream(messages):
+            # 在线 deepseek-reasoner 会把推理放进 additional_kwargs["reasoning_content"]
+            rc = chunk.additional_kwargs.get("reasoning_content") if chunk.additional_kwargs else None
+            if rc:
+                reasoning_parts.append(rc)
+            yield chunk.content or ""
+
+    print("\n✅ 答案:")
+    answer_parts = []
+    try:
+        for piece in strip_think_stream(_text_stream()):
+            print(piece, end="", flush=True)
+            answer_parts.append(piece)
+    except KeyboardInterrupt:
+        print("\n⏹ 已中断本轮生成")
+        return ""
+
+    answer = clean_response("".join(answer_parts))
+    print()
+    if reasoning_parts:
+        print(f"🧠 (推理过程) {''.join(reasoning_parts)[:200]}...")
 
     if docs:
         print("📄 参考来源：")
         for i, doc in enumerate(docs, 1):
             print(f"   [{i}] {doc.metadata.get('source', 'unknown')}")
+    return answer
 
 
 # ============== 主函数 ==============
@@ -475,24 +569,36 @@ def main():
     bm25 = bm25_data[0] if bm25_data else None
     bm25_doc_texts = bm25_data[1] if bm25_data else []
 
-    # 测试问答（演示混合检索效果，问题均能从知识库找到答案）
-    questions = [
-        "什么是 RAG？它解决了什么问题？",
-        "LangChain 有哪些核心组件？",
-        "FAISS 稠密检索和 BM25 稀疏检索有什么区别？",
-    ]
-
     print("\n" + "=" * 55)
-    print(f"💬 开始混合检索问答测试（provider={LLM_PROVIDER}）")
+    print(f"💬 混合检索问答已就绪（provider={LLM_PROVIDER}，clear 清空历史，exit 退出）")
     print("=" * 55)
 
-    for q in questions:
-        answer_question(q, vectorstore, bm25, bm25_doc_texts, documents, llm)
+    history: List = []
+    while True:
+        try:
+            question = input("\n❓ 请输入问题：").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 已退出")
+            break
+        if not question:
+            continue
+        command = question.lower()
+        if command in {"exit", "quit", "q"}:
+            print(f"👋 已退出（本次共 {len(history) // 2} 轮对话）")
+            break
+        if command in {"clear", "reset"}:
+            print(f"🧹 对话历史已清空（原 {len(history) // 2} 轮）")
+            history.clear()
+            continue
+        answer = answer_question(
+            question, vectorstore, bm25, bm25_doc_texts, documents, llm, history
+        )
+        # 记录本轮问答，并只保留最近 MAX_HISTORY_TURNS 轮，防止本地 4k 上下文被撑爆
+        # 被 Ctrl+C 中断的轮次返回空答案，不写入历史
+        if answer.strip():
+            history.extend([HumanMessage(content=question), AIMessage(content=answer)])
+            del history[: max(0, len(history) - MAX_HISTORY_TURNS * 2)]
         print("-" * 55)
-
-    print("\n" + "=" * 55)
-    print("✅ 测试完成！")
-    print("=" * 55)
 
 
 if __name__ == "__main__":

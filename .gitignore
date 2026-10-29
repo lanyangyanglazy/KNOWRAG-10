@@ -27,3 +27,10 @@ Thumbs.db
 
 # Local vector index (generated at runtime)
 faiss_index/
+web_index/
+
+# Runtime audit log (contains demo questions/answers, do not commit)
+logs/
+
+# Local agent working notes (not part of the project)
+.workbuddy/

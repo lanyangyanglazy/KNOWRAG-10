@@ -8,6 +8,8 @@ dependencies = [
     # langchain 1.x 是 API 分水岭（分包架构、ChatPromptTemplate 元组语法等），
     # 故核心包锁定 >=1.0；加 <2 上限防止未来大版本破坏示例。
     "faiss-cpu>=1.0",
+    "fastapi>=0.162.0",
+    "itsdangerous>=2.2.0",
     "jieba>=0.42",
     "langchain>=1.0,<2",
     "langchain-community>=0.4,<1",
@@ -15,10 +17,18 @@ dependencies = [
     "langchain-ollama>=1.0,<2",
     "langchain-text-splitters>=1.0,<2",
     "python-dotenv>=1.0",
+    "pyyaml>=6.0.3",
     "rank-bm25>=0.2",
+    "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=9.0.2",
 ]
+
+[tool.pytest.ini_options]
+# 让测试可以直接 import main / app（仓库根目录加入 sys.path）
+pythonpath = ["."]
+testpaths = ["tests"]
