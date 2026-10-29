@@ -56,7 +56,8 @@ def service(monkeypatch):
         "build_or_load_index",
         lambda documents, embed_model: FAISS.from_documents(documents, embed_model),
     )
-    return rs.RagService(llm=_FakeLLM(), embed_model=_FakeEmbeddings())
+    return rs.RagService(llm=_FakeLLM(), embed_model=_FakeEmbeddings(),
+                         backend="faiss")
 
 
 # ---------- 语料与密级 ----------

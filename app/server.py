@@ -100,7 +100,11 @@ def get_service() -> RagService:
                     _service_error = f"{type(exc).__name__}: {exc}"
                     raise HTTPException(
                         status_code=503,
-                        detail=f"服务初始化失败：{_service_error}。请确认 Ollama 已启动并已拉取模型。",
+                        detail=(
+                            f"服务初始化失败：{_service_error}。"
+                            "FAISS 模式请确认 Ollama 已启动并已拉取模型；"
+                            "pg 模式请确认 PostgreSQL 可连接且已执行 ingest.schema.sql。"
+                        ),
                     ) from exc
     return _service
 
