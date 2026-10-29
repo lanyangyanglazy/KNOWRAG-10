@@ -4,6 +4,7 @@ import re
 
 from psycopg import Connection
 from psycopg.types.json import Jsonb
+from pydantic import ValidationError
 
 from app.users import User
 from ingest import repository as repo
@@ -110,10 +111,16 @@ def _apply_table_patches(ir: DocModel, tables: list, settings: Settings) -> None
                         or row in rebuilt.header_rows):
                     raise ReviewRequired("footer_rows 必须落在数据区")
             # 走完整校验重建，不用 model_copy 绕过 footer/表头重叠等约束检查。
-            rebuilt = Table.model_validate({
-                **rebuilt.model_dump(),
-                "footer_rows": sorted(set(patch.footer_rows)),
-            })
+            # 校验器还会拦 footer_rows 与 repeated_header_rows 重叠：这里只换了
+            # footer_rows，失败必须转成 422 复核提示，不能让 ValidationError 漏成 500。
+            try:
+                rebuilt = Table.model_validate({
+                    **rebuilt.model_dump(),
+                    "footer_rows": sorted(set(patch.footer_rows)),
+                })
+            except ValidationError as exc:
+                raise ReviewRequired(
+                    "footer_rows 不能与表头或重复表头行重叠") from exc
         block.table = rebuilt
 
 
@@ -223,12 +230,18 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
 
 def approve(conn: Connection, version_id: str, *, user: User) -> dict:
     version, doc = load_version_for_review(conn, version_id, user, write=True)
-    if doc["classification"] != 2:
+    items = [i for i in repo.list_open_review_items(conn, version_id)
+             if i["kind"] == "classification"]
+    # 降密已落库后文档不再是秘密级，但挂着的密级复核项仍需第二票才能完成；
+    # 只有确实存在这类复核项才放行，普通文档仍拒绝走 /approve。
+    secret_item = any(
+        (item["payload"] or {}).get("reason") in ("secret_two_person", "secret_downgrade")
+        for item in items
+    )
+    if doc["classification"] != 2 and not secret_item:
         raise ReviewRequired("只有秘密级需要二次确认")
     if user.max_level < 2:
         raise Forbidden("无秘密级确认权限")
-    items = [i for i in repo.list_open_review_items(conn, version_id)
-             if i["kind"] == "classification"]
     if not items:
         raise ReviewRequired("没有待确认的密级复核项")
     item_id = items[0]["id"]

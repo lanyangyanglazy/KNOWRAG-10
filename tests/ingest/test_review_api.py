@@ -10,28 +10,47 @@ from ingest.ir import Block, Column, DocMeta, DocModel, ParserInfo, Table, Warni
 from tests.ingest.conftest import fetch_all
 
 
-def build_ir() -> DocModel:
+def build_ir(*, repeated_header: bool = False,
+             second_table: bool = False) -> DocModel:
+    rows = [["综合处", "100"], ["人事处", "90"]]
+    repeated: list[int] = []
+    if repeated_header:
+        # 数据区第二行重复表头（绝对行号 4），用于 footer 与重复表头重叠的用例。
+        rows = [["综合处", "100"], ["部门", "预算"]]
+        repeated = [4]
     table = Table(
         table_key="t1", sheet="2025预算", range="A1:B4",
         header_rows=[2], header_values=[["部门", "预算"]],
         pre_rows=[["2025年部门预算表", ""]],
         columns=[Column(key="c1", name="部门"), Column(key="c2", name="预算")],
-        rows=[["综合处", "100"], ["人事处", "90"]],
+        rows=rows, repeated_header_rows=repeated,
         confidence=0.6, source="heuristic",
         candidates=[{"start_row": 2, "depth": 1, "confidence": 0.6}],
         flags=["merged_cells"],
     )
+    blocks = [Block(block_id="b1", type="table", table=table)]
+    if second_table:
+        # 多表场景：apply_template 只为 tables[0] 保存模板，审计不应带上其余补丁表。
+        blocks.append(Block(block_id="b2", type="table", table=Table(
+            table_key="t2", sheet="2025预算", range="D1:E2",
+            header_rows=[1], header_values=[["项目", "金额"]],
+            columns=[Column(key="c1", name="项目"), Column(key="c2", name="金额")],
+            rows=[["差旅", "10"]],
+            confidence=0.5, source="heuristic",
+        )))
     return DocModel(
         parser=ParserInfo(name="xlsx", version="0.1.0"),
         meta=DocMeta(title="2025年部门预算表", source_filename="预算.xlsx",
                      sha256="b" * 64),
-        blocks=[Block(block_id="b1", type="table", table=table)],
+        blocks=blocks,
         warnings=[Warning(code="merged_cells", detail="1 个合并区间")],
     )
 
 
 def seed(db_url: str, *, classification: int | None = 1,
-         structure: bool = True, dept: str = "财务处") -> tuple[str, str]:
+         structure: bool = True, dept: str = "财务处",
+         repeated_header: bool = False,
+         second_table: bool = False) -> tuple[str, str]:
     with psycopg.connect(db_url, row_factory=dict_row) as conn:
         doc = repo.create_document(conn, title="2025年部门预算表", dept=dept,
                                    classification=classification,
@@ -40,8 +59,12 @@ def seed(db_url: str, *, classification: int | None = 1,
             conn, document_id=doc["id"], version_no=1, sha256="b" * 64,
             filename="预算.xlsx", mime="application/octet-stream", size_bytes=10,
             storage_path="bb/" + "b" * 64, parser="xlsx", parser_version="0.1.0")
-        repo.set_version_status(conn, version["id"], "needs_review", ir=build_ir(),
-                                warnings=[{"code": "merged_cells", "detail": "1 个合并区间"}])
+        repo.set_version_status(
+            conn, version["id"], "needs_review",
+            ir=build_ir(repeated_header=repeated_header,
+                        second_table=second_table),
+            warnings=[{"code": "merged_cells", "detail": "1 个合并区间"}])
+
         if structure:
             repo.ensure_review_item(conn, version["id"], "structure",
                                     {"reason": "structure", "tables": []})
@@ -151,6 +174,32 @@ def test_footer_overlap_header_rejected(api):
     assert resp.json()["code"] == "review_required"
 
 
+def test_footer_overlapping_repeated_header_returns_422(api):
+    make, db_url = api
+    _, version_id = seed(db_url, repeated_header=True)
+    client = make("wang")
+
+    # 手工范围内校验能过，但 Table 校验器会发现 row 4 同时是重复表头：
+    # 不能把 pydantic ValidationError 漏成 500，必须转成 422 复核提示。
+    resp = client.post(f"/api/versions/{version_id}/confirm", json={
+        "tables": [{
+            "table_key": "t1",
+            "header_rows": [2],
+            "columns": [{"key": "c1", "name": "部门"}, {"key": "c2", "name": "预算"}],
+            "footer_rows": [4],
+        }],
+    })
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "review_required"
+    assert "footer_rows" in resp.json()["detail"]
+
+    version = fetch_all(db_url, "SELECT status, ir FROM doc_versions")[0]
+    assert version["status"] == "needs_review"
+    table = version["ir"]["blocks"][0]["table"]
+    assert table["footer_rows"] == []
+    assert table["repeated_header_rows"] == [4]
+
+
 def test_secret_needs_two_distinct_approvers(api):
     make, db_url = api
     _, version_id = seed(db_url, classification=2, structure=False)
@@ -212,6 +261,41 @@ def test_secret_downgrade_requires_two_approvers(api):
         "classification"] == 1
     assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs WHERE kind='embed'")[0][
         "n"] == 1
+
+
+def test_approve_completes_downgrade_review(api):
+    make, db_url = api
+    _, version_id = seed(db_url, classification=2, structure=False)
+    wang = make("wang")
+
+    first = wang.post(f"/api/versions/{version_id}/confirm",
+                      json={"meta": {"classification": 1}})
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "needs_review"
+    assert first.json()["pending_approvals"] == 1
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs")[0]["n"] == 0
+
+    # 降密后文档已不是秘密级，但挂着的密级复核项仍可经 /approve 完成第二票。
+    chen = make("chen")
+    approved = chen.post(f"/api/versions/{version_id}/approve",
+                         json={"decision": "approve"})
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "embedding"
+    assert approved.json()["pending_approvals"] == 2
+    assert approved.json()["classification"] == 1
+    assert fetch_all(db_url, "SELECT status FROM doc_versions")[0][
+        "status"] == "embedding"
+    assert fetch_all(db_url, "SELECT status FROM review_items WHERE kind='classification'")[
+        0]["status"] == "resolved"
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs WHERE kind='embed'")[0][
+        "n"] == 1
+
+    # 非秘密级且没有待确认的密级复核项时，/approve 仍必须拒绝。
+    _, plain_version = seed(db_url, structure=False)
+    plain = make("wang").post(f"/api/versions/{plain_version}/approve",
+                              json={"decision": "approve"})
+    assert plain.status_code == 422
+    assert plain.json()["code"] == "review_required"
 
 
 def test_waive_requires_reason_and_secret_cannot_waive(api):
@@ -336,7 +420,7 @@ def test_apply_template_is_audited(api, tmp_path, monkeypatch):
     make, db_url = api
     audit_file = tmp_path / "template-apply-audit.jsonl"
     monkeypatch.setattr(server, "AUDIT_FILE", audit_file)
-    _, version_id = seed(db_url)
+    _, version_id = seed(db_url, second_table=True)
     client = make("wang")
 
     resp = client.post(f"/api/versions/{version_id}/confirm", json={
@@ -344,10 +428,20 @@ def test_apply_template_is_audited(api, tmp_path, monkeypatch):
             "table_key": "t1",
             "header_rows": [2],
             "columns": [{"key": "c1", "name": "部门"}, {"key": "c2", "name": "预算"}],
+        }, {
+            "table_key": "t2",
+            "header_rows": [1],
+            "columns": [{"key": "c1", "name": "项目"}, {"key": "c2", "name": "金额"}],
         }],
         "apply_template": True,
     })
     assert resp.status_code == 200, resp.text
+
+    # apply_template=True 但没有表格补丁：服务端不会保存模板，不得写假的审计事件。
+    _, empty_version = seed(db_url)
+    empty = client.post(f"/api/versions/{empty_version}/confirm",
+                        json={"apply_template": True})
+    assert empty.status_code == 200, empty.text
 
     lines = [json.loads(line) for line in
              audit_file.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -355,4 +449,5 @@ def test_apply_template_is_audited(api, tmp_path, monkeypatch):
     assert len(applied) == 1
     assert isinstance(applied[0]["version_id"], str)
     assert applied[0]["version_id"] == version_id
+    # 实际只为 tables[0] 保存了模板，审计不能把其余补丁表也算进去。
     assert applied[0]["detail"]["table_keys"] == ["t1"]

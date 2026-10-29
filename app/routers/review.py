@@ -95,11 +95,13 @@ def confirm_version(version_id: str, payload: ConfirmPayload, request: Request,
                 classification=result["classification"],
                 detail={"status": result["status"],
                         "pending_approvals": result.get("pending_approvals", 0)})
-    if payload.apply_template:
+    # 与 confirm() 的保存条件一致：没有表格补丁时不会保存模板，不能写假的审计事件；
+    # 实际只为 tables[0] 存模板，审计也只记录这一张表的 key。
+    if payload.apply_template and payload.tables:
         audit_event(request, user, "template_apply", version_id=version_id,
                     doc_id=result["document_id"],
                     classification=result["classification"],
-                    detail={"table_keys": [t.table_key for t in payload.tables]})
+                    detail={"table_keys": [payload.tables[0].table_key]})
     return result
 
 
