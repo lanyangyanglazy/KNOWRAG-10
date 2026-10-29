@@ -1,13 +1,37 @@
 import zipfile
 from dataclasses import replace
+from pathlib import Path
 
 import fitz
 import pytest
+from docx import Document
 
 from ingest.config import get_settings
 from ingest.errors import Quarantined, TooLarge, UnsupportedType
 from ingest.sniff import sniff_file, strip_macros
-from tests.ingest.builders import build_xlsx
+from tests.ingest.builders import build_docx, build_xlsx
+
+_VBA_REL = (
+    b'<Relationship Id="rIdMacro" '
+    b'Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" '
+    b'Target="vbaProject.bin"/>'
+)
+
+
+def _build_macro_docx(path: Path) -> Path:
+    """用 python-docx 造真实 DOCX，再注入 vbaProject 部件与关系（模拟 .docm 改名）。"""
+    src = build_docx(path.with_suffix(".src.docx"), [(None, "hello")])
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(
+            path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            data = zin.read(info)
+            if info.filename == "word/_rels/document.xml.rels":
+                data = data.replace(b"</Relationships>",
+                                    _VBA_REL + b"</Relationships>")
+            zout.writestr(info, data)
+        zout.writestr("word/vbaProject.bin", b"macro-payload")
+    src.unlink()
+    return path
 
 
 def test_sniffs_xlsx(tmp_path):
@@ -57,6 +81,32 @@ def test_detects_and_strips_macros(tmp_path):
     assert strip_macros(path, clean) is True
     with zipfile.ZipFile(clean) as zf:
         assert "xl/vbaProject.bin" not in zf.namelist()
+
+
+def test_strips_docx_macro_and_keeps_document_parseable(tmp_path):
+    path = _build_macro_docx(tmp_path / "a.docx")
+    result = sniff_file(path, "a.docx")
+    assert result.kind == "docx"
+    assert result.macro is True
+    assert "macro_stripped" in result.warnings
+
+    clean = tmp_path / "clean.docx"
+    assert strip_macros(path, clean) is True
+    with zipfile.ZipFile(clean) as zf:
+        assert "word/vbaProject.bin" not in zf.namelist()
+        rels = zf.read("word/_rels/document.xml.rels").lower()
+    assert b"vbaproject" not in rels
+
+    assert [p.text for p in Document(clean).paragraphs] == ["hello"]
+
+
+def test_strip_macros_quarantines_broken_archive(tmp_path):
+    broken = tmp_path / "broken.docx"
+    broken.write_bytes(b"PK\x03\x04not a real archive")
+    out = tmp_path / "out.docx"
+    with pytest.raises(Quarantined):
+        strip_macros(broken, out)
+    assert not out.exists()
 
 
 def test_encrypted_pdf_is_quarantined(tmp_path):
