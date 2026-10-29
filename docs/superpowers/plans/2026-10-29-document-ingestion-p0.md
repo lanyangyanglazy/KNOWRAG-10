@@ -6419,8 +6419,8 @@ def seed_chunk(db_url: str, doc_id: str, version_id: str, *,
                VALUES (%s, %s, 7, 'table_rows', '第 3-4 行：综合处 100',
                        '第 3-4 行 综合处 100', 'bge-m3', '财务处', %s, %s, %s, %s)""",
             (doc_id, version_id, classification,
-             {"chunk_type": "table_rows", "sheet": "2025预算",
-              "cell_range": "A3:B4", "row_range": "3-4"},
+             Jsonb({"chunk_type": "table_rows", "sheet": "2025预算",
+                    "cell_range": "A3:B4", "row_range": "3-4"}),
              "d" * 64, active),
         )
         conn.execute("UPDATE documents SET status='active', current_version_id=%s WHERE id=%s",
@@ -6440,16 +6440,14 @@ def test_job_status_and_sse(api):
     assert status.status_code == 200
     assert status.json()["status"] == "queued"
 
-    events = client.get(f"/api/jobs/{job_id}/events")
-    assert events.status_code == 200
-    assert "job.progress" in events.text
-    assert '"status": "queued"' in events.text
-
+    # SSE 对未完成任务会持续推送，测试只验证终态事件立即返回。
     with psycopg.connect(db_url, row_factory=dict_row) as conn:
         conn.execute("UPDATE jobs SET status='done', finished_at=now() WHERE id=%s", (job_id,))
         conn.commit()
     done = client.get(f"/api/jobs/{job_id}/events")
+    assert done.status_code == 200
     assert "event: job.done" in done.text
+    assert '"status": "done"' in done.text
 
 
 def test_job_visibility_is_department_scoped(api):
@@ -6737,6 +6735,2669 @@ Expected: 既有测试全绿（FAISS 模式下 `/api/health` 不探测 DB）。
 git add app/routers/jobs.py app/routers/source.py app/server.py \
   tests/ingest/test_jobs_source_api.py
 git commit -m "feat(api): 任务 SSE、健康检查与引用回源"
+```
+
+---
+
+### Task 17: 文档库与复核台前端
+
+**Files:**
+- Modify: `app/static/index.html`（导航按钮、`#ingest-view` 容器、引用 `chunk_id`、登录态切换）、`app/server.py`（静态资源路由）
+- Create: `app/static/ingest.js`、`app/static/ingest.css`、`tests/ingest/test_ui_static.py`
+
+**Interfaces:**
+- Consumes: Task 14–16 的全部 HTTP 接口；现有 `#chat-view`、`#login-view`、`renderCitations()`。
+- Produces:
+  - DOM 契约（Task 23 手工验收与后续 E2E 依赖）：`#ingest-view`、`#open-ingest-btn`、`#back-chat-btn`、`#ingest-logout-btn`、`#ingest-status`、`#ingest-alert`、`#ingest-upload-form`、`#ingest-file`、`#ingest-classification`、`#ingest-effective-date`、`#ingest-version-target`、`#ingest-version-target-wrap`、`#ingest-submit`、`#ingest-job-status`、`#ingest-progress`、`#ingest-refresh-btn`、`#ingest-library-body`、`#ingest-library-empty`、`#ingest-review-panel`、`#ingest-review-summary`、`#ingest-review-tables`、`#ingest-review-form`、`#ingest-review-title`、`#ingest-review-classification`、`#ingest-review-effective-date`、`#ingest-review-actions`、`#ingest-source-panel`、`#ingest-source-body`、`#ingest-source-close-btn`。
+  - `window.IngestUI = { open, close, showSource }`。
+  - 引用条目带 `data-chunk-id`；非空时点击打开回源面板。
+  - `GET /static/ingest.js`、`GET /static/ingest.css` 返回本地文件，无外联。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_ui_static.py`：
+
+```python
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from app import server
+
+
+def client() -> TestClient:
+    return TestClient(server.app)
+
+
+def test_index_exposes_ingest_view_and_navigation():
+    html = client().get("/").text
+    for element_id in ("ingest-view", "open-ingest-btn", "back-chat-btn",
+                       "ingest-upload-form", "ingest-library-body",
+                       "ingest-review-panel", "ingest-source-panel"):
+        assert f'id="{element_id}"' in html
+    assert 'href="/static/ingest.css"' in html
+    assert 'src="/static/ingest.js"' in html
+
+
+def test_static_assets_are_served_locally():
+    c = client()
+    js = c.get("/static/ingest.js")
+    assert js.status_code == 200
+    assert "javascript" in js.headers["content-type"]
+    assert "window.IngestUI" in js.text
+
+    css = c.get("/static/ingest.css")
+    assert css.status_code == 200
+    assert "text/css" in css.headers["content-type"]
+    assert ".ingest-grid-table" in css.text
+
+
+def test_assets_have_no_external_origins():
+    js = client().get("/static/ingest.js").text.lower()
+    css = client().get("/static/ingest.css").text.lower()
+    for text in (js, css):
+        assert "http://" not in text
+        assert "https://" not in text
+        assert "cdn." not in text
+
+
+def test_citations_carry_chunk_id_for_source_lookup():
+    html = client().get("/").text
+    assert 'data-chunk-id="${escapeHtml(it.chunk_id' in html
+    js = client().get("/static/ingest.js").text
+    assert '.cite-item[data-chunk-id]' in js
+    assert "/source" in js
+
+
+def test_ingest_js_calls_documented_endpoints():
+    js = client().get("/static/ingest.js").text
+    for fragment in ("/api/documents", "/api/jobs/", "/api/versions/",
+                     "/api/chunks/", "/api/me"):
+        assert fragment in js
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+uv run pytest tests/ingest/test_ui_static.py -v
+```
+
+Expected: FAIL，`id="ingest-view"` 不在页面中，`/static/ingest.js` 返回 404。
+
+- [ ] **Step 3: 写实现**
+
+**3.1 `app/static/index.html`**
+
+在 `<head>` 的 `</style>` 之后加样式表引用：
+
+```html
+<link rel="stylesheet" href="/static/ingest.css">
+```
+
+在 `#chat-view` 的 `masthead-actions` 里、`#logout-btn` 之前加导航按钮：
+
+```html
+<button type="button" class="btn btn-outline btn-sm" id="open-ingest-btn">文档库</button>
+```
+
+在 `#chat-view` 结束的 `</div>` 之后、`<script>` 之前插入独立视图（只放容器，内容由 `ingest.js` 渲染）：
+
+```html
+<section id="ingest-view" class="app-shell hidden" aria-labelledby="ingest-title">
+  <a class="skip-link" href="#ingest-main">跳到主要内容</a>
+  <div class="gov-strip" aria-hidden="true"></div>
+
+  <header class="masthead masthead-app">
+    <div class="masthead-inner">
+      <div class="brand">
+        <div class="brand-mark brand-mark-sm" aria-hidden="true">政务</div>
+        <div class="brand-text"><h1 class="app-title" id="ingest-title">文档摄取</h1></div>
+      </div>
+      <div class="masthead-actions">
+        <div class="identity">
+          <span class="identity-name" id="ingest-me-name">—</span>
+          <span class="identity-meta" id="ingest-me-meta">—</span>
+        </div>
+        <button type="button" class="btn btn-outline btn-sm" id="back-chat-btn">返回问答</button>
+        <button type="button" class="btn btn-outline btn-sm" id="ingest-logout-btn">退出登录</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="statusbar">
+    <div class="statusbar-inner">
+      <nav class="breadcrumb" aria-label="当前位置">首页 <span aria-hidden="true">/</span> 文档摄取</nav>
+      <p class="system-status" id="ingest-status">正在加载…</p>
+    </div>
+  </div>
+
+  <main class="ingest-main" id="ingest-main">
+    <div class="ingest-alert hidden" id="ingest-alert" role="alert"></div>
+
+    <div class="ingest-grid">
+      <section class="ingest-panel" aria-labelledby="upload-title">
+        <h2 class="ingest-h2" id="upload-title">上传与解析</h2>
+        <form class="ingest-form" id="ingest-upload-form">
+          <label class="ingest-field">文件（PDF / Word / Excel / Markdown，≤50 MB）
+            <input type="file" id="ingest-file" name="file"
+                   accept=".pdf,.docx,.doc,.xlsx,.xls,.md" required>
+          </label>
+          <label class="ingest-field">密级
+            <select id="ingest-classification" name="classification">
+              <option value="0">公开</option>
+              <option value="1" selected>内部</option>
+              <option value="2">秘密</option>
+            </select>
+          </label>
+          <label class="ingest-field">生效日期
+            <input type="date" id="ingest-effective-date" name="effective_date">
+          </label>
+          <label class="ingest-field" id="ingest-version-target-wrap">追加版本到（可选）
+            <select id="ingest-version-target" name="document_id">
+              <option value="">新建文档</option>
+            </select>
+          </label>
+          <div class="ingest-actions">
+            <button type="submit" class="btn btn-primary btn-sm" id="ingest-submit">上传并解析</button>
+            <span class="ingest-hint" id="ingest-job-status"></span>
+          </div>
+          <progress class="ingest-progress hidden" id="ingest-progress" max="100" value="0"></progress>
+        </form>
+      </section>
+
+      <section class="ingest-panel" aria-labelledby="library-title">
+        <div class="ingest-panel-head">
+          <h2 class="ingest-h2" id="library-title">文档库</h2>
+          <button type="button" class="btn btn-outline btn-sm" id="ingest-refresh-btn">刷新</button>
+        </div>
+        <div class="ingest-table-wrap">
+          <table class="ingest-table">
+            <thead>
+              <tr><th>标题</th><th>部门</th><th>密级</th><th>状态</th><th>版本</th><th>更新时间</th><th>操作</th></tr>
+            </thead>
+            <tbody id="ingest-library-body"></tbody>
+          </table>
+        </div>
+        <p class="ingest-hint" id="ingest-library-empty">暂无可见文档。</p>
+      </section>
+    </div>
+
+    <section class="ingest-panel hidden" id="ingest-review-panel" aria-labelledby="review-title">
+      <h2 class="ingest-h2" id="review-title">复核台</h2>
+      <div id="ingest-review-summary"></div>
+      <div id="ingest-review-tables"></div>
+      <div class="ingest-review-form" id="ingest-review-form">
+        <label class="ingest-field">标题
+          <input type="text" id="ingest-review-title">
+        </label>
+        <label class="ingest-field">密级
+          <select id="ingest-review-classification">
+            <option value="0">公开</option>
+            <option value="1">内部</option>
+            <option value="2">秘密</option>
+          </select>
+        </label>
+        <label class="ingest-field">生效日期
+          <input type="date" id="ingest-review-effective-date">
+        </label>
+      </div>
+      <div class="ingest-actions" id="ingest-review-actions"></div>
+    </section>
+
+    <section class="ingest-panel hidden" id="ingest-source-panel" aria-labelledby="source-title">
+      <div class="ingest-panel-head">
+        <h2 class="ingest-h2" id="source-title">引用原文</h2>
+        <button type="button" class="btn btn-outline btn-sm" id="ingest-source-close-btn">关闭</button>
+      </div>
+      <div id="ingest-source-body"></div>
+    </section>
+  </main>
+</section>
+```
+
+在页面末尾内联脚本之前加：
+
+```html
+<script src="/static/ingest.js" defer></script>
+```
+
+修改 `renderCitations()`：给 `.cite-item` 加 `data-chunk-id`（未切换 pgvector 后端前该字段为空，点击不生效）：
+
+```js
+      return `
+      <div class="cite-item" data-chunk-id="${escapeHtml(it.chunk_id || "")}">
+```
+
+修改登录态切换：`enterChat()` 显示 `chat-view` 的同时隐藏摄取视图；`showLogin()` 隐藏两个应用视图：
+
+```js
+    $("ingest-view").classList.add("hidden");
+    $("ingest-source-panel").classList.add("hidden");
+    $("login-view").classList.add("hidden");
+    $("chat-view").classList.remove("hidden");
+```
+
+```js
+  function showLogin(message) {
+    $("chat-view").classList.add("hidden");
+    $("ingest-view").classList.add("hidden");
+    $("ingest-source-panel").classList.add("hidden");
+    $("login-view").classList.remove("hidden");
+```
+
+**3.2 `app/server.py`**
+
+在 `index()` 之后加两个只读静态路由（不挂 `StaticFiles`，避免把 `index.html` 与未来文件一并暴露）：
+
+```python
+@app.get("/static/ingest.js", include_in_schema=False)
+def ingest_js() -> FileResponse:
+    return FileResponse(STATIC_DIR / "ingest.js", media_type="application/javascript")
+
+
+@app.get("/static/ingest.css", include_in_schema=False)
+def ingest_css() -> FileResponse:
+    return FileResponse(STATIC_DIR / "ingest.css", media_type="text/css")
+```
+
+**3.3 `app/static/ingest.css`**
+
+```css
+.ingest-main {
+  flex: 1; overflow: auto; padding: 20px 24px 40px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.ingest-grid {
+  display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  gap: 16px; align-items: start;
+}
+.ingest-panel {
+  background: #fff; border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px 18px;
+}
+.ingest-panel-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-bottom: 10px;
+}
+.ingest-h2 {
+  margin: 0; font-family: var(--serif); font-size: 16px;
+  font-weight: 600; letter-spacing: 1px; color: var(--blue-deep);
+}
+.ingest-form { display: flex; flex-direction: column; gap: 10px; }
+.ingest-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.ingest-field input, .ingest-field select {
+  height: 34px; padding: 0 8px; border: 1px solid var(--line-strong);
+  border-radius: var(--radius); background: #fff; color: var(--text);
+}
+.ingest-field input[type="file"] { height: auto; padding: 6px 8px; }
+.ingest-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ingest-progress { width: 100%; height: 6px; }
+.ingest-hint { margin: 0; font-size: 12px; color: var(--muted); }
+.ingest-table-wrap {
+  overflow: auto; max-height: 380px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+}
+.ingest-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ingest-table th, .ingest-table td {
+  border-bottom: 1px solid var(--line); padding: 6px 8px;
+  text-align: left; vertical-align: top;
+}
+.ingest-table thead th {
+  position: sticky; top: 0; z-index: 1; background: #f5f7fa; white-space: nowrap;
+}
+.ingest-title-cell { font-weight: 600; }
+.ingest-row-actions { display: flex; gap: 10px; white-space: nowrap; }
+.ingest-review-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+}
+.ingest-review-title {
+  margin: 0 0 4px; font-family: var(--serif); font-size: 18px; color: var(--blue-deep);
+}
+.ingest-open-items { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: var(--amber); }
+.ingest-table-card {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 10px 12px; margin-top: 12px;
+}
+.ingest-table-card-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.ingest-flag {
+  font-size: 11px; color: var(--amber); background: var(--amber-bg);
+  border: 1px solid #dfc98f; border-radius: 999px; padding: 1px 8px;
+}
+.ingest-candidates { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.ingest-candidate { font-size: 11px; }
+.ingest-grid-table tbody tr { cursor: pointer; }
+.ingest-grid-table tbody tr:hover { background: var(--blue-50); }
+.ingest-grid-table tbody tr.is-header { background: #eef4fb; }
+.ingest-pick { width: 28px; }
+.ingest-review-form {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px; margin-top: 14px;
+}
+.ingest-waive { display: inline-flex; align-items: center; gap: 8px; }
+.ingest-waive input {
+  height: 30px; padding: 0 8px; border: 1px solid var(--line-strong);
+  border-radius: var(--radius); background: #fff;
+}
+.ingest-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.ingest-source-locator { margin: 6px 0; font-size: 13px; color: var(--blue-deep); }
+.ingest-source-content {
+  margin: 8px 0 0; padding: 10px 12px; max-height: 320px; overflow: auto;
+  background: #f7f9fb; border: 1px solid var(--line); border-radius: var(--radius);
+  font-family: var(--sans); font-size: 12.5px; line-height: 1.7; white-space: pre-wrap;
+}
+.ingest-alert {
+  padding: 10px 12px; border: 1px solid #e0b2ae; border-radius: var(--radius);
+  background: var(--red-bg); color: var(--red); font-size: 13px;
+}
+.ingest-alert.ok { border-color: #a9cfae; background: var(--green-bg); color: var(--green); }
+.cite-item[data-chunk-id]:not([data-chunk-id=""]) { cursor: pointer; }
+.cite-item[data-chunk-id]:not([data-chunk-id=""]) .cite-meta::after {
+  content: " · 查看原文"; color: var(--blue);
+}
+@media (max-width: 960px) {
+  .ingest-grid { grid-template-columns: 1fr; }
+  .ingest-main { padding: 14px; }
+}
+```
+
+**3.4 `app/static/ingest.js`**
+
+```js
+(() => {
+  const LEVEL_NAME = { 0: "公开", 1: "内部", 2: "秘密" };
+  const LEVEL_CLASS = { 0: "lv0", 1: "lv1", 2: "lv2" };
+  const STATUS_NAME = {
+    uploaded: "已上传", scanning: "扫描中", parsing: "解析中",
+    needs_review: "待复核", embedding: "向量化中", ready: "就绪",
+    failed: "失败", quarantined: "已隔离",
+    draft: "草稿", active: "已激活", inactive: "已下线", deleting: "清理中",
+  };
+
+  const $ = (id) => document.getElementById(id);
+  let me = null;
+  let currentVersion = null;
+  let currentDoc = null;
+  let currentTables = [];
+
+  const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[ch]);
+  const levelName = (level) =>
+    LEVEL_NAME[level] ?? (typeof level === "string" ? level : "未定级");
+  const badge = (level) =>
+    `<span class="badge ${LEVEL_CLASS[level] || "lv2"}">${esc(levelName(level))}</span>`;
+  const fmtTime = (iso) => {
+    if (!iso) return "—";
+    const date = new Date(iso);
+    return Number.isNaN(date.getTime())
+      ? String(iso)
+      : date.toLocaleString("zh-CN", { hour12: false });
+  };
+  const rangeStart = (range) => {
+    const match = /^([A-Z]+)(\d+):/.exec(String(range || ""));
+    return match ? Number(match[2]) : 1;
+  };
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, { credentials: "same-origin", ...options });
+    const text = await response.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { detail: text }; }
+    if (!response.ok) {
+      const error = new Error((data && (data.detail || data.code)) || `HTTP ${response.status}`);
+      error.status = response.status;
+      error.code = data && data.code;
+      throw error;
+    }
+    return data;
+  }
+
+  function showAlert(message, ok = false) {
+    const el = $("ingest-alert");
+    el.textContent = message;
+    el.classList.toggle("ok", ok);
+    el.classList.remove("hidden");
+  }
+  function clearAlert() { $("ingest-alert").classList.add("hidden"); }
+
+  // 视图切换
+
+  async function open() {
+    clearAlert();
+    try {
+      me = await api("/api/me");
+    } catch (err) {
+      if (err.status === 401) return location.reload();
+      return showAlert(err.message || "无法进入文档库");
+    }
+    $("ingest-me-name").textContent = me.user.display_name;
+    $("ingest-me-meta").textContent =
+      `${me.user.dept} · 最高密级 ${me.user.max_classification}`;
+    $("login-view").classList.add("hidden");
+    $("chat-view").classList.add("hidden");
+    $("ingest-view").classList.remove("hidden");
+    try { await loadLibrary(); } catch (err) { showAlert(err.message || "加载文档库失败"); }
+  }
+
+  function close() {
+    $("ingest-view").classList.add("hidden");
+    $("ingest-source-panel").classList.add("hidden");
+    $("chat-view").classList.remove("hidden");
+  }
+
+  async function logout() {
+    try { await api("/api/logout", { method: "POST" }); } catch (_) {}
+    location.reload();
+  }
+
+  // 上传与任务
+
+  const UPLOAD_ERRORS = {
+    unsupported_type: "不支持的文件类型（仅 PDF/Word/Excel/Markdown）",
+    too_large: "文件超过大小限制",
+    duplicate_content: "该文件内容已存在，未重复入库",
+    queue_full: "任务队列已满，请稍后重试",
+    document_inactive: "目标文档已下线，不能追加版本",
+    quarantined: "文件未通过安全扫描，已隔离",
+  };
+  const uploadError = (err) => UPLOAD_ERRORS[err.code] || err.message || "上传失败";
+
+  async function submitUpload(event) {
+    event.preventDefault();
+    clearAlert();
+    const file = $("ingest-file").files[0];
+    if (!file) return showAlert("请先选择文件。");
+    const form = new FormData();
+    form.append("file", file);
+    form.append("classification", $("ingest-classification").value);
+    const effectiveDate = $("ingest-effective-date").value;
+    if (effectiveDate) form.append("effective_date", effectiveDate);
+    const target = $("ingest-version-target").value;
+    const url = target
+      ? `/api/documents/${encodeURIComponent(target)}/versions`
+      : "/api/documents";
+    $("ingest-submit").disabled = true;
+    $("ingest-job-status").textContent = "正在上传…";
+    try {
+      const result = await api(url, { method: "POST", body: form });
+      $("ingest-job-status").textContent = `任务 #${result.job_id} 已排队`;
+      await followJob(result.job_id);
+      event.target.reset();
+      $("ingest-version-target").value = "";
+      await loadLibrary();
+      showAlert(`上传完成，任务 #${result.job_id} 已结束。`, true);
+    } catch (err) {
+      showAlert(uploadError(err));
+    } finally {
+      $("ingest-submit").disabled = false;
+    }
+  }
+
+  async function followJob(jobId) {
+    const progress = $("ingest-progress");
+    progress.classList.remove("hidden");
+    progress.value = 0;
+    for (let i = 0; i < 400; i++) {
+      const job = await api(`/api/jobs/${jobId}`);
+      const label = { queued: "排队中", running: "执行中", done: "完成", failed: "失败" }[job.status] || job.status;
+      $("ingest-job-status").textContent =
+        `任务 #${jobId} · ${label} · 第 ${job.attempts} 次尝试`;
+      progress.value = job.status === "done" ? 100 : Math.min(90, 10 + job.attempts * 20);
+      if (job.status === "done") {
+        progress.classList.add("hidden");
+        return job;
+      }
+      if (job.status === "failed") {
+        progress.classList.add("hidden");
+        throw Object.assign(new Error(job.last_error || "任务失败"), { code: "job_failed" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    progress.classList.add("hidden");
+    throw Object.assign(new Error("任务仍在执行，请稍后刷新文档库"), { code: "job_timeout" });
+  }
+
+  // 文档库
+
+  async function loadLibrary() {
+    const data = await api("/api/documents?page_size=100");
+    const docs = data.items || [];
+    $("ingest-library-empty").classList.toggle("hidden", docs.length > 0);
+    $("ingest-library-body").innerHTML = docs.map((doc) => {
+      const actions = [
+        `<button type="button" class="link-action" data-action="review">复核</button>`,
+        `<button type="button" class="link-action" data-action="version">新版本</button>`,
+        `<button type="button" class="link-action" data-action="deactivate">下线</button>`,
+      ];
+      if (me && (me.user.roles || []).includes("admin")) {
+        actions.push(`<button type="button" class="link-action" data-action="delete">删除</button>`);
+      }
+      return `<tr data-doc-id="${esc(doc.id)}">
+        <td class="ingest-title-cell">${esc(doc.title)}</td>
+        <td>${esc(doc.dept)}</td>
+        <td>${badge(doc.classification)}</td>
+        <td>${esc(STATUS_NAME[doc.version_status] || doc.version_status || "—")}</td>
+        <td>v${esc(doc.version_no ?? "—")}</td>
+        <td>${esc(fmtTime(doc.updated_at))}</td>
+        <td class="ingest-row-actions">${actions.join("")}</td>
+      </tr>`;
+    }).join("");
+    fillVersionTargets(docs);
+    $("ingest-status").textContent = `共 ${data.total} 篇可见文档`;
+  }
+
+  function fillVersionTargets(docs) {
+    const select = $("ingest-version-target");
+    const previous = select.value;
+    select.innerHTML = `<option value="">新建文档</option>` + docs
+      .filter((doc) => doc.status !== "inactive")
+      .map((doc) => `<option value="${esc(doc.id)}">${esc(doc.title)}（v${esc(doc.version_no ?? "—")}）</option>`)
+      .join("");
+    if ([...select.options].some((option) => option.value === previous)) {
+      select.value = previous;
+    }
+  }
+
+  function bindLibraryActions() {
+    $("ingest-library-body").addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-action]");
+      const row = event.target.closest("tr[data-doc-id]");
+      if (!button || !row) return;
+      const docId = row.getAttribute("data-doc-id");
+      const action = button.getAttribute("data-action");
+      if (action === "review") return openReview(docId);
+      if (action === "version") {
+        $("ingest-version-target").value = docId;
+        $("ingest-file").focus();
+        return showAlert("已选择追加版本，请挑选文件后提交。", true);
+      }
+      if (action === "deactivate") {
+        if (!window.confirm("下线后该文档立即不可检索，确定继续？")) return;
+        try {
+          await api(`/api/documents/${encodeURIComponent(docId)}/deactivate`, { method: "POST" });
+          await loadLibrary();
+          showAlert("已下线。", true);
+        } catch (err) { showAlert(err.message || "下线失败"); }
+        return;
+      }
+      if (action === "delete") {
+        if (!window.confirm("删除为逻辑删除，切片将异步清理，确定继续？")) return;
+        try {
+          await api(`/api/documents/${encodeURIComponent(docId)}`, { method: "DELETE" });
+          await loadLibrary();
+          showAlert("已提交删除。", true);
+        } catch (err) { showAlert(err.message || "删除失败"); }
+      }
+    });
+  }
+
+  // 复核台
+
+  async function openReview(docId) {
+    clearAlert();
+    try {
+      const detail = await api(`/api/documents/${encodeURIComponent(docId)}`);
+      const versions = detail.versions || [];
+      if (!versions.length) return showAlert("该文档还没有版本。");
+      currentVersion = versions[0].id;
+      const data = await api(`/api/versions/${encodeURIComponent(currentVersion)}/review`);
+      renderReview(data);
+    } catch (err) {
+      showAlert(err.message || "无法打开复核台");
+    }
+  }
+
+  function renderReview(data) {
+    currentDoc = data.document;
+    currentTables = data.tables || [];
+    const panel = $("ingest-review-panel");
+    panel.classList.remove("hidden");
+    const openItems = data.open_items || [];
+    const items = openItems.map((item) =>
+      `<li>${esc(item.kind)}${item.reason ? `：${esc(item.reason)}` : ""}</li>`).join("");
+    $("ingest-review-summary").innerHTML = `
+      <div class="ingest-review-head">
+        <div>
+          <h3 class="ingest-review-title">${esc(currentDoc.title)}</h3>
+          <p class="ingest-hint">${esc(currentDoc.dept)} · 解析器 ${esc(data.parser)}
+            · 状态 ${esc(STATUS_NAME[data.status] || data.status)} · 待办 ${openItems.length} 项
+            ${currentDoc.classification === 2 ? " · 秘密级需双人确认" : ""}</p>
+        </div>
+        <button type="button" class="btn btn-outline btn-sm" id="ingest-close-review-btn">收起</button>
+      </div>
+      ${items ? `<ul class="ingest-open-items">${items}</ul>` : ""}`;
+    $("ingest-close-review-btn").addEventListener("click", () => panel.classList.add("hidden"));
+
+    $("ingest-review-tables").innerHTML = currentTables.length
+      ? currentTables.map((table, index) => tableCard(table, index)).join("")
+      : `<p class="ingest-hint">该版本没有表格，将按正文切片。</p>`;
+    bindGrid();
+
+    $("ingest-review-title").value = currentDoc.title || "";
+    $("ingest-review-classification").value = String(currentDoc.classification ?? 1);
+    $("ingest-review-effective-date").value = currentDoc.effective_date || "";
+    renderReviewActions(data);
+    panel.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
+  function tableCard(table, index) {
+    const start = rangeStart(table.range);
+    const selected = new Set(table.header_rows || []);
+    const rows = (table.grid || []).map((cells, offset) => {
+      const absolute = start + offset;
+      const isHeader = selected.has(absolute);
+      return `<tr data-row="${absolute}" class="${isHeader ? "is-header" : ""}">
+        <td class="ingest-pick"><input type="checkbox" ${isHeader ? "checked" : ""}></td>
+        <th scope="row">${absolute}</th>
+        ${cells.map((cell) => `<td>${esc(cell)}</td>`).join("")}
+      </tr>`;
+    }).join("");
+    const candidates = (table.candidates || []).map((candidate) => {
+      const startRow = Number(candidate.start_row);
+      const depth = Number(candidate.depth);
+      return `<button type="button" class="btn btn-outline btn-sm ingest-candidate"
+        data-start="${startRow}" data-depth="${depth}">
+        候选 ${startRow}–${startRow + depth - 1}（${Math.round(Number(candidate.confidence) * 100)}%）
+      </button>`;
+    }).join("");
+    return `<article class="ingest-table-card" data-table-key="${esc(table.table_key)}" data-index="${index}">
+      <header class="ingest-table-card-head">
+        <strong>${esc(table.sheet || "工作表")} · ${esc(table.range)}</strong>
+        <span class="ingest-hint">置信度 ${Math.round(Number(table.confidence) * 100)}% · ${esc(table.source)}</span>
+        ${(table.flags || []).map((flag) => `<span class="ingest-flag">${esc(flag)}</span>`).join("")}
+      </header>
+      ${candidates ? `<div class="ingest-candidates">${candidates}</div>` : ""}
+      <div class="ingest-table-wrap">
+        <table class="ingest-table ingest-grid-table">
+          <thead><tr><th>表头</th><th>行</th>${(table.columns || []).map((column) =>
+            `<th>${esc(column.name)}${column.unit ? `（${esc(column.unit)}）` : ""}</th>`).join("")}</tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <label class="ingest-field">列名（逗号分隔，顺序与表格一致）
+        <input type="text" data-role="columns"
+               value="${esc((table.columns || []).map((column) => column.name).join(", "))}">
+      </label>
+    </article>`;
+  }
+
+  function bindGrid() {
+    const host = $("ingest-review-tables");
+    host.onclick = (event) => {
+      const candidate = event.target.closest(".ingest-candidate");
+      if (candidate) {
+        const card = candidate.closest(".ingest-table-card");
+        const start = Number(candidate.dataset.start);
+        const depth = Number(candidate.dataset.depth);
+        card.querySelectorAll("tbody tr").forEach((row) => {
+          const absolute = Number(row.dataset.row);
+          const on = absolute >= start && absolute < start + depth;
+          row.querySelector("input[type=checkbox]").checked = on;
+          row.classList.toggle("is-header", on);
+        });
+        return;
+      }
+      const row = event.target.closest("tbody tr");
+      if (!row) return;
+      const box = row.querySelector("input[type=checkbox]");
+      if (event.target !== box) box.checked = !box.checked;
+      row.classList.toggle("is-header", box.checked);
+    };
+    host.onchange = (event) => {
+      if (!event.target.matches("tbody input[type=checkbox]")) return;
+      const row = event.target.closest("tr");
+      row.classList.toggle("is-header", event.target.checked);
+    };
+  }
+
+  function renderReviewActions(data) {
+    const roles = (me && me.user.roles) || [];
+    const canReview = roles.includes("reviewer") || roles.includes("admin");
+    const actionable = canReview && ["needs_review", "failed"].includes(data.status);
+    const secretPending = canReview && currentDoc.classification === 2
+      && data.status === "needs_review";
+    $("ingest-review-actions").innerHTML = `
+      <button type="button" class="btn btn-primary btn-sm" id="ingest-confirm-btn"
+        ${actionable ? "" : "disabled"}>确认结构</button>
+      ${secretPending ? `<button type="button" class="btn btn-outline btn-sm" id="ingest-approve-btn">秘密级二次确认</button>` : ""}
+      <label class="ingest-inline"><input type="checkbox" id="ingest-review-template"> 保存为版式模板</label>
+      <span class="ingest-waive">
+        <input type="text" id="ingest-waive-reason" placeholder="waive 理由">
+        <button type="button" class="btn btn-outline btn-sm" id="ingest-waive-btn"
+          ${actionable && currentDoc.classification !== 2 ? "" : "disabled"}>申请豁免</button>
+      </span>`;
+    $("ingest-confirm-btn").addEventListener("click", submitConfirm);
+    if ($("ingest-approve-btn")) $("ingest-approve-btn").addEventListener("click", submitApprove);
+    if ($("ingest-waive-btn")) $("ingest-waive-btn").addEventListener("click", submitWaive);
+  }
+
+  function collectConfirmPayload() {
+    const cards = [...$("ingest-review-tables").querySelectorAll(".ingest-table-card")];
+    const tables = cards.map((card) => {
+      const source = currentTables[Number(card.dataset.index)] || {};
+      const headerRows = [...card.querySelectorAll("tbody tr")]
+        .filter((row) => row.querySelector("input[type=checkbox]").checked)
+        .map((row) => Number(row.dataset.row));
+      const names = card.querySelector('[data-role="columns"]').value
+        .split(/[,，、]/).map((part) => part.trim()).filter(Boolean);
+      const columns = names.map((name, index) => {
+        const base = (source.columns || [])[index] || {};
+        return {
+          key: base.key || `c${index + 1}`,
+          name,
+          dtype: base.dtype || "string",
+          unit: base.unit || null,
+        };
+      });
+      return {
+        table_key: card.dataset.tableKey,
+        header_rows: headerRows,
+        columns,
+        footer_rows: source.footer_rows || [],
+      };
+    });
+    return {
+      tables,
+      meta: {
+        title: $("ingest-review-title").value.trim() || null,
+        classification: Number($("ingest-review-classification").value),
+        effective_date: $("ingest-review-effective-date").value || null,
+      },
+      apply_template: $("ingest-review-template").checked,
+    };
+  }
+
+  async function submitConfirm() {
+    clearAlert();
+    const payload = collectConfirmPayload();
+    if (payload.tables.some((table) => table.header_rows.length === 0)) {
+      return showAlert("每张表至少要勾选一行表头。");
+    }
+    const button = $("ingest-confirm-btn");
+    button.disabled = true;
+    try {
+      const result = await api(`/api/versions/${encodeURIComponent(currentVersion)}/confirm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      await loadLibrary();
+      if (result.status === "embedding") {
+        showAlert("结构已确认，已入队向量化。", true);
+        $("ingest-review-panel").classList.add("hidden");
+      } else {
+        showAlert(`已记录，仍有 ${result.open_items ?? 0} 项待复核。`, true);
+        await openReview(currentDoc.id);
+      }
+    } catch (err) {
+      showAlert(err.message || "确认失败");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function submitApprove() {
+    if (!window.confirm("确认以当前账号作为第二名复核人？")) return;
+    try {
+      const result = await api(`/api/versions/${encodeURIComponent(currentVersion)}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      await loadLibrary();
+      if (result.status === "embedding") {
+        showAlert("双人确认完成，已入队向量化。", true);
+        $("ingest-review-panel").classList.add("hidden");
+      } else {
+        showAlert(`仍需 ${result.pending_approvals ?? 1} 人确认。`, true);
+        await openReview(currentDoc.id);
+      }
+    } catch (err) {
+      showAlert(err.message || "二次确认失败");
+    }
+  }
+
+  async function submitWaive() {
+    const reason = $("ingest-waive-reason").value.trim();
+    if (!reason) return showAlert("waive 必须填写理由。");
+    try {
+      const result = await api(`/api/versions/${encodeURIComponent(currentVersion)}/waive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason }),
+      });
+      await loadLibrary();
+      if (result.status === "embedding") {
+        showAlert("已豁免并开始向量化。", true);
+        $("ingest-review-panel").classList.add("hidden");
+      } else {
+        showAlert(`已豁免，仍有 ${result.open_items ?? 0} 项待复核。`, true);
+        await openReview(currentDoc.id);
+      }
+    } catch (err) {
+      showAlert(err.message || "豁免失败");
+    }
+  }
+
+  // 引用回源
+
+  async function showSource(chunkId) {
+    clearAlert();
+    try {
+      const data = await api(`/api/chunks/${encodeURIComponent(chunkId)}/source`);
+      const locator = data.locator || {};
+      const parts = [
+        locator.sheet ? `工作表 ${locator.sheet}` : "",
+        locator.cell_range ? `区域 ${locator.cell_range}` : "",
+        locator.row_range ? `行 ${locator.row_range}` : "",
+        locator.page ? `第 ${locator.page} 页` : "",
+        Array.isArray(locator.heading_path) && locator.heading_path.length
+          ? `章节 ${locator.heading_path.join(" > ")}` : "",
+      ].filter(Boolean);
+      $("ingest-source-body").innerHTML = `
+        <p class="ingest-hint">${esc(data.filename)} · ${esc(locator.chunk_type || "正文")}</p>
+        <p class="ingest-source-locator">${esc(parts.join(" · ") || "该切片没有可定位的结构信息")}</p>
+        <pre class="ingest-source-content">${esc(data.content)}</pre>`;
+      if (!me) {
+        await open();
+      } else {
+        $("login-view").classList.add("hidden");
+        $("chat-view").classList.add("hidden");
+        $("ingest-view").classList.remove("hidden");
+        await loadLibrary();
+      }
+      $("ingest-source-panel").classList.remove("hidden");
+      $("ingest-source-panel").scrollIntoView({ block: "start", behavior: "smooth" });
+    } catch (err) {
+      showAlert(err.message || "无法定位原文");
+    }
+  }
+
+  // 初始化
+
+  function init() {
+    $("open-ingest-btn").addEventListener("click", open);
+    $("back-chat-btn").addEventListener("click", close);
+    $("ingest-logout-btn").addEventListener("click", logout);
+    $("ingest-refresh-btn").addEventListener("click", () => {
+      loadLibrary().catch((err) => showAlert(err.message || "刷新失败"));
+    });
+    $("ingest-upload-form").addEventListener("submit", submitUpload);
+    $("ingest-source-close-btn").addEventListener("click", () => {
+      $("ingest-source-panel").classList.add("hidden");
+    });
+    bindLibraryActions();
+    document.addEventListener("click", (event) => {
+      const item = event.target.closest(".cite-item[data-chunk-id]");
+      if (!item) return;
+      const chunkId = item.getAttribute("data-chunk-id");
+      if (chunkId) showSource(chunkId);
+    });
+  }
+
+  window.IngestUI = { open, close, showSource };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+```
+
+注意：
+
+- `#ingest-review-actions` 每次渲染都重建，监听器随元素一起替换，不会重复绑定；网格用 `host.onclick/onchange` 覆盖，避免重复。
+- 引用条目的 `data-chunk-id` 只有在 pgvector 后端（Task 21/22）返回 `chunk_id` 后才非空，FAISS 模式下点击无反应，属于预期。
+- 前端不判断密级可见性，全部依赖服务端 404/403；UI 只做状态与操作入口。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+uv run pytest tests/ingest/test_ui_static.py -v
+```
+
+Expected: 5 passed。
+
+- [ ] **Step 5: 回归既有页面测试**
+
+```bash
+uv run pytest tests/test_web.py -q
+```
+
+Expected: 73 passed（`/` 与登录流程未变）。
+
+手工冒烟（可选，需 Compose 已启动）：
+
+```bash
+uv run uvicorn app.server:app --host 127.0.0.1 --port 8000
+```
+
+登录 `wang` → 文档库 → 上传一个 xlsx → 任务状态从排队到完成 → 列表出现「待复核」→ 复核台勾选表头、改列名 → 确认结构。此时 `embed` 任务尚未注册（Task 19 才实现），任务会失败并重试，这是本阶段的预期；页面不得报 JS 异常。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add app/static/index.html app/static/ingest.js app/static/ingest.css \
+  app/server.py tests/ingest/test_ui_static.py
+git commit -m "feat(ui): 文档库与复核台前端，引用切片回源"
+```
+
+---
+
+### Task 18: 切片（文本、表格摘要、行窗口）
+
+**Files:**
+- Create: `ingest/chunking.py`、`tests/ingest/test_chunking.py`
+
+**Interfaces:**
+- Consumes: `ingest.ir.DocModel`、`ingest.config.Settings`。
+- Produces:
+  - `ingest.chunking.ChunkDraft`（`ordinal: int`、`chunk_type: str`、`content: str`、`content_tokens: str`、`metadata: dict`、`chunk_hash: str`）。
+  - `ingest.chunking.chunk_document(ir, *, doc_id, version_no, title, dept, classification, source_filename, settings=None) -> list[ChunkDraft]`。
+  - `ingest.chunking.tokenize(text) -> list[str]`（与 `main.tokenize` 同口径：jieba + 小写 + 去空白）。
+  - `ingest.chunking.CHINESE_SEPARATORS`（与 `main.CHINESE_SEPARATORS` 完全一致）。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_chunking.py`：
+
+```python
+from __future__ import annotations
+
+import re
+from dataclasses import replace
+
+from ingest.chunking import CHINESE_SEPARATORS, chunk_document, tokenize
+from ingest.config import get_settings
+from ingest.ir import Block, Column, DocMeta, DocModel, ParserInfo, Table
+
+DOC_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _model(blocks, *, title="差旅费管理办法", parser="docx") -> DocModel:
+    return DocModel(
+        parser=ParserInfo(name=parser, version="0.1.0"),
+        meta=DocMeta(title=title, source_filename=f"{title}.docx", sha256="a" * 64),
+        blocks=blocks,
+    )
+
+
+def _chunk(ir, **over):
+    kwargs = dict(doc_id=DOC_ID, version_no=2, title=ir.meta.title, dept="综合处",
+                  classification=1, source_filename=ir.meta.source_filename)
+    kwargs.update(over)
+    return chunk_document(ir, **kwargs)
+
+
+def _text_blocks():
+    return [
+        Block(block_id="b1", type="heading", level=1, text="第一章 总则"),
+        Block(block_id="b2", type="paragraph", text="差旅住宿费标准按照职级执行。" * 30),
+        Block(block_id="b3", type="heading", level=2, text="第一节 住宿"),
+        Block(block_id="b4", type="paragraph", text="住宿费凭发票报销。"),
+        Block(block_id="b5", type="heading", level=2, text="第二节 交通"),
+        Block(block_id="b6", type="paragraph", text="交通费按实际发生额报销，不得重复报销。"),
+    ]
+
+
+def _budget_table() -> Table:
+    rows = [[f"部门{i}", str(i * 10), str(i * 10 + 1)] for i in range(1, 23)]
+    rows.append(["合计", "2530", "2552"])
+    return Table(
+        table_key="t1", sheet="2025预算", range="A1:C24",
+        header_rows=[1],
+        header_values=[["部门", "Q1预算", "Q2预算"]],
+        columns=[Column(key="c1", name="部门"),
+                 Column(key="c2", name="Q1预算", unit="万元"),
+                 Column(key="c3", name="Q2预算", unit="万元")],
+        rows=rows, footer_rows=[24], confidence=0.9, source="heuristic",
+    )
+
+
+def test_chinese_separators_match_main():
+    from main import CHINESE_SEPARATORS as MAIN_SEPARATORS
+
+    assert CHINESE_SEPARATORS == MAIN_SEPARATORS
+
+
+def test_text_chunks_carry_title_and_heading_path():
+    ir = _model(_text_blocks())
+    chunks = _chunk(ir)
+    assert chunks
+    assert all(c.chunk_type == "text" for c in chunks)
+    assert all(c.content.startswith("《差旅费管理办法》 > 第一章 总则") for c in chunks)
+    assert all(len(c.content) <= 400 for c in chunks)
+    assert [c.ordinal for c in chunks] == list(range(len(chunks)))
+    first = chunks[0]
+    assert first.metadata["heading_path"] == ["第一章 总则"]
+    assert first.metadata["chunk_id"] == f"{DOC_ID}@v2#0"
+    assert re.fullmatch(r"[0-9a-f-]{36}@v\d+#\d+", first.metadata["chunk_id"])
+    assert first.metadata["title"] == "差旅费管理办法"
+    assert first.metadata["dept"] == "综合处"
+    assert first.metadata["classification"] == 1
+    assert first.metadata["parser"] == "docx@0.1.0"
+    assert "预算" not in first.content_tokens or True  # token 串非空即可
+    assert first.content_tokens
+
+
+def test_short_sections_merge_forward():
+    chunks = _chunk(_model(_text_blocks()))
+    joined = "\n".join(c.content for c in chunks)
+    assert "住宿费凭发票报销。" in joined
+    assert "交通费按实际发生额报销" in joined
+    assert any("住宿费凭发票报销。" in c.content
+               and "交通费按实际发生额报销" in c.content for c in chunks)
+    assert all(len(c.content) >= 40 for c in chunks)
+
+
+def test_tokenize_matches_bm25_conventions():
+    tokens = tokenize("部门预算 Department 2025")
+    assert "部门" in tokens
+    assert "department" in tokens
+    assert "2025" in tokens
+    assert all(token == token.strip() and token for token in tokens)
+
+
+def test_table_summary_and_row_windows():
+    ir = _model([
+        Block(block_id="b1", type="paragraph", text="2025 年预算如下。"),
+        Block(block_id="b2", type="table", table=_budget_table()),
+    ], title="2025年部门预算表", parser="xlsx")
+    chunks = _chunk(ir, classification=2)
+    summary = next(c for c in chunks if c.chunk_type == "table_summary")
+    assert summary.metadata["sheet"] == "2025预算"
+    assert summary.metadata["table_key"] == "t1"
+    assert summary.metadata["cell_range"] == "A1:C24"
+    assert summary.metadata["classification"] == 2
+    assert "工作表「2025预算」" in summary.content
+    assert "区域 A1:C24" in summary.content
+    assert "共 22 行 × 3 列" in summary.content
+    assert "列：部门 | Q1预算（万元） | Q2预算（万元）" in summary.content
+    assert "合计：合计 | 2530 | 2552（第 24 行）" in summary.content
+    assert "预算" in summary.content_tokens
+
+    windows = [c for c in chunks if c.chunk_type == "table_rows"]
+    assert len(windows) == 3
+    assert [c.metadata["row_range"] for c in windows] == ["2-11", "12-21", "22-23"]
+    for window in windows:
+        assert "列：部门 | Q1预算（万元） | Q2预算（万元）" in window.content
+        assert "2530" not in window.content  # 合计行不进窗口
+    assert "部门1 | 10 | 11" in windows[0].content
+    assert "部门22" in windows[2].content
+
+
+def test_wide_table_splits_into_column_groups():
+    names = [f"列{i}" for i in range(1, 16)]
+    table = Table(
+        table_key="t1", sheet="宽表", range="A1:O3",
+        header_rows=[1], header_values=[names],
+        columns=[Column(key=f"c{i}", name=f"列{i}") for i in range(1, 16)],
+        rows=[["第1列"] + [f"第{i}列值" for i in range(2, 16)]],
+        confidence=0.9, source="heuristic",
+    )
+    ir = _model([Block(block_id="b1", type="table", table=table)],
+                title="宽表", parser="xlsx")
+    windows = [c for c in _chunk(ir) if c.chunk_type == "table_rows"]
+    assert len(windows) == 2
+    assert windows[0].metadata["col_group"] == "1-10"
+    assert windows[1].metadata["col_group"] == "1,11-15"
+    assert "列：列1 | 列2 | 列3 | 列4 | 列5 | 列6 | 列7 | 列8 | 列9 | 列10" in windows[0].content
+    assert "列1 | 列11 | 列12 | 列13 | 列14 | 列15" in windows[1].content
+    assert "第15列值" not in windows[0].content
+    assert "第15列值" in windows[1].content
+
+
+def test_cell_truncation_marks_metadata():
+    long_cell = "长" * 300
+    table = Table(
+        table_key="t1", sheet="S", range="A1:B2",
+        header_rows=[1], header_values=[["名称", "内容"]],
+        columns=[Column(key="c1", name="名称"), Column(key="c2", name="内容")],
+        rows=[["甲", long_cell]], confidence=0.8, source="heuristic",
+    )
+    ir = _model([Block(block_id="b1", type="table", table=table)],
+                title="截断测试", parser="xlsx")
+    window = next(c for c in _chunk(ir) if c.chunk_type == "table_rows")
+    assert window.metadata["truncated"] is True
+    assert "长" * 200 in window.content
+    assert "长" * 201 not in window.content
+
+
+def test_large_table_is_sampled():
+    rows = [[f"行{i}", str(i)] for i in range(1, 102)]
+    table = Table(
+        table_key="t1", sheet="S", range=f"A1:B{len(rows) + 1}",
+        header_rows=[1], header_values=[["名称", "数值"]],
+        columns=[Column(key="c1", name="名称"), Column(key="c2", name="数值")],
+        rows=rows, confidence=0.8, source="heuristic",
+    )
+    ir = _model([Block(block_id="b1", type="table", table=table)],
+                title="大表", parser="xlsx")
+    settings = replace(get_settings(), max_rows_per_table=100)
+    windows = [c for c in _chunk(ir, settings=settings)
+               if c.chunk_type == "table_rows"]
+    assert windows
+    assert all(c.metadata.get("sampled") is True for c in windows)
+    assert len(windows) <= 10
+    assert "行1" in windows[0].content
+    assert "行101" in windows[-1].content
+
+
+def test_ordinals_and_hashes_are_stable():
+    ir = _model([
+        Block(block_id="b1", type="paragraph", text="正文内容。" * 30),
+        Block(block_id="b2", type="table", table=_budget_table()),
+    ], title="2025年部门预算表", parser="xlsx")
+    first = _chunk(ir)
+    second = _chunk(ir)
+    assert [(c.ordinal, c.chunk_hash) for c in first] == \
+        [(c.ordinal, c.chunk_hash) for c in second]
+    types = [c.chunk_type for c in first]
+    assert types.index("table_summary") < types.index("table_rows")
+
+
+def test_pdf_table_keeps_page_and_bbox():
+    table = _budget_table()
+    table = table.model_copy(update={"page": 3, "bbox": [10.0, 20.0, 30.0, 40.0]})
+    ir = _model([Block(block_id="b1", type="table", table=table)],
+                title="扫描预算表", parser="pdf")
+    summary = next(c for c in _chunk(ir) if c.chunk_type == "table_summary")
+    assert summary.metadata["page"] == 3
+    assert summary.metadata["bbox"] == [10.0, 20.0, 30.0, 40.0]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+uv run pytest tests/ingest/test_chunking.py -v
+```
+
+Expected: FAIL，`ModuleNotFoundError: No module named 'ingest.chunking'`。
+
+- [ ] **Step 3: 写实现**
+
+`ingest/chunking.py`：
+
+```python
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from ingest.config import Settings, get_settings
+from ingest.ir import DocModel, Table
+
+try:
+    import jieba
+
+    _JIEBA = True
+except ImportError:  # pragma: no cover
+    _JIEBA = False
+
+# 与 main.CHINESE_SEPARATORS 保持一致，测试会校验防漂移
+CHINESE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+
+MIN_CHUNK_CHARS = 20
+MERGE_CHARS = 40
+PREFIX_MAX = 80
+CELL_MAX = 200
+WIDE_TABLE_COLS = 12
+MAX_COL_GROUP = 10
+SAMPLE_HEAD = 20
+SAMPLE_TAIL = 20
+SAMPLE_MIDDLE = 40
+
+
+@dataclass(frozen=True)
+class ChunkDraft:
+    ordinal: int
+    chunk_type: str
+    content: str
+    content_tokens: str
+    metadata: dict
+    chunk_hash: str
+
+
+def tokenize(text: str) -> list[str]:
+    if _JIEBA:
+        tokens = list(jieba.cut(text))
+    else:  # pragma: no cover
+        tokens = [ch for ch in text if not ch.isspace()]
+    return [token.strip().lower() for token in tokens if token.strip()]
+
+
+def _hash(chunk_type: str, content: str) -> str:
+    return hashlib.sha256(f"{chunk_type}\x00{content}".encode("utf-8")).hexdigest()
+
+
+def _prefix(title: str, path: list[str]) -> str:
+    parts = [f"《{title}》", *[part for part in path if part.strip()]]
+    return " > ".join(parts)[:PREFIX_MAX]
+
+
+def _split_body(text: str, limit: int, overlap: int) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    splitter = RecursiveCharacterTextSplitter(
+        separators=CHINESE_SEPARATORS,
+        chunk_size=limit,
+        chunk_overlap=min(overlap, max(0, limit // 4)),
+        length_function=len,
+    )
+    pieces = [piece.strip() for piece in splitter.split_text(text) if piece.strip()]
+    merged: list[str] = []
+    for piece in pieces:
+        if merged and len(piece) < MIN_CHUNK_CHARS:
+            merged[-1] = f"{merged[-1]}\n{piece}"
+        else:
+            merged.append(piece)
+    return merged
+
+
+def _column_label(column) -> str:
+    return f"{column.name}（{column.unit}）" if column.unit else column.name
+
+
+class _Builder:
+    def __init__(self, ir: DocModel, *, doc_id: str, version_no: int, title: str,
+                 dept: str, classification: int | None, source_filename: str,
+                 settings: Settings) -> None:
+        self.ir = ir
+        self.doc_id = doc_id
+        self.version_no = version_no
+        self.title = title
+        self.dept = dept
+        self.classification = classification
+        self.source_filename = source_filename
+        self.settings = settings
+        self.drafts: list[ChunkDraft] = []
+
+    def add(self, chunk_type: str, content: str, metadata: dict) -> None:
+        ordinal = len(self.drafts)
+        meta = {
+            "chunk_id": f"{self.doc_id}@v{self.version_no}#{ordinal}",
+            "chunk_type": chunk_type,
+            "title": self.title,
+            "dept": self.dept,
+            "classification": self.classification,
+            "source": self.source_filename,
+            "parser": f"{self.ir.parser.name}@{self.ir.parser.version}",
+            **metadata,
+        }
+        tokens = " ".join(tokenize(content))
+        self.drafts.append(ChunkDraft(
+            ordinal=ordinal, chunk_type=chunk_type, content=content,
+            content_tokens=tokens, metadata=meta,
+            chunk_hash=_hash(chunk_type, content),
+        ))
+
+    def emit_text(self, body: str, path: list[str]) -> None:
+        prefix = _prefix(self.title, path)
+        limit = max(60, self.settings.chunk_size - len(prefix) - 1 - MIN_CHUNK_CHARS)
+        for piece in _split_body(body, limit, self.settings.chunk_overlap):
+            self.add("text", f"{prefix}\n{piece}", {
+                "heading_path": list(path),
+                "block_id": None,
+                "sheet": None,
+                "table_key": None,
+                "cell_range": None,
+                "row_range": None,
+                "col_group": None,
+                "page": None,
+                "bbox": None,
+            })
+
+    def emit_table(self, table: Table, path: list[str], block_id: str) -> None:
+        prefix = _prefix(self.title, path)
+        pairs = self._data_pairs(table)
+        self.add("table_summary", self._summary(table, prefix, pairs),
+                 self._table_meta(table, path, block_id))
+        if not pairs:
+            return
+        selected = self._select_pairs(pairs)
+        sampled = len(selected) < len(pairs)
+        for group in self._column_groups(table):
+            for window in self._windows(selected):
+                metadata = self._table_meta(table, path, block_id)
+                metadata.update({
+                    "row_range": f"{window[0][0]}-{window[-1][0]}",
+                    "col_group": group["label"],
+                })
+                if sampled:
+                    metadata["sampled"] = True
+                if any(len(row[index]) > CELL_MAX
+                       for _, row in window for index in group["indexes"]
+                       if index < len(row)):
+                    metadata["truncated"] = True
+                self.add("table_rows",
+                         self._window_content(table, prefix, group, window),
+                         metadata)
+
+    def _table_meta(self, table: Table, path: list[str], block_id: str) -> dict:
+        return {
+            "heading_path": list(path),
+            "block_id": block_id,
+            "sheet": table.sheet,
+            "table_key": table.table_key,
+            "cell_range": table.range,
+            "row_range": None,
+            "col_group": None,
+            "page": table.page,
+            "bbox": table.bbox,
+        }
+
+    def _data_pairs(self, table: Table) -> list[tuple[int, list[str]]]:
+        start = table.data_start_row
+        footer = set(table.footer_rows)
+        return [(start + offset, row) for offset, row in enumerate(table.rows)
+                if start + offset not in footer]
+
+    def _select_pairs(self, pairs: list[tuple[int, list[str]]]) -> list[tuple[int, list[str]]]:
+        if len(pairs) <= self.settings.max_rows_per_table:
+            return pairs
+        head = pairs[:SAMPLE_HEAD]
+        tail = pairs[-SAMPLE_TAIL:]
+        middle = pairs[SAMPLE_HEAD:len(pairs) - SAMPLE_TAIL]
+        if not middle:
+            return head + tail
+        step = max(1, len(middle) // SAMPLE_MIDDLE)
+        return head + middle[::step][:SAMPLE_MIDDLE] + tail
+
+    def _windows(self, pairs: list[tuple[int, list[str]]]):
+        size = max(1, self.settings.table_rows_per_chunk)
+        return [pairs[start:start + size] for start in range(0, len(pairs), size)]
+
+    def _column_groups(self, table: Table) -> list[dict]:
+        ncols = len(table.columns)
+        if ncols <= WIDE_TABLE_COLS:
+            return [{"indexes": list(range(ncols)), "label": None}]
+        groups: list[dict] = []
+        start = 1
+        while start < ncols:
+            end = min(ncols, start + MAX_COL_GROUP - 1)
+            indexes = [0, *range(start, end)]
+            label = (f"1-{end}" if start == 1
+                     else f"1,{start + 1}-{end}" if start + 1 != end
+                     else f"1,{start + 1}")
+            groups.append({"indexes": indexes, "label": label})
+            start = end
+        return groups
+
+    def _summary(self, table: Table, prefix: str,
+                 pairs: list[tuple[int, list[str]]]) -> str:
+        sheet = table.sheet or "工作表"
+        lines = [
+            prefix,
+            f"文档《{self.title}》工作表「{sheet}」区域 {table.range}，"
+            f"共 {len(pairs)} 行 × {len(table.columns)} 列。",
+            "列：" + " | ".join(_column_label(column) for column in table.columns),
+        ]
+        footer = table.footer_values()
+        if footer:
+            lines.append(f"合计：{' | '.join(footer[0])}（第 {table.footer_rows[0]} 行）")
+        return "\n".join(lines)
+
+    def _window_content(self, table: Table, prefix: str, group: dict,
+                        window: list[tuple[int, list[str]]]) -> str:
+        indexes = group["indexes"]
+        labels = [_column_label(table.columns[index]) for index in indexes]
+        lines = [
+            prefix,
+            "列：" + " | ".join(labels),
+            f"第 {window[0][0]}–{window[-1][0]} 行：",
+        ]
+        for _, row in window:
+            cells = [row[index][:CELL_MAX] if index < len(row) else ""
+                     for index in indexes]
+            lines.append(" | ".join(cells))
+        return "\n".join(lines)
+
+
+def chunk_document(ir: DocModel, *, doc_id: str, version_no: int, title: str,
+                   dept: str, classification: int | None,
+                   source_filename: str,
+                   settings: Settings | None = None) -> list[ChunkDraft]:
+    settings = settings or get_settings()
+    builder = _Builder(ir, doc_id=doc_id, version_no=version_no, title=title,
+                       dept=dept, classification=classification,
+                       source_filename=source_filename, settings=settings)
+    stack: list[tuple[int, str]] = []
+    section_path: list[str] = []
+    buffer: list[str] = []
+    carry = ""
+
+    def flush() -> None:
+        nonlocal carry
+        text = "\n\n".join(part for part in buffer if part.strip()).strip()
+        buffer.clear()
+        if not text:
+            return
+        if carry:
+            text = f"{carry}\n\n{text}".strip()
+            carry = ""
+        if len(text) < MERGE_CHARS:
+            carry = text
+            return
+        builder.emit_text(text, section_path)
+
+    for block in ir.blocks:
+        if block.type == "heading":
+            if not block.text.strip():
+                continue
+            flush()
+            level = block.level or 1
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, block.text.strip()))
+            section_path = [text for _, text in stack]
+        elif block.type == "paragraph":
+            if block.text.strip():
+                buffer.append(block.text)
+        elif block.type == "table" and block.table is not None:
+            flush()
+            if carry:
+                builder.emit_text(carry, section_path)
+                carry = ""
+            builder.emit_table(block.table, block.path or section_path,
+                               block.block_id)
+    flush()
+    if carry and len(carry) >= MIN_CHUNK_CHARS:
+        builder.emit_text(carry, section_path)
+    return builder.drafts
+```
+
+注意：
+
+- 文本块 `content = 前缀 + 换行 + 正文`，正文上限按 `chunk_size - 前缀 - 1 - 20` 计算，保证合并短尾后总长仍 ≤ `chunk_size`。
+- 表格切片不套用 400 字符上限：行窗口按 10 行 × 单元格 200 字符截断控制；宽表按列组拆。
+- `ordinal` 按「正文块 → 表格摘要 → 行窗口」的文档顺序递增；`chunk_hash` 只覆盖 `chunk_type + content`，重切分时用于判断内容是否变化。
+- `metadata` 里 `embed_model` 由 Task 19 写入时合并，切片阶段不依赖嵌入模型配置。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+uv run pytest tests/ingest/test_chunking.py -v
+```
+
+Expected: 10 passed。
+
+- [ ] **Step 5: 回归无关测试**
+
+```bash
+uv run pytest tests/test_main.py -q
+```
+
+Expected: 既有测试仍全绿（`main.py` 未改动）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ingest/chunking.py tests/ingest/test_chunking.py
+git commit -m "feat(ingest): 文本与表格切片（摘要、行窗口、宽表列组）"
+```
+
+---
+
+### Task 19: 嵌入 job 与 chunks 写入
+
+**Files:**
+- Modify: `ingest/config.py`（新增 `embed_model`、`ollama_base_url`）、`ingest/pipeline.py`（注册 `embed` 处理器）、`.env.example`
+- Create: `ingest/embedding.py`、`tests/ingest/test_embedding.py`
+
+**Interfaces:**
+- Consumes: `ingest.chunking.chunk_document`、`ingest.repository`、`ingest.queue.enqueue`、`ingest.errors.ModelUnavailable`、`pgvector` 适配器。
+- Produces:
+  - `ingest.embedding.Embedder`（协议：`model: str`、`dim: int`、`embed(texts: list[str]) -> list[list[float]]`）。
+  - `ingest.embedding.OllamaEmbedder(model, base_url, dim)`、`ingest.embedding.get_embedder(settings=None) -> Embedder`。
+  - `ingest.embedding.embed_texts(embedder, texts, batch_size=32) -> list[list[float]]`。
+  - `ingest.embedding.embed_version(conn, version_id, *, embedder=None, settings=None) -> dict`：写 `chunks` + `doc_tables`，版本置 `ready`，幂等入队 `activate`。
+  - `ingest.pipeline.handle_embed(conn, payload)`，并加入 `HANDLERS`。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_embedding.py`：
+
+```python
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from ingest import embedding, pipeline, repository as repo
+from ingest.config import get_settings
+from ingest.errors import ModelUnavailable
+from ingest.ir import Block, Column, DocMeta, DocModel, ParserInfo, Table
+
+
+class FakeEmbedder:
+    model = "fake-embed"
+
+    def __init__(self, dim: int = 1024) -> None:
+        self.dim = dim
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [[0.001] * self.dim for _ in texts]
+
+
+def _ir() -> DocModel:
+    table = Table(
+        table_key="t1", sheet="2025预算", range="A1:B3",
+        header_rows=[1], header_values=[["部门", "预算"]],
+        columns=[Column(key="c1", name="部门"), Column(key="c2", name="预算")],
+        rows=[["综合处", "100"], ["人事处", "90"]],
+        confidence=0.9, source="heuristic",
+    )
+    return DocModel(
+        parser=ParserInfo(name="xlsx", version="0.1.0"),
+        meta=DocMeta(title="预算", source_filename="预算.xlsx", sha256="b" * 64),
+        blocks=[Block(block_id="b1", type="paragraph", text="2025 年预算如下。"),
+                Block(block_id="b2", type="table", table=table)],
+    )
+
+
+def _seed(conn, *, classification: int = 1):
+    doc = repo.create_document(conn, title="预算", dept="财务处",
+                               classification=classification,
+                               effective_date=None, created_by="wang")
+    version = repo.create_version(
+        conn, document_id=doc["id"], version_no=1, sha256="b" * 64,
+        filename="预算.xlsx", mime="application/octet-stream", size_bytes=10,
+        storage_path="bb/" + "b" * 64, parser="xlsx", parser_version="0.1.0")
+    repo.set_version_status(conn, version["id"], "embedding", ir=_ir())
+    conn.commit()
+    return doc, version
+
+
+def test_embed_settings_do_not_collide_with_faiss_embed_model(monkeypatch):
+    monkeypatch.delenv("INGEST_EMBED_MODEL", raising=False)
+    monkeypatch.setenv("EMBED_MODEL", "nomic-embed-text")
+    get_settings.cache_clear()
+    settings = get_settings()
+    assert settings.embed_model == "bge-m3"
+    assert settings.ollama_base_url == "http://127.0.0.1:11434"
+    get_settings.cache_clear()
+
+
+def test_embed_version_writes_chunks_and_tables(conn):
+    doc, version = _seed(conn)
+    result = embedding.embed_version(conn, version["id"], embedder=FakeEmbedder())
+
+    rows = conn.execute(
+        "SELECT * FROM chunks WHERE version_id=%s ORDER BY ordinal",
+        (version["id"],),
+    ).fetchall()
+    assert result["chunks"] == len(rows) > 0
+    assert [row["ordinal"] for row in rows] == list(range(len(rows)))
+    assert all(row["embedding"] is not None for row in rows)
+    assert all(row["embed_model"] == "fake-embed" for row in rows)
+    assert all(row["active"] is False for row in rows)
+    assert rows[0]["metadata"]["embed_model"] == "fake-embed"
+    assert rows[0]["metadata"]["chunk_id"] == f"{doc['id']}@v1#0"
+    tsv_ok = conn.execute(
+        "SELECT tsv = to_tsvector('simple', content_tokens) AS ok "
+        "FROM chunks WHERE id=%s", (rows[0]["id"],)).fetchone()["ok"]
+    assert tsv_ok is True
+
+    assert conn.execute("SELECT status FROM doc_versions WHERE id=%s",
+                        (version["id"],)).fetchone()["status"] == "ready"
+    job = conn.execute(
+        "SELECT kind, payload FROM jobs WHERE kind='activate' AND status='queued'"
+    ).fetchone()
+    assert job["payload"]["version_id"] == version["id"]
+
+    table = conn.execute("SELECT * FROM doc_tables WHERE version_id=%s",
+                         (version["id"],)).fetchone()
+    assert table["table_key"] == "t1"
+    assert table["header_rows"] == [1]
+    assert table["row_count"] == 2
+    assert table["columns"][1]["name"] == "预算"
+
+
+def test_embed_version_is_idempotent(conn):
+    _, version = _seed(conn)
+    embedder = FakeEmbedder()
+    first = embedding.embed_version(conn, version["id"], embedder=embedder)
+    second = embedding.embed_version(conn, version["id"], embedder=embedder)
+    assert first["chunks"] == second["chunks"]
+    assert conn.execute("SELECT count(*) AS n FROM chunks WHERE version_id=%s",
+                        (version["id"],)).fetchone()["n"] == first["chunks"]
+    queued = conn.execute(
+        "SELECT count(*) AS n FROM jobs WHERE kind='activate' AND status='queued'"
+    ).fetchone()["n"]
+    assert queued == 1
+
+
+def test_embed_keeps_active_for_current_version(conn):
+    doc, version = _seed(conn)
+    conn.execute("UPDATE documents SET status='active', current_version_id=%s "
+                 "WHERE id=%s", (version["id"], doc["id"]))
+    conn.commit()
+    embedding.embed_version(conn, version["id"], embedder=FakeEmbedder())
+    rows = conn.execute("SELECT active FROM chunks WHERE version_id=%s",
+                        (version["id"],)).fetchall()
+    assert rows and all(row["active"] is True for row in rows)
+
+
+def test_dimension_mismatch_raises_and_keeps_version_embedding(conn):
+    _, version = _seed(conn)
+    with pytest.raises(ModelUnavailable):
+        embedding.embed_version(conn, version["id"], embedder=FakeEmbedder(dim=8))
+    conn.rollback()
+    assert conn.execute("SELECT count(*) AS n FROM chunks WHERE version_id=%s",
+                        (version["id"],)).fetchone()["n"] == 0
+    assert conn.execute("SELECT status FROM doc_versions WHERE id=%s",
+                        (version["id"],)).fetchone()["status"] == "embedding"
+
+
+def test_embed_texts_batches_requests():
+    embedder = FakeEmbedder(dim=2)
+    vectors = embedding.embed_texts(embedder, ["a", "b", "c"], batch_size=2)
+    assert len(vectors) == 3
+    assert [len(call) for call in embedder.calls] == [2, 1]
+
+
+def test_embed_texts_rejects_wrong_count():
+    class ShortEmbedder(FakeEmbedder):
+        def embed(self, texts):
+            return [[0.0] * self.dim]
+
+    with pytest.raises(ModelUnavailable):
+        embedding.embed_texts(ShortEmbedder(dim=2), ["a", "b"])
+
+
+def test_ollama_embedder_contract(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse({"embeddings": [[0.1, 0.2], [0.3, 0.4]]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    embedder = embedding.OllamaEmbedder(model="bge-m3",
+                                        base_url="http://127.0.0.1:11434", dim=2)
+    vectors = embedder.embed(["甲", "乙"])
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+    assert captured["url"] == "http://127.0.0.1:11434/api/embed"
+    assert captured["body"] == {"model": "bge-m3", "input": ["甲", "乙"]}
+
+
+def test_ollama_embedder_rejects_bad_dimension(monkeypatch):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps({"embeddings": [[0.1]]}).encode("utf-8")
+
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda request, timeout=None: FakeResponse())
+    embedder = embedding.OllamaEmbedder(model="bge-m3",
+                                        base_url="http://127.0.0.1:11434", dim=2)
+    with pytest.raises(ModelUnavailable):
+        embedder.embed(["甲"])
+
+
+def test_handle_embed_is_registered():
+    assert pipeline.HANDLERS["embed"] is pipeline.handle_embed
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_embedding.py -v
+```
+
+Expected: FAIL，`ModuleNotFoundError: No module named 'ingest.embedding'`。
+
+- [ ] **Step 3: 写实现**
+
+**3.1 `ingest/config.py` 增加两个字段（环境变量用 `INGEST_` 前缀，避免和现有 FAISS 的 `EMBED_MODEL` 冲突）**
+
+在 `Settings` 中 `embed_dim` 之后插入：
+
+```python
+    embed_model: str = "bge-m3"
+    ollama_base_url: str = "http://127.0.0.1:11434"
+```
+
+在 `get_settings()` 的 `embed_dim=...` 之后插入：
+
+```python
+        embed_model=os.getenv("INGEST_EMBED_MODEL", "bge-m3"),
+        ollama_base_url=os.getenv("INGEST_OLLAMA_BASE_URL",
+                                  "http://127.0.0.1:11434"),
+```
+
+`.env.example` 追加：
+
+```dotenv
+# 文档摄取：嵌入与本地模型服务（与现有 FAISS 的 EMBED_MODEL 相互独立）
+INGEST_EMBED_MODEL=bge-m3
+INGEST_OLLAMA_BASE_URL=http://127.0.0.1:11434
+```
+
+**3.2 `ingest/embedding.py`**
+
+```python
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Protocol
+
+from psycopg import Connection
+from psycopg.types.json import Jsonb
+
+from ingest import repository as repo
+from ingest.chunking import chunk_document
+from ingest.config import Settings, get_settings
+from ingest.errors import ModelUnavailable
+from ingest.ir import DocModel
+from ingest.queue import enqueue
+
+BATCH_SIZE = 32
+
+
+class Embedder(Protocol):
+    model: str
+    dim: int
+
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+@dataclass
+class OllamaEmbedder:
+    model: str = "bge-m3"
+    base_url: str = "http://127.0.0.1:11434"
+    dim: int = 1024
+    timeout: float = 120.0
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        payload = json.dumps({"model": self.model, "input": texts},
+                             ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url.rstrip('/')}/api/embed",
+            data=payload, headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.load(response)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ModelUnavailable(f"嵌入服务不可用: {exc}") from exc
+        vectors = data.get("embeddings")
+        if not isinstance(vectors, list) or len(vectors) != len(texts):
+            raise ModelUnavailable("嵌入服务返回的向量数量与输入不一致")
+        for vector in vectors:
+            if not isinstance(vector, list) or len(vector) != self.dim:
+                raise ModelUnavailable(
+                    f"向量维度 {len(vector) if isinstance(vector, list) else '?'} "
+                    f"!= EMBED_DIM {self.dim}")
+        return vectors
+
+
+def get_embedder(settings: Settings | None = None) -> Embedder:
+    settings = settings or get_settings()
+    return OllamaEmbedder(model=settings.embed_model,
+                          base_url=settings.ollama_base_url,
+                          dim=settings.embed_dim)
+
+
+def embed_texts(embedder: Embedder, texts: list[str],
+                batch_size: int = BATCH_SIZE) -> list[list[float]]:
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        out = embedder.embed(batch)
+        if len(out) != len(batch):
+            raise ModelUnavailable("嵌入服务返回的向量数量与输入不一致")
+        for vector in out:
+            if len(vector) != embedder.dim:
+                raise ModelUnavailable(
+                    f"向量维度 {len(vector)} != EMBED_DIM {embedder.dim}")
+        vectors.extend(out)
+    return vectors
+
+
+def _write_doc_tables(conn: Connection, version_id: str, ir: DocModel) -> None:
+    keys = [table.table_key for table in ir.tables()]
+    if keys:
+        conn.execute(
+            "DELETE FROM doc_tables WHERE version_id=%s AND NOT (table_key = ANY(%s))",
+            (version_id, keys),
+        )
+    else:
+        conn.execute("DELETE FROM doc_tables WHERE version_id=%s", (version_id,))
+    for table in ir.tables():
+        conn.execute(
+            """INSERT INTO doc_tables (version_id, table_key, sheet, cell_range,
+                   header_rows, columns, row_count, footer_rows, confidence, source)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (version_id, table_key) DO UPDATE SET
+                   sheet=EXCLUDED.sheet, cell_range=EXCLUDED.cell_range,
+                   header_rows=EXCLUDED.header_rows, columns=EXCLUDED.columns,
+                   row_count=EXCLUDED.row_count, footer_rows=EXCLUDED.footer_rows,
+                   confidence=EXCLUDED.confidence, source=EXCLUDED.source""",
+            (version_id, table.table_key, table.sheet, table.range,
+             table.header_rows, Jsonb([c.model_dump() for c in table.columns]),
+             len(table.rows), table.footer_rows, table.confidence, table.source),
+        )
+
+
+def embed_version(conn: Connection, version_id: str, *,
+                  embedder: Embedder | None = None,
+                  settings: Settings | None = None) -> dict:
+    settings = settings or get_settings()
+    embedder = embedder or get_embedder(settings)
+    version = repo.get_version(conn, version_id)
+    if version is None:
+        raise ValueError(f"版本不存在: {version_id}")
+    doc = repo.get_document(conn, version["document_id"])
+    if doc is None or doc["deleted_at"] is not None:
+        raise ValueError(f"文档不存在: {version['document_id']}")
+    if not version["ir"]:
+        raise ValueError(f"版本没有解析结果: {version_id}")
+
+    ir = DocModel.model_validate(version["ir"])
+    drafts = chunk_document(
+        ir, doc_id=doc["id"], version_no=version["version_no"],
+        title=doc["title"], dept=doc["dept"],
+        classification=doc["classification"],
+        source_filename=version["filename"], settings=settings,
+    )
+    vectors = embed_texts(embedder, [draft.content for draft in drafts])
+    active = (doc["current_version_id"] == version["id"]
+              and doc["status"] == "active")
+
+    conn.execute("DELETE FROM chunks WHERE version_id=%s", (version["id"],))
+    for draft, vector in zip(drafts, vectors):
+        metadata = {**draft.metadata, "embed_model": embedder.model}
+        conn.execute(
+            """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type,
+                   content, content_tokens, tsv, embedding, embed_model, dept,
+                   classification, metadata, chunk_hash, active)
+               VALUES (%s,%s,%s,%s,%s,%s,to_tsvector('simple', %s),%s,%s,%s,%s,%s,%s,%s)""",
+            (doc["id"], version["id"], draft.ordinal, draft.chunk_type,
+             draft.content, draft.content_tokens, draft.content_tokens,
+             vector, embedder.model, doc["dept"], doc["classification"],
+             Jsonb(metadata), draft.chunk_hash, active),
+        )
+    _write_doc_tables(conn, version["id"], ir)
+    repo.set_version_status(conn, version["id"], "ready")
+
+    queued = conn.execute(
+        """SELECT id FROM jobs WHERE kind='activate' AND status='queued'
+             AND payload->>'version_id' = %s LIMIT 1""",
+        (version["id"],),
+    ).fetchone()
+    if queued is None:
+        enqueue(conn, "activate", {"version_id": version["id"]}, priority=40)
+    else:
+        conn.commit()
+    return {"version_id": version["id"], "chunks": len(drafts),
+            "active": active}
+```
+
+**3.3 `ingest/pipeline.py`**
+
+顶部导入：
+
+```python
+from ingest.embedding import embed_version
+```
+
+在 `handle_parse_dead_letter` 之后加：
+
+```python
+def handle_embed(conn: Connection, payload: dict) -> None:
+    embed_version(conn, payload["version_id"])
+```
+
+更新处理器表（Task 20 还会追加 `activate` / `purge`）：
+
+```python
+HANDLERS = {"parse": handle_parse, "embed": handle_embed}
+DEAD_LETTER_HOOKS = {"parse": handle_parse_dead_letter}
+```
+
+注意：
+
+- `INGEST_EMBED_MODEL` 与现有 `EMBED_MODEL` 分离，防止 FAISS 的 768 维模型误用进 1024 维表。
+- 嵌入先算完所有向量再写库，维度不符时不会留下半套切片；worker 捕获异常后按退避重试，最终转 `failed` 并生成 `parse_warning`（Task 13 的死信逻辑沿用）。
+- 当前已激活版本重嵌入时，新切片直接 `active=true`，避免出现检索空窗。
+- `activate` 任务按版本去重，重复执行 `embed` 不会堆任务。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_embedding.py -v
+```
+
+Expected: 10 passed。
+
+- [ ] **Step 5: 回归既有测试**
+
+```bash
+uv run pytest tests/test_web.py tests/test_main.py -q
+```
+
+Expected: 既有测试全绿（新增配置字段都有默认值）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ingest/config.py ingest/embedding.py ingest/pipeline.py .env.example \
+  tests/ingest/test_embedding.py
+git commit -m "feat(ingest): 嵌入 job、chunks/doc_tables 写入与 activate 入队"
+```
+
+---
+
+### Task 20: 激活事务、版本切换与清理
+
+**Files:**
+- Modify: `ingest/config.py`（`keep_versions` / `keep_days`）、`ingest/repository.py`（`lock_version`）、`ingest/activation.py`、`ingest/pipeline.py`、`.env.example`
+- Test: `tests/ingest/test_activation.py`
+
+**Interfaces:**
+- Consumes: Task 19 的 `embed_version()`（结束时版本 `ready` 并入队 `activate`）、Task 14 的 `deactivate_document()` / `soft_delete_document()`、`ingest.storage.FileStore.delete()`、`app.audit.write_audit()`。
+- Produces:
+  - `repo.lock_version(conn, version_id) -> dict | None`（`SELECT … FOR UPDATE`）。
+  - `activate_version(conn, version_id, *, actor="worker", settings=None) -> dict`，返回 `{"version_id", "activated", "status", "previous_version_id", "pruned_chunks"}`；跳过时额外返回 `"reason": "document_inactive" | "already_active"`。
+  - `purge_document(conn, document_id, *, actor="worker", settings=None) -> dict`，返回 `{"document_id", "status", "versions", "files_removed"}`。
+  - `pipeline.handle_activate / handle_activate_dead_letter / handle_purge / handle_purge_dead_letter / handle_embed_dead_letter`；`HANDLERS` 与 `DEAD_LETTER_HOOKS` 覆盖 `parse/embed/activate/purge`。
+
+**行为约定（与设计 §6.1、§6.5 对齐）：**
+
+- 激活是**一个事务**：新版本切片 `active=true`、同文档其他版本切片 `active=false`、`documents.current_version_id=新版本`、`documents.status='active'`、`doc_versions.activated_at=now()`。任一步失败整体回滚，不出现“新旧都激活”或“都不激活”。
+- 版本状态保持 `ready`；`active` 是文档级状态，`doc_versions` 的状态机没有 `active` 值。
+- **下线不可自动复活**：`documents.status` 为 `inactive` / `deleting` 时，`activate` 任务只提交空操作并返回 `reason="document_inactive"`，绝不把文档改回 `active`。需要恢复内容时重新上传为新文档；带审批的 `/reactivate` 留给 P1（设计状态机只有 `inactive → deleting`）。
+- 未定级（`classification IS NULL`）、版本非 `ready`、切片数为 0 都拒绝激活（`ReviewRequired`），由 worker 重试后转死信并生成复核项。
+- 激活成功后按保留策略清理**旧版本的切片**（不删版本行、不删 `doc_tables`）：`version_no <= 当前版本号 - INGEST_KEEP_VERSIONS` 或激活时间早于 `INGEST_KEEP_DAYS`。`0` 表示禁用该维度。原件按引用计数延后清理。
+- `purge` 只处理 `status='deleting'` 的文档：先删未被其他文档引用的原件（内容寻址，按引用计数），再删 `chunks / doc_tables / review_approvals / review_items / doc_versions`，保留 `documents` 墓碑行（`status='deleting'`、`deleted_at` 非空、`current_version_id=NULL`）。重复执行幂等。
+- 嵌入任务此前没有死信钩子，版本会停在 `embedding`；本任务补上 `handle_embed_dead_letter`，让 `failed` + `parse_warning` 的约定对 `embed / activate` 同样成立。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_activation.py`：
+
+```python
+import hashlib
+from dataclasses import replace
+
+import pytest
+
+from ingest import activation, pipeline, repository as repo
+from ingest.config import get_settings
+from ingest.errors import DocumentInactive, ReviewRequired
+from ingest.queue import claim, enqueue
+from ingest.storage import FileStore
+from ingest.worker import run_job
+
+
+@pytest.fixture()
+def audited(monkeypatch):
+    records: list[dict] = []
+    monkeypatch.setattr(activation, "write_audit", records.append)
+    monkeypatch.setattr(pipeline, "write_audit", records.append)
+    return records
+
+
+def _seed(conn, *, classification=1, status="draft"):
+    doc = repo.create_document(
+        conn, title="预算文档", dept="财务处", classification=classification,
+        effective_date=None, created_by="zhang")
+    if status != "draft":
+        conn.execute("UPDATE documents SET status=%s WHERE id=%s",
+                     (status, doc["id"]))
+    conn.commit()
+    return repo.get_document(conn, doc["id"])
+
+
+def _version(conn, doc, no, *, status="ready", storage_path=None):
+    return repo.create_version(
+        conn, document_id=doc["id"], version_no=no, sha256=str(no) * 64,
+        filename=f"v{no}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        size_bytes=100, storage_path=storage_path or f"aa/{no}",
+        parser="docx", parser_version="0.1.0", status=status)
+
+
+def _chunks(conn, doc, version, *, count=2, active=False):
+    for i in range(count):
+        conn.execute(
+            """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type,
+                   content, content_tokens, embed_model, dept, classification,
+                   metadata, chunk_hash, active)
+               VALUES (%s,%s,%s,'text',%s,%s,'bge-m3',%s,%s,'{}',%s,%s)""",
+            (doc["id"], version["id"], i, f"正文{i}", f"正文{i}", doc["dept"],
+             doc["classification"], f"{version['id']}-{i}".ljust(64, "0"), active))
+    conn.commit()
+
+
+def test_activate_first_version_makes_document_active(conn, audited):
+    doc = _seed(conn)
+    version = _version(conn, doc, 1)
+    _chunks(conn, doc, version)
+
+    result = activation.activate_version(conn, version["id"])
+
+    assert result["activated"] is True
+    assert result["previous_version_id"] is None
+    row = repo.get_document(conn, doc["id"])
+    assert row["status"] == "active"
+    assert str(row["current_version_id"]) == str(version["id"])
+    flags = conn.execute("SELECT active FROM chunks WHERE version_id=%s",
+                         (version["id"],)).fetchall()
+    assert len(flags) == 2 and all(f["active"] for f in flags)
+    assert conn.execute("SELECT activated_at FROM doc_versions WHERE id=%s",
+                        (version["id"],)).fetchone()["activated_at"] is not None
+    assert [r["action"] for r in audited] == ["activate"]
+
+
+def test_activate_switches_version_and_deactivates_old(conn, audited):
+    doc = _seed(conn)
+    first = _version(conn, doc, 1)
+    _chunks(conn, doc, first)
+    activation.activate_version(conn, first["id"])
+
+    second = _version(conn, doc, 2)
+    _chunks(conn, doc, second)
+    result = activation.activate_version(conn, second["id"])
+
+    assert result["previous_version_id"] == str(first["id"])
+    row = repo.get_document(conn, doc["id"])
+    assert row["status"] == "active"
+    assert str(row["current_version_id"]) == str(second["id"])
+    old = conn.execute(
+        "SELECT bool_or(active) AS any_active FROM chunks WHERE version_id=%s",
+        (first["id"],)).fetchone()
+    new = conn.execute(
+        "SELECT bool_and(active) AS all_active FROM chunks WHERE version_id=%s",
+        (second["id"],)).fetchone()
+    assert old["any_active"] is False
+    assert new["all_active"] is True
+
+
+def test_activate_refuses_unclassified_document(conn, audited):
+    doc = _seed(conn, classification=None)
+    version = _version(conn, doc, 1)
+    _chunks(conn, doc, version)
+
+    with pytest.raises(ReviewRequired):
+        activation.activate_version(conn, version["id"])
+
+    assert repo.get_document(conn, doc["id"])["status"] == "draft"
+    assert conn.execute(
+        "SELECT count(*) AS n FROM chunks WHERE active").fetchone()["n"] == 0
+    assert audited == []
+
+
+def test_activate_requires_ready_version(conn, audited):
+    doc = _seed(conn)
+    version = _version(conn, doc, 1, status="embedding")
+    _chunks(conn, doc, version)
+
+    with pytest.raises(ReviewRequired):
+        activation.activate_version(conn, version["id"])
+
+
+def test_activate_requires_chunks(conn, audited):
+    doc = _seed(conn)
+    version = _version(conn, doc, 1)
+
+    with pytest.raises(ReviewRequired):
+        activation.activate_version(conn, version["id"])
+
+
+def test_inactive_document_is_not_revived(conn, audited):
+    doc = _seed(conn)
+    first = _version(conn, doc, 1)
+    _chunks(conn, doc, first)
+    activation.activate_version(conn, first["id"])
+    activation.deactivate_document(conn, doc["id"], actor="admin")
+
+    second = _version(conn, doc, 2)
+    _chunks(conn, doc, second)
+    result = activation.activate_version(conn, second["id"])
+
+    assert result["activated"] is False
+    assert result["reason"] == "document_inactive"
+    row = repo.get_document(conn, doc["id"])
+    assert row["status"] == "inactive"
+    assert str(row["current_version_id"]) == str(first["id"])
+    assert conn.execute(
+        "SELECT count(*) AS n FROM chunks WHERE active").fetchone()["n"] == 0
+
+
+def test_activate_is_idempotent(conn, audited):
+    doc = _seed(conn)
+    version = _version(conn, doc, 1)
+    _chunks(conn, doc, version)
+
+    activation.activate_version(conn, version["id"])
+    again = activation.activate_version(conn, version["id"])
+
+    assert again["activated"] is False
+    assert again["reason"] == "already_active"
+    assert len(audited) == 1
+
+
+def test_activation_prunes_chunks_beyond_retention(conn, audited):
+    settings = replace(get_settings(), keep_versions=2, keep_days=180)
+    doc = _seed(conn)
+    versions = []
+    for no in (1, 2, 3, 4):
+        version = _version(conn, doc, no)
+        _chunks(conn, doc, version)
+        versions.append(version)
+
+    result = activation.activate_version(conn, versions[-1]["id"],
+                                         settings=settings)
+
+    counts = {
+        no: conn.execute("SELECT count(*) AS n FROM chunks WHERE version_id=%s",
+                         (version["id"],)).fetchone()["n"]
+        for no, version in zip((1, 2, 3, 4), versions)
+    }
+    assert counts == {1: 0, 2: 0, 3: 2, 4: 2}
+    assert result["pruned_chunks"] == 4
+    assert conn.execute(
+        "SELECT count(*) AS n FROM doc_versions WHERE document_id=%s",
+        (doc["id"],)).fetchone()["n"] == 4
+
+
+def test_purge_removes_rows_and_file_but_keeps_tombstone(conn, audited, tmp_path):
+    settings = replace(get_settings(), upload_dir=tmp_path / "uploads")
+    doc = _seed(conn)
+    source = tmp_path / "a.docx"
+    source.write_bytes(b"hello")
+    store = FileStore(settings.upload_dir)
+    rel = store.put_file(source, hashlib.sha256(b"hello").hexdigest())
+    version = _version(conn, doc, 1, storage_path=rel)
+    _chunks(conn, doc, version)
+    conn.execute(
+        """INSERT INTO doc_tables (version_id, table_key, header_rows, columns,
+               row_count, confidence, source)
+           VALUES (%s, 't1', '{1}', '[]'::jsonb, 0, 0.9, 'heuristic')""",
+        (version["id"],))
+    item_id = repo.ensure_review_item(conn, version["id"], "structure",
+                                      {"reason": "structure"})
+    repo.add_approval(conn, item_id, "li")
+    conn.commit()
+
+    activation.soft_delete_document(conn, doc["id"], actor="admin")
+    result = activation.purge_document(conn, doc["id"], actor="admin",
+                                       settings=settings)
+
+    assert result["versions"] == 1
+    assert result["files_removed"] == 1
+    assert not store.resolve(rel).exists()
+    counts = conn.execute(
+        """SELECT (SELECT count(*) FROM chunks) AS chunks,
+                  (SELECT count(*) FROM doc_tables) AS doc_tables,
+                  (SELECT count(*) FROM doc_versions) AS versions,
+                  (SELECT count(*) FROM review_items) AS items,
+                  (SELECT count(*) FROM review_approvals) AS approvals"""
+    ).fetchone()
+    assert dict(counts) == {"chunks": 0, "doc_tables": 0, "versions": 0,
+                            "items": 0, "approvals": 0}
+    tomb = repo.get_document(conn, doc["id"])
+    assert tomb["status"] == "deleting"
+    assert tomb["deleted_at"] is not None
+    assert tomb["current_version_id"] is None
+    assert audited[-1]["action"] == "delete"
+
+
+def test_purge_keeps_shared_blob_until_last_reference(conn, audited, tmp_path):
+    settings = replace(get_settings(), upload_dir=tmp_path / "uploads")
+    source = tmp_path / "shared.docx"
+    source.write_bytes(b"shared")
+    store = FileStore(settings.upload_dir)
+    rel = store.put_file(source, hashlib.sha256(b"shared").hexdigest())
+
+    docs = []
+    for _ in range(2):
+        doc = _seed(conn)
+        _version(conn, doc, 1, storage_path=rel)
+        conn.execute(
+            "UPDATE documents SET status='deleting', deleted_at=now() WHERE id=%s",
+            (doc["id"],))
+        conn.commit()
+        docs.append(doc)
+
+    activation.purge_document(conn, docs[0]["id"], settings=settings)
+    assert store.resolve(rel).exists()
+
+    activation.purge_document(conn, docs[1]["id"], settings=settings)
+    assert not store.resolve(rel).exists()
+
+
+def test_purge_refuses_live_document(conn, audited, tmp_path):
+    settings = replace(get_settings(), upload_dir=tmp_path / "uploads")
+    doc = _seed(conn)
+
+    with pytest.raises(DocumentInactive):
+        activation.purge_document(conn, doc["id"], settings=settings)
+
+
+def test_embed_failure_dead_letters_to_review(conn, audited, monkeypatch):
+    doc = _seed(conn)
+    version = _version(conn, doc, 1)
+
+    def boom(conn, version_id, **kwargs):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr(pipeline, "embed_version", boom)
+    enqueue(conn, "embed", {"version_id": str(version["id"])}, max_attempts=0)
+    job = claim(conn, "w")
+    assert run_job(conn, job, pipeline.HANDLERS, "w",
+                   pipeline.DEAD_LETTER_HOOKS) is False
+
+    row = conn.execute("SELECT status, error FROM doc_versions WHERE id=%s",
+                       (version["id"],)).fetchone()
+    assert row["status"] == "failed"
+    assert "ollama down" in row["error"]
+    items = repo.list_open_review_items(conn, version["id"])
+    assert [i["kind"] for i in items] == ["parse_warning"]
+    assert audited[-1]["action"] == "embed_failed"
+
+
+def test_pipeline_registers_activation_handlers():
+    assert pipeline.HANDLERS["activate"] is pipeline.handle_activate
+    assert pipeline.HANDLERS["purge"] is pipeline.handle_purge
+    assert set(pipeline.DEAD_LETTER_HOOKS) == {"parse", "embed", "activate", "purge"}
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_activation.py -v
+```
+
+Expected: FAIL，`AttributeError: module 'ingest.activation' has no attribute 'activate_version'`（`lock_version` 同样缺失）。
+
+- [ ] **Step 3: 写实现**
+
+**3.1 `ingest/config.py` 增加保留策略**
+
+`Settings` 在 `queue_max` 之后插入：
+
+```python
+    keep_versions: int = 3
+    keep_days: int = 180
+```
+
+`get_settings()` 在 `queue_max=...` 之后插入：
+
+```python
+        keep_versions=_int("INGEST_KEEP_VERSIONS", 3),
+        keep_days=_int("INGEST_KEEP_DAYS", 180),
+```
+
+`.env.example` 追加：
+
+```dotenv
+# 旧版本切片保留策略（0 表示禁用该维度；版本行与 doc_tables 永久保留）
+INGEST_KEEP_VERSIONS=3
+INGEST_KEEP_DAYS=180
+```
+
+**3.2 `ingest/repository.py` 增加版本行锁**
+
+紧跟在 `get_version` 之后：
+
+```python
+def lock_version(conn: Connection, version_id: str) -> dict | None:
+    return conn.execute("SELECT * FROM doc_versions WHERE id=%s FOR UPDATE",
+                        (version_id,)).fetchone()
+```
+
+**3.3 `ingest/activation.py`（整文件替换；前两个函数保持 Task 14 原样）**
+
+```python
+from __future__ import annotations
+
+from psycopg import Connection
+
+from app.audit import write_audit
+from ingest import repository as repo
+from ingest.config import Settings, get_settings
+from ingest.errors import DocumentInactive, NotFound, ReviewRequired
+from ingest.queue import enqueue
+from ingest.storage import FileStore
+
+# 只有这两种状态允许新版本激活；inactive/deleting 是终态，避免误操作后旧内容自动复活
+_ACTIVATABLE_STATUSES = {"draft", "active"}
+
+
+def deactivate_document(conn: Connection, document_id: str, *, actor: str) -> dict:
+    if repo.lock_document(conn, document_id) is None:
+        raise NotFound("文档不存在")
+    conn.execute("UPDATE chunks SET active=false WHERE document_id=%s", (document_id,))
+    conn.execute(
+        "UPDATE documents SET status='inactive', updated_at=now() WHERE id=%s",
+        (document_id,),
+    )
+    conn.commit()
+    return {"document_id": document_id, "status": "inactive"}
+
+
+def soft_delete_document(conn: Connection, document_id: str, *, actor: str) -> dict:
+    doc = repo.lock_document(conn, document_id)
+    if doc is None:
+        raise NotFound("文档不存在")
+    if doc["status"] == "deleting":
+        return {"document_id": document_id, "status": "deleting", "queued": False}
+    conn.execute("UPDATE chunks SET active=false WHERE document_id=%s", (document_id,))
+    conn.execute(
+        """UPDATE documents SET status='deleting', deleted_at=now(), updated_at=now()
+           WHERE id=%s""",
+        (document_id,),
+    )
+    enqueue(conn, "purge", {"document_id": document_id}, priority=200)
+    return {"document_id": document_id, "status": "deleting", "queued": True}
+
+
+def _prune_superseded(conn: Connection, document_id, version: dict,
+                      settings: Settings) -> int:
+    """删除超出保留窗口的旧版本切片；版本行与 doc_tables 保留。"""
+    pruned = 0
+    if settings.keep_versions > 0:
+        cutoff = int(version["version_no"]) - settings.keep_versions
+        if cutoff > 0:
+            cur = conn.execute(
+                """DELETE FROM chunks
+                    WHERE document_id=%s AND version_id<>%s
+                      AND version_id IN (
+                          SELECT id FROM doc_versions
+                           WHERE document_id=%s AND version_no<=%s)""",
+                (document_id, version["id"], document_id, cutoff),
+            )
+            pruned += cur.rowcount
+    if settings.keep_days > 0:
+        cur = conn.execute(
+            """DELETE FROM chunks
+                WHERE document_id=%s AND version_id<>%s
+                  AND version_id IN (
+                      SELECT id FROM doc_versions
+                       WHERE document_id=%s AND activated_at IS NOT NULL
+                         AND activated_at < now() - make_interval(days => %s))""",
+            (document_id, version["id"], document_id, settings.keep_days),
+        )
+        pruned += cur.rowcount
+    return pruned
+
+
+def activate_version(conn: Connection, version_id: str, *, actor: str = "worker",
+                     settings: Settings | None = None) -> dict:
+    settings = settings or get_settings()
+    version = repo.lock_version(conn, version_id)
+    if version is None:
+        raise NotFound("版本不存在")
+    doc = repo.lock_document(conn, version["document_id"])
+    if doc is None or doc["deleted_at"] is not None:
+        raise NotFound("文档不存在")
+
+    if doc["status"] not in _ACTIVATABLE_STATUSES:
+        conn.commit()
+        return {"version_id": str(version["id"]), "activated": False,
+                "status": doc["status"], "reason": "document_inactive"}
+
+    if doc["classification"] is None:
+        raise ReviewRequired("未定级文档不可激活")
+
+    if (doc["status"] == "active"
+            and doc["current_version_id"] == version["id"]):
+        conn.commit()
+        return {"version_id": str(version["id"]), "activated": False,
+                "status": "active", "reason": "already_active"}
+
+    if version["status"] != "ready":
+        raise ReviewRequired(f"版本状态为 {version['status']}，不可激活")
+
+    count = conn.execute(
+        "SELECT count(*) AS n FROM chunks WHERE version_id=%s",
+        (version["id"],),
+    ).fetchone()["n"]
+    if count == 0:
+        raise ReviewRequired("版本没有可激活的切片")
+
+    previous = doc["current_version_id"]
+    conn.execute(
+        """UPDATE chunks SET active=false
+           WHERE document_id=%s AND version_id<>%s AND active""",
+        (doc["id"], version["id"]),
+    )
+    conn.execute("UPDATE chunks SET active=true WHERE version_id=%s",
+                 (version["id"],))
+    conn.execute(
+        """UPDATE documents SET status='active', current_version_id=%s,
+               updated_at=now() WHERE id=%s""",
+        (version["id"], doc["id"]),
+    )
+    conn.execute(
+        """UPDATE doc_versions SET activated_at=now()
+           WHERE id=%s AND activated_at IS NULL""",
+        (version["id"],),
+    )
+    pruned = _prune_superseded(conn, doc["id"], version, settings)
+    conn.commit()
+
+    write_audit({
+        "action": "activate", "user": actor, "dept": doc["dept"],
+        "doc_id": str(doc["id"]), "version_id": str(version["id"]),
+        "classification": doc["classification"],
+        "detail": {"previous_version_id": str(previous) if previous else None,
+                   "pruned_chunks": pruned},
+    })
+    return {"version_id": str(version["id"]), "activated": True,
+            "status": "active",
+            "previous_version_id": str(previous) if previous else None,
+            "pruned_chunks": pruned}
+
+
+def purge_document(conn: Connection, document_id: str, *, actor: str = "worker",
+                   settings: Settings | None = None) -> dict:
+    """物理清理已软删除的文档；保留 documents 墓碑行。"""
+    settings = settings or get_settings()
+    doc = repo.lock_document(conn, document_id)
+    if doc is None:
+        raise NotFound("文档不存在")
+    if doc["status"] != "deleting":
+        raise DocumentInactive("只有已删除的文档才可清理")
+
+    versions = repo.list_versions(conn, document_id)
+    version_ids = [v["id"] for v in versions]
+    store = FileStore(settings.upload_dir)
+
+    # 先删原件（引用计数为 0 时），再删数据库行：中途失败重跑可收敛，
+    # 反过来会先丢路径、留下永远无法回收的孤儿文件。
+    stored = sorted({v["storage_path"] for v in versions})
+    removed = 0
+    for rel in stored:
+        other = conn.execute(
+            """SELECT 1 FROM doc_versions
+                WHERE storage_path=%s AND document_id<>%s LIMIT 1""",
+            (rel, document_id),
+        ).fetchone()
+        if other is None:
+            store.delete(rel)
+            removed += 1
+
+    conn.execute("DELETE FROM chunks WHERE document_id=%s", (document_id,))
+    if version_ids:
+        conn.execute("DELETE FROM doc_tables WHERE version_id = ANY(%s)",
+                     (version_ids,))
+        conn.execute(
+            """DELETE FROM review_approvals WHERE review_item_id IN
+               (SELECT id FROM review_items WHERE version_id = ANY(%s))""",
+            (version_ids,),
+        )
+        conn.execute("DELETE FROM review_items WHERE version_id = ANY(%s)",
+                     (version_ids,))
+    conn.execute("DELETE FROM doc_versions WHERE document_id=%s", (document_id,))
+    conn.execute(
+        """UPDATE documents SET current_version_id=NULL, status='deleting',
+               deleted_at=COALESCE(deleted_at, now()), updated_at=now()
+           WHERE id=%s""",
+        (document_id,),
+    )
+    conn.commit()
+
+    write_audit({
+        "action": "delete", "user": actor, "dept": doc["dept"],
+        "doc_id": str(doc["id"]), "classification": doc["classification"],
+        "detail": {"stage": "purged", "versions": len(versions),
+                   "files_removed": removed},
+    })
+    return {"document_id": str(doc["id"]), "status": "deleting",
+            "versions": len(versions), "files_removed": removed}
+```
+
+**3.4 `ingest/pipeline.py`**
+
+顶部导入改为：
+
+```python
+from ingest.activation import activate_version, purge_document
+from ingest.embedding import embed_version
+```
+
+在 `handle_parse_dead_letter` 之后追加（并把该函数里读 `last_error` 的两行换成 `_job_error`）：
+
+```python
+def _job_error(conn: Connection, job_id: int, default: str) -> str:
+    row = conn.execute("SELECT last_error FROM jobs WHERE id=%s",
+                       (job_id,)).fetchone()
+    return (row or {}).get("last_error") or default
+
+
+def handle_parse_dead_letter(conn: Connection, job: dict) -> None:
+    version_id = job["payload"]["version_id"]
+    error = _job_error(conn, job["id"], "parse failed")
+    repo.set_version_status(conn, version_id, "failed", error=error)
+    repo.ensure_review_item(conn, version_id, "parse_warning",
+                            {"reason": "parse_failed", "error": error})
+    conn.commit()
+    write_audit({"action": "parse_failed", "version_id": version_id,
+                 "detail": error})
+
+
+def handle_embed_dead_letter(conn: Connection, job: dict) -> None:
+    version_id = job["payload"]["version_id"]
+    error = _job_error(conn, job["id"], "embed failed")
+    repo.set_version_status(conn, version_id, "failed", error=error)
+    repo.ensure_review_item(conn, version_id, "parse_warning",
+                            {"reason": "embed_failed", "error": error})
+    conn.commit()
+    write_audit({"action": "embed_failed", "version_id": version_id,
+                 "detail": error})
+
+
+def handle_activate(conn: Connection, payload: dict) -> None:
+    activate_version(conn, payload["version_id"])
+
+
+def handle_activate_dead_letter(conn: Connection, job: dict) -> None:
+    version_id = job["payload"]["version_id"]
+    error = _job_error(conn, job["id"], "activate failed")
+    repo.set_version_status(conn, version_id, "failed", error=error)
+    repo.ensure_review_item(conn, version_id, "parse_warning",
+                            {"reason": "activate_failed", "error": error})
+    conn.commit()
+    write_audit({"action": "activate_failed", "version_id": version_id,
+                 "detail": error})
+
+
+def handle_purge(conn: Connection, payload: dict) -> None:
+    purge_document(conn, payload["document_id"])
+
+
+def handle_purge_dead_letter(conn: Connection, job: dict) -> None:
+    # 文档行仍在（墓碑），但切片/版本可能已删一半；记录审计供人工重跑 purge
+    write_audit({"action": "delete", "doc_id": job["payload"].get("document_id"),
+                 "detail": {"stage": "purge_failed", "job_id": job["id"],
+                            "error": _job_error(conn, job["id"], "purge failed")}})
+```
+
+处理器表替换为：
+
+```python
+HANDLERS = {
+    "parse": handle_parse,
+    "embed": handle_embed,
+    "activate": handle_activate,
+    "purge": handle_purge,
+}
+DEAD_LETTER_HOOKS = {
+    "parse": handle_parse_dead_letter,
+    "embed": handle_embed_dead_letter,
+    "activate": handle_activate_dead_letter,
+    "purge": handle_purge_dead_letter,
+}
+```
+
+注意：
+
+- `handle_purge_dead_letter` 不写数据库：进入死信时 worker 已 `rollback`，且文档可能已被清理到只剩墓碑；人工用同一个 `purge` payload 重跑即可（`purge_document` 幂等）。
+- `activate` 的 `ReviewRequired`（未定级/状态不对）会被当作可重试错误重试 3 次，属可接受的浪费；最终死信把版本标 `failed` 并生成复核项，不会静默卡在 `ready`。
+- 激活不暴露 HTTP 接口，只由 `embed` 成功后自动入队；下线/删除仍走 Task 14 的接口。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_activation.py -v
+```
+
+Expected: 13 passed。
+
+- [ ] **Step 5: 回归既有测试**
+
+```bash
+uv run pytest tests/test_web.py tests/test_main.py -q
+```
+
+Expected: 既有测试全绿（本任务只动 `ingest/` 与 `.env.example`）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ingest/config.py ingest/repository.py ingest/activation.py \
+  ingest/pipeline.py .env.example tests/ingest/test_activation.py
+git commit -m "feat(ingest): 版本激活事务、下线保留策略与异步清理"
 ```
 
 ---

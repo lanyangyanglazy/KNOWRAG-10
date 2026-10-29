@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from app.rag_service import BASE_DIR, RagService, max_distance
+from app.rag_service import BASE_DIR, RagService, core, max_distance
 from app.users import DEMO_USERS, User, authenticate, get_user
 
 logger = logging.getLogger("rag.server")
@@ -50,6 +50,24 @@ TRUST_PROXY = os.getenv("TRUST_PROXY", "0").strip().lower() in {"1", "true", "ye
 # 登录失败限速：连续 5 次失败锁定 30 分钟（与演示语料 gov-004 的口令要求口径一致）。
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCK_SECONDS = 30 * 60
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是整数，使用默认值 %d", name, raw, default)
+        return default
+    return value if value > 0 else default
+
+
+# 问答并发上限：同步端点跑在线程池里，每个请求占一个线程直到生成结束。
+# 不设上限时，少量慢请求就能打满线程池，把登录、/api/me 等轻接口一起拖死。
+MAX_CONCURRENT_CHATS = _env_positive_int("MAX_CONCURRENT_CHATS", 4)
+_chat_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CHATS)
 
 # 会话密钥：生产必须从密钥管理系统注入。缺失时随机生成，仅适用于单进程本地演示。
 _SESSION_SECRET_FROM_ENV = os.getenv("SESSION_SECRET")
@@ -371,10 +389,13 @@ def health():
             },
         )
     stats = _service.stats()
+    issues = stats.get("load_issues", [])
     return {
         "ok": True,
         "docs": stats["docs"],
         "chunks": stats["chunks"],
+        "skipped_docs": len(issues),
+        "skipped_files": [item["file"] for item in issues],
         "max_distance": max_distance(),
     }
 
@@ -421,14 +442,24 @@ def chat(
 
     def event_stream() -> Iterator[str]:
         nonlocal rewritten
+
+        # 并发闸门：拿不到槽位就回一个 error 事件，不排队、不占线程。
+        if not _chat_slots.acquire(blocking=False):
+            logger.warning("chat 并发已满（上限 %d），拒绝新请求", MAX_CONCURRENT_CHATS)
+            yield _sse({"type": "error", "message": "当前问答请求过多，请稍后重试"})
+            return
+
         answer_parts: list[str] = []
         citations: list[dict] = []
         refusal: dict | None = None
         status = "ok"
         error_text: str | None = None
+        deadline = started + float(core.LLM_TIMEOUT_S)
 
         try:
             for event in service.answer_stream(user, question, history):
+                if time.perf_counter() > deadline:
+                    raise TimeoutError(f"本次生成超过 {core.LLM_TIMEOUT_S:.0f}s 预算")
                 if event["type"] == "rewrite":
                     rewritten = event["to"]
                 elif event["type"] == "token":
@@ -449,6 +480,7 @@ def chat(
             # 只回传 request_id，不把内部异常文本（可能含内网地址/模型端点）暴露给前端
             yield _sse({"type": "error", "message": f"生成失败，请稍后重试（请求号 {request_id}）"})
         finally:
+            _chat_slots.release()
             if status == "ok" and refusal is not None:
                 status = "refused"
 

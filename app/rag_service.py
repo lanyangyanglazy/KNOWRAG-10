@@ -109,6 +109,17 @@ class GovDoc:
     path: Path
 
 
+@dataclass
+class DocIssue:
+    """一份加载失败、被跳过的文档。"""
+
+    path: Path
+    reason: str
+
+    def to_dict(self) -> dict:
+        return {"file": self.path.name, "reason": self.reason}
+
+
 def parse_front_matter(text: str) -> tuple[dict, str]:
     """
     拆分 YAML front matter 与正文。
@@ -129,31 +140,60 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
     return meta, text[match.end():]
 
 
-def load_gov_docs(docs_dir: Path = GOV_DOCS_DIR) -> list[GovDoc]:
-    """读取 data/gov_docs/*.md，校验元数据并归一化密级。"""
+def load_gov_docs(
+    docs_dir: Path = GOV_DOCS_DIR,
+    *,
+    strict: bool = True,
+    issues: list[DocIssue] | None = None,
+) -> list[GovDoc]:
+    """
+    读取 data/gov_docs/*.md，校验元数据并归一化密级。
+
+    strict=True（默认）遇到坏文档立即抛错，保持调用方（测试/工具）的严格语义；
+    strict=False 时跳过坏文档并记入 `issues`，用于运行时——单个文件格式错误
+    不应让整个知识库 503。全部文档都坏时仍然抛错（没有可用语料不等于可用）。
+    """
     docs: list[GovDoc] = []
     paths = sorted(Path(docs_dir).glob("*.md"))
     if not paths:
         raise FileNotFoundError(f"未在 {docs_dir} 找到任何 Markdown 文档")
 
     for path in paths:
-        meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
-        missing = [k for k in _REQUIRED_FIELDS if not meta.get(k)]
-        if missing:
-            raise ValueError(f"{path.name} 缺少必填元数据: {', '.join(missing)}")
-        level = CLASSIFICATION_LEVELS.get(meta["classification"])
-        if level is None:
-            raise ValueError(
-                f"{path.name} 的 classification='{meta['classification']}' 非法，"
-                f"可选：{'/'.join(CLASSIFICATION_LEVELS)}"
-            )
-        meta = {**meta, "classification_level": level}
-        docs.append(GovDoc(metadata=meta, body=body, path=path))
+        try:
+            meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
+            missing = [k for k in _REQUIRED_FIELDS if not meta.get(k)]
+            if missing:
+                raise ValueError(f"{path.name} 缺少必填元数据: {', '.join(missing)}")
+            level = CLASSIFICATION_LEVELS.get(meta["classification"])
+            if level is None:
+                raise ValueError(
+                    f"{path.name} 的 classification='{meta['classification']}' 非法，"
+                    f"可选：{'/'.join(CLASSIFICATION_LEVELS)}"
+                )
+        except (ValueError, yaml.YAMLError, OSError) as exc:
+            if strict:
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning("跳过无法加载的文档 %s（%s）", path.name, reason)
+            if issues is not None:
+                issues.append(DocIssue(path=path, reason=reason))
+            continue
+
+        docs.append(GovDoc(metadata={**meta, "classification_level": level}, body=body, path=path))
+
+    if not docs:
+        detail = "；".join(f"{i.path.name}: {i.reason}" for i in (issues or []))
+        raise RuntimeError(f"{docs_dir} 下没有任何可加载的文档。{detail}")
 
     return docs
 
 
-def load_gov_documents(docs_dir: Path = GOV_DOCS_DIR) -> list[LCDocument]:
+def load_gov_documents(
+    docs_dir: Path = GOV_DOCS_DIR,
+    *,
+    strict: bool = True,
+    issues: list[DocIssue] | None = None,
+) -> list[LCDocument]:
     """把带密级文档切成检索切片，每个切片携带完整的密级/部门元数据。"""
     splitter = RecursiveCharacterTextSplitter(
         separators=core.CHINESE_SEPARATORS,
@@ -161,7 +201,7 @@ def load_gov_documents(docs_dir: Path = GOV_DOCS_DIR) -> list[LCDocument]:
         chunk_overlap=core.CHUNK_OVERLAP,
     )
     documents: list[LCDocument] = []
-    for gov in load_gov_docs(docs_dir):
+    for gov in load_gov_docs(docs_dir, strict=strict, issues=issues):
         meta = gov.metadata
         chunks = [c for c in splitter.split_text(gov.body) if c.strip()]
         for idx, chunk in enumerate(chunks):
@@ -296,7 +336,15 @@ class RagService:
     def __init__(self, llm=None, embed_model=None, history_turns: int = core.MAX_HISTORY_TURNS):
         self.llm = llm or core.init_llm()
         self.embed_model = embed_model or core.init_embedding()
-        self.documents = load_gov_documents()
+        # 运行时用宽松模式：单个坏文件只跳过并留痕，不让整库不可用
+        self.load_issues: list[DocIssue] = []
+        self.documents = load_gov_documents(issues=self.load_issues)
+        if self.load_issues:
+            logger.warning(
+                "语料加载跳过 %d 个文件（以部分文档启动）：%s",
+                len(self.load_issues),
+                "；".join(f"{i.path.name}（{i.reason}）" for i in self.load_issues),
+            )
         self.vectorstore = build_or_load_index(self.documents, self.embed_model)
         self.history_turns = history_turns
         self._history: dict[str, list] = {}
@@ -397,7 +445,8 @@ class RagService:
         rewrite / citations / token / done / refusal
         """
         started = time.perf_counter()
-        history = history or []
+        # 历史先按字符预算裁剪，避免长答案把上下文撑爆后被模型静默截断
+        history = core.trim_history(history or [])
 
         # 1) 多轮改写：把「它有几类？」还原成可独立检索的问题
         search_query = core.condense_question(self.llm, history, question)
@@ -422,7 +471,8 @@ class RagService:
         yield {"type": "citations", "items": citations}
 
         # 3) 拼 Prompt 并流式生成（复用 <think> 过滤）
-        context = "\n\n".join(doc.page_content for doc in retrieval.docs)
+        # 上下文带 [n] 编号且受字符预算约束，编号与 citations 的 rank 一一对应
+        context = core.format_context(retrieval.docs)
         messages = core.RAG_PROMPT.invoke(
             {"context": context, "question": question, "history": history}
         )
@@ -463,6 +513,7 @@ class RagService:
             "docs": len({doc.metadata["doc_id"] for doc in self.documents}),
             "chunks": len(self.documents),
             "chunks_by_classification": by_class,
+            "load_issues": [issue.to_dict() for issue in self.load_issues],
             "embed_model": core.EMBED_MODEL,
             "llm_provider": core.LLM_PROVIDER,
             "llm_model": (

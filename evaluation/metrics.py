@@ -65,6 +65,8 @@ class CaseOutcome:
     # 性能与答案
     elapsed_ms: float = 0.0
     answer: str = ""
+    # answer 模式下服务实际用于检索的改写结果（多轮追问改写是否生效的证据）
+    rewritten_to: str = ""
 
 
 # ---------- 证据命中 ----------

@@ -1,0 +1,42 @@
+# 政务 RAG 种子评测集（30 条）
+# 字段约定见 evaluation/cases.py；evidence 必须能在单个切片里原文匹配。
+# 覆盖：单文档事实 / 数值 / 跨文档 / 权限拒答 / 超纲拒答 / 多轮指代
+
+{"id": "fact-001", "user": "zhang", "question": "政务服务中心的办公时间是几点到几点？", "expected_doc_ids": ["gov-001"], "evidence": ["上午 8:30 至 12:00"], "tags": ["single_fact"]}
+{"id": "fact-002", "user": "zhang", "question": "承诺件多久能办结？", "expected_doc_ids": ["gov-001"], "evidence": ["承诺件自受理之日起 5 个工作日内办结"], "tags": ["single_fact"]}
+{"id": "fact-003", "user": "zhang", "question": "政务信息公开申请多久答复？", "expected_doc_ids": ["gov-001"], "evidence": ["20 个工作日内予以答复"], "tags": ["single_fact"]}
+{"id": "fact-004", "user": "zhang", "question": "线上办理遇到系统问题怎么反馈？", "expected_doc_ids": ["gov-001"], "evidence": ["工单一般在 1 个工作日内响应"], "tags": ["single_fact"]}
+{"id": "fact-005", "user": "li", "question": "年休假有多少天？", "expected_doc_ids": ["gov-002"], "evidence": ["满 1 年不满 10 年的，年休假 5 天"], "tags": ["single_fact"]}
+{"id": "fact-006", "user": "li", "question": "请病假需要什么证明？", "expected_doc_ids": ["gov-002"], "evidence": ["二级以上医院"], "tags": ["single_fact"]}
+{"id": "fact-007", "user": "li", "question": "迟到多久会被记录？", "expected_doc_ids": ["gov-002"], "evidence": ["迟到 15 分钟以内的"], "tags": ["single_fact"]}
+{"id": "fact-008", "user": "wang", "question": "差旅住宿费标准是多少？", "expected_doc_ids": ["gov-003"], "evidence": ["一类城市每人每天 900 元"], "tags": ["single_fact"]}
+{"id": "fact-009", "user": "wang", "question": "报销费用后多久内要提交？", "expected_doc_ids": ["gov-003"], "evidence": ["费用发生后 30 日内完成报销"], "tags": ["single_fact"]}
+{"id": "fact-010", "user": "chen", "question": "口令长度有什么要求？", "expected_doc_ids": ["gov-004"], "evidence": ["口令长度不少于 12 位"], "tags": ["single_fact"]}
+{"id": "fact-011", "user": "chen", "question": "发现安全事件后多久报告？", "expected_doc_ids": ["gov-004"], "evidence": ["30 分钟内电话报告信息中心"], "tags": ["single_fact"]}
+{"id": "fact-012", "user": "chen", "question": "数据外发需要谁审批？", "expected_doc_ids": ["gov-004"], "evidence": ["数据外发实行双人审批"], "tags": ["single_fact"]}
+
+{"id": "num-001", "user": "li", "question": "旷工一天扣多少绩效？", "expected_doc_ids": ["gov-002"], "evidence": ["旷工 1 天扣发当月绩效的 20%"], "tags": ["numeric"]}
+{"id": "num-002", "user": "wang", "question": "20 万到 50 万的支出由谁审批？", "expected_doc_ids": ["gov-003"], "evidence": ["20 万元（含）至 50 万元的，提交党组会集体研究"], "tags": ["numeric"]}
+{"id": "num-003", "user": "chen", "question": "口令多久必须更换一次？", "expected_doc_ids": ["gov-004"], "evidence": ["每 90 天更换一次"], "tags": ["numeric"]}
+{"id": "num-004", "user": "wang", "question": "出差伙食补助每天多少钱？", "expected_doc_ids": ["gov-003"], "evidence": ["伙食补助费每人每天 100 元"], "tags": ["numeric"]}
+{"id": "num-005", "user": "li", "question": "年度事假最多多少天？", "expected_doc_ids": ["gov-002"], "evidence": ["年度累计事假原则上不超过 15 天"], "tags": ["numeric"]}
+
+{"id": "cross-001", "user": "li", "question": "政务服务中心的办公时间和单位作息时间有什么不同？", "expected_doc_ids": ["gov-001", "gov-002"], "evidence": ["上午 8:30 至 12:00", "上午 9:00 上班"], "tags": ["cross_doc"]}
+{"id": "cross-002", "user": "wang", "question": "办事大厅办公时间和差旅住宿标准分别是什么？", "expected_doc_ids": ["gov-001", "gov-003"], "evidence": ["上午 8:30 至 12:00", "一类城市每人每天 900 元"], "tags": ["cross_doc"]}
+{"id": "cross-003", "user": "chen", "question": "办公时间和口令要求分别是什么？", "expected_doc_ids": ["gov-001", "gov-004"], "evidence": ["上午 8:30 至 12:00", "口令长度不少于 12 位"], "tags": ["cross_doc"]}
+
+{"id": "perm-001", "user": "zhang", "question": "差旅住宿费标准是多少？", "should_refuse": true, "forbidden_doc_ids": ["gov-003"], "tags": ["permission"]}
+{"id": "perm-002", "user": "zhang", "question": "年休假有几天？", "should_refuse": true, "forbidden_doc_ids": ["gov-002"], "tags": ["permission"]}
+{"id": "perm-003", "user": "li", "question": "差旅住宿费标准是多少？", "should_refuse": true, "forbidden_doc_ids": ["gov-003"], "tags": ["permission"]}
+{"id": "perm-004", "user": "wang", "question": "年休假有几天？", "should_refuse": true, "forbidden_doc_ids": ["gov-002"], "tags": ["permission"]}
+{"id": "perm-005", "user": "chen", "question": "差旅住宿费标准是多少？", "should_refuse": true, "forbidden_doc_ids": ["gov-003"], "tags": ["permission"]}
+{"id": "perm-006", "user": "zhang", "question": "口令有什么要求？", "should_refuse": true, "forbidden_doc_ids": ["gov-004"], "tags": ["permission"]}
+
+{"id": "scope-001", "user": "zhang", "question": "如何申请公租房？", "should_refuse": true, "tags": ["out_of_scope"]}
+{"id": "scope-002", "user": "wang", "question": "今天天气怎么样？", "should_refuse": true, "tags": ["out_of_scope"]}
+{"id": "scope-003", "user": "chen", "question": "单位今年科研项目立项情况如何？", "should_refuse": true, "tags": ["out_of_scope"]}
+
+{"id": "multi-001", "user": "wang", "question": "那伙食补助和市内交通费呢？", "search_query": "差旅伙食补助费和市内交通费标准是多少", "expected_doc_ids": ["gov-003"], "evidence": ["伙食补助费每人每天 100 元"], "tags": ["multi_turn"], "history": [{"role": "user", "content": "差旅住宿费标准是多少？"}, {"role": "assistant", "content": "一类城市每人每天 900 元，二类城市 600 元，三类城市 450 元。"}]}
+{"id": "multi-002", "user": "li", "question": "没休完能结转吗？", "search_query": "年休假未休完可以结转到次年吗", "expected_doc_ids": ["gov-002"], "evidence": ["结转至次年 3 月 31 日前使用"], "tags": ["multi_turn"], "history": [{"role": "user", "content": "年休假有几天？"}, {"role": "assistant", "content": "满 1 年不满 10 年 5 天，满 10 年不满 20 年 10 天，满 20 年 15 天。"}]}
+{"id": "multi-003", "user": "chen", "question": "多久要换一次？", "search_query": "口令多久更换一次", "expected_doc_ids": ["gov-004"], "evidence": ["每 90 天更换一次"], "tags": ["multi_turn"], "history": [{"role": "user", "content": "口令长度有什么要求？"}, {"role": "assistant", "content": "口令长度不少于 12 位，须包含大小写字母、数字和特殊字符中的至少三类。"}]}
+{"id": "multi-004", "user": "zhang", "question": "可以延长吗？", "search_query": "承诺件办理时限可以延长多久", "expected_doc_ids": ["gov-001"], "evidence": ["经批准可延长 5 个工作日"], "tags": ["multi_turn"], "history": [{"role": "user", "content": "承诺件多久能办结？"}, {"role": "assistant", "content": "承诺件自受理之日起 5 个工作日内办结。"}]}

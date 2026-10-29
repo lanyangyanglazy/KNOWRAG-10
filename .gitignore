@@ -34,3 +34,10 @@ logs/
 
 # Local agent working notes (not part of the project)
 .workbuddy/
+
+# Evaluation run outputs (reports/baseline are generated locally)
+evaluation/reports/
+
+# Frontend build artifacts
+node_modules/
+frontend/dist/

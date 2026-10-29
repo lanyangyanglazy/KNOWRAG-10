@@ -106,6 +106,38 @@ class TestGovCorpus:
         )
         assert rs.corpus_signature(tmp_path) != sig1, "改密级也必须触发索引重建"
 
+    def test_bad_documents_are_skipped_in_lenient_mode(self, tmp_path):
+        """单个坏文件不应拖垮整库：运行时跳过并留下可定位的 issue。"""
+        (tmp_path / "good.md").write_text(
+            "---\ndoc_id: a\ntitle: t\ndept: d\nclassification: 公开\n---\n正文",
+            encoding="utf-8",
+        )
+        (tmp_path / "bom.md").write_bytes(
+            "\ufeff---\ndoc_id: b\ntitle: t\ndept: d\nclassification: 公开\n---\n正文".encode("utf-8")
+        )
+        (tmp_path / "missing.md").write_text(
+            "---\ndoc_id: c\ntitle: t\ndept:\nclassification: 公开\n---\n正文",
+            encoding="utf-8",
+        )
+
+        issues = []
+        docs = rs.load_gov_docs(tmp_path, strict=False, issues=issues)
+
+        assert [d.metadata["doc_id"] for d in docs] == ["a"]
+        assert {i.path.name for i in issues} == {"bom.md", "missing.md"}
+        assert all(i.reason for i in issues)
+
+    def test_all_bad_documents_still_fail(self, tmp_path):
+        """全部文档都坏时不能静默变成「空知识库」。"""
+        (tmp_path / "bad.md").write_text("没有 front matter", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="没有任何可加载的文档"):
+            rs.load_gov_docs(tmp_path, strict=False)
+
+    def test_strict_mode_still_fails_fast(self, tmp_path):
+        (tmp_path / "bad.md").write_text("---\ndoc_id: x\n---\n正文", encoding="utf-8")
+        with pytest.raises(ValueError, match="缺少必填元数据"):
+            rs.load_gov_docs(tmp_path, strict=True)
+
 
 # ---------- 文档级权限 ----------
 
@@ -401,3 +433,28 @@ class TestHttpApi:
         _login(client)
         monkeypatch.setattr(server, "audit_ready", lambda: (False, "disk full"))
         assert client.post("/api/chat", json={"question": "你好"}).status_code == 503
+
+    def test_chat_rejects_when_concurrency_saturated(self, client, monkeypatch):
+        import threading
+
+        slots = threading.BoundedSemaphore(1)
+        assert slots.acquire(blocking=False)
+        monkeypatch.setattr(server, "_chat_slots", slots)
+        _login(client)
+
+        with client.stream("POST", "/api/chat", json={"question": "任意问题"}) as res:
+            body = "".join(res.iter_text())
+
+        assert "请求过多" in body
+
+    def test_chat_times_out_and_reports_error(self, client, monkeypatch, tmp_path):
+        _login(client)
+        monkeypatch.setattr(server.core, "LLM_TIMEOUT_S", 0.0)
+
+        with client.stream("POST", "/api/chat", json={"question": "任意问题"}) as res:
+            body = "".join(res.iter_text())
+
+        assert '"type": "error"' in body
+        record = _audit_records(tmp_path / "audit.jsonl")[-1]
+        assert record["status"] == "error"
+        assert "TimeoutError" in record["error"]

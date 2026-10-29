@@ -316,6 +316,13 @@
   .cite-title { font-size: 13px; font-weight: 600; line-height: 1.5; }
   .cite-meta { margin-top: 2px; font-size: 12px; color: var(--muted); }
   .cite-preview { margin-top: 4px; font-size: 12.5px; line-height: 1.65; color: var(--muted); }
+  .cite-ref {
+    color: var(--blue); font-size: 11px; vertical-align: super;
+    cursor: pointer; margin: 0 1px; text-decoration: none;
+  }
+  .cite-ref:hover { text-decoration: underline; }
+  .cite-ref.is-missing { color: var(--red); text-decoration: line-through; cursor: default; }
+  .cite-item.is-active { background: var(--blue-50); }
 
   .empty-state { max-width: 560px; margin: 7vh auto 0; text-align: center; color: var(--muted); }
   .empty-rule { width: 48px; height: 2px; background: var(--blue); margin: 0 auto 18px; }
@@ -743,9 +750,9 @@
     return /^(https?:\/\/|\/)/i.test(url);
   }
 
-  // 行内解析：加粗 / 斜体 / 行内代码 / 链接；所有内容以文本节点或受控元素写入
+  // 行内解析：加粗 / 斜体 / 行内代码 / 链接 / [n] 引用角标；所有内容以文本节点或受控元素写入
   function renderInline(parent, text) {
-    const re = /(\*\*([^*]+)\*\*)|(`([^`]+)`)|(\*([^*]+)\*)|(\[([^\]]+)\]\((https?:\/\/[^)\s]+|[^)\s]+)\))/g;
+    const re = /(\*\*([^*]+)\*\*)|(`([^`]+)`)|(\*([^*]+)\*)|(\[([^\]]+)\]\((https?:\/\/[^)\s]+|[^)\s]+)\))|(\[(\d{1,2})\])/g;
     let last = 0, m;
     while ((m = re.exec(text)) !== null) {
       if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
@@ -773,10 +780,25 @@
         } else {
           parent.appendChild(document.createTextNode(m[8]));
         }
+      } else if (m[10]) {
+        const sup = document.createElement("sup");
+        sup.className = "cite-ref";
+        sup.dataset.rank = m[11];
+        sup.textContent = m[10];
+        parent.appendChild(sup);
       }
       last = re.lastIndex;
     }
     if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+  }
+
+  // 模型可能编造不存在的编号：标成红色删除线，避免用户以为有依据
+  function markRefs(card) {
+    card.querySelectorAll(".cite-ref").forEach((ref) => {
+      const exists = card.querySelector(`.cite-item[data-rank="${ref.dataset.rank}"]`);
+      ref.classList.toggle("is-missing", !exists);
+      ref.setAttribute("aria-label", exists ? `查看引用 ${ref.dataset.rank}` : "引用的片段不存在");
+    });
   }
 
   function splitRow(row) {
@@ -1142,7 +1164,7 @@
     view.citeList.innerHTML = items.map((it) => {
       const preview = cleanPreview(it.preview);
       return `
-      <div class="cite-item">
+     <div class="cite-item" data-rank="${it.rank}">
         <div class="cite-index">[${it.rank}]</div>
         <div>
           <div class="cite-title-row">
@@ -1252,6 +1274,7 @@
           answer = ev.answer || answer;
           if (renderer) renderer.flush();
           renderMarkdown(view.content, answer);
+          markRefs(view.card);
           view.content.classList.remove("pending");
           view.meta.textContent =
             `完成 · ${fmtNumber(ev.elapsed_ms)} ms · 引用 ${ev.citations.length} 段 · ${nowTime()}`;
@@ -1287,6 +1310,7 @@
       view.content.classList.remove("pending");
       cancelled = true;
       if (renderer) { if (answer) renderer.flush(); else renderer.cancel(); }
+      if (answer) markRefs(view.card);
       if (err.name === "AbortError") {
         if (!answer && !gotToken) view.content.textContent = "已取消本次提问。";
         view.meta.textContent = `已停止生成 · ${nowTime()}`;
@@ -1345,6 +1369,19 @@
 
   $("messages").addEventListener("scroll", updateScrollButton, { passive: true });
   $("scroll-bottom").addEventListener("click", scrollBottom);
+
+  // [n] 引用角标：点击滚动到对应引用片段并高亮
+  $("messages").addEventListener("click", (e) => {
+    const ref = e.target.closest(".cite-ref");
+    if (!ref || ref.classList.contains("is-missing")) return;
+    const card = ref.closest(".answer-card");
+    if (!card) return;
+    const target = card.querySelector(`.cite-item[data-rank="${ref.dataset.rank}"]`);
+    if (!target) return;
+    card.querySelectorAll(".cite-item.is-active").forEach((el) => el.classList.remove("is-active"));
+    target.classList.add("is-active");
+    target.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  });
 
   $("clear-btn").addEventListener("click", async () => {
     if (sending) return;

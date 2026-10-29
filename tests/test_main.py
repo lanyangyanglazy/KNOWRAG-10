@@ -486,5 +486,63 @@ class TestStreaming:
         assert "已中断" in capsys.readouterr().out
 
 
+class TestContextBudget:
+    """B5/B2：上下文编号与 token 预算。"""
+
+    @staticmethod
+    def _doc(text, title, dept="综合处", classification="公开"):
+        from langchain_core.documents import Document
+
+        return Document(
+            page_content=text,
+            metadata={"title": title, "dept": dept, "classification": classification},
+        )
+
+    def test_format_context_numbers_chunks(self):
+        import main
+
+        docs = [
+            self._doc("甲内容", "文档甲"),
+            self._doc("乙内容", "文档乙", dept="财务处", classification="秘密"),
+        ]
+        ctx = main.format_context(docs, budget=1000)
+
+        assert "[1] 文档甲（综合处 / 公开）" in ctx
+        assert "[2] 文档乙（财务处 / 秘密）" in ctx
+        assert ctx.index("[1]") < ctx.index("[2]"), "编号顺序必须与 citations 的 rank 一致"
+
+    def test_format_context_respects_budget(self):
+        import main
+
+        docs = [self._doc("很长的正文" * 50, "文档甲"), self._doc("第二段", "文档乙")]
+        ctx = main.format_context(docs, budget=40)
+
+        assert "[2]" not in ctx, "超出预算的片段不应进入上下文"
+        assert len(ctx) <= 45
+
+    def test_trim_history_respects_budget(self):
+        import main
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        history = [
+            HumanMessage(content="a" * 100),
+            AIMessage(content="b" * 100),
+            HumanMessage(content="c" * 100),
+        ]
+        assert main.trim_history(history, budget=150) == history[-1:]
+        assert main.trim_history(history, budget=1000) == history
+        assert main.trim_history([], budget=10) == []
+
+    def test_prompt_requires_citation_numbers(self):
+        import main
+
+        prompt = main.RAG_PROMPT.invoke(
+            {"context": "[1] 片段", "question": "问题", "history": []}
+        )
+        system_text = prompt.messages[0].content
+        assert "[编号]" in system_text
+        assert "不得编造编号" in system_text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -18,8 +18,11 @@
 | 多轮对话 | 复用 `main.py` 的追问改写（`condense_question`）与最近 3 轮历史 |
 | 流式输出 | SSE 推送结构化事件，逐 token 渲染，跨分片 `<think>` 过滤 |
 | 引用来源 | 每个回答附带文档标题、部门、密级、生效日期、切片预览 |
+| 引用可核查 | 上下文按 `[n]` 编号，Prompt 强制答案标注依据；前端角标可点击定位，越界编号标红 |
 | 拒答 | 无可见文档 / 相关性不足 → 直接拒答，**不调用生成模型** |
 | 审计 | 问答、登录/失败/锁定、登出、清空会话均落 JSONL；问答前做可写性预检（fail-closed） |
+| 单文档容错 | 坏文件（BOM / 缺字段）跳过并记录，`/api/health` 暴露 `skipped_files`，不整库 503 |
+| 过载保护 | 问答并发上限 + 单次生成 deadline；超限/超时回 `error` 事件并写审计 |
 
 ## 快速开始
 
@@ -256,11 +259,29 @@ SSE 事件类型：
 | `refusal` | 拒答，携带原因、可见文档数、最佳距离 |
 | `error` | 异常 |
 
+## 评测
+
+`evaluation/` 是独立评测台：金标绑「文档 + 证据原文」而不是 `chunk_id`，换切分方案或迁向量库都不用重标。
+指标包括 Recall@K、MRR、证据命中率、拒答准确率、越权泄露数与时延分位。
+
+```bash
+# 检索模式（需要 Ollama 提供 embedding；默认用例集 evaluation/cases.jsonl）
+uv run python -m evaluation.runner --mode retrieval
+
+# 存基线，之后用它做回归门禁（指标跌幅超过 --tolerance 即失败）
+uv run python -m evaluation.runner --mode retrieval --save-baseline
+uv run python -m evaluation.runner --mode retrieval --baseline evaluation/reports/baseline.json
+```
+
+种子集共 33 条，覆盖六类标签：单文档事实、数值、跨文档、权限拒答、超纲拒答、多轮指代。
+`pytest` 会校验用例与语料一致（金标文档存在、证据能在单切片内原文匹配），
+用例写错会在测试阶段失败，而不是安静地拉低指标。
+
 ## 测试
 
 ```bash
-uv run pytest tests/test_web.py -q   # 36 个用例
-uv run pytest -q                     # 全量 82 个用例
+uv run pytest tests/test_web.py -q   # 41 个用例
+uv run pytest -q                     # 全量 171 个用例
 ```
 
 `tests/test_web.py` 覆盖：
@@ -292,10 +313,10 @@ uv run pytest -q                     # 全量 82 个用例
 | Cookie 未开 `secure` | 内网 HTTP 演示需要；HTTPS 部署必须开启 | P0 部署 |
 | 历史存内存 | 单进程、重启即丢；多副本不共享 | P1 会话存储 |
 | 无内容安全过滤 | 输入输出敏感词、提示注入防护未做 | P1 |
-| 无 Rerank / 评测集 | 相关性只靠 L2 阈值，召回质量有限；阈值仅由 12 条样本校准 | P1 |
+| 无 Rerank | 相关性只靠 L2 阈值；评测集为 33 条种子，覆盖面仍有限 | P1 |
 | 审计仅本机 JSONL | 含明文答案，无轮转/防篡改/异地留存；需配合文件权限与独立备份 | P1 |
-| 问答无限流 | 登录已限速，但问答接口没有并发/频率限制与超时降级 | P1 |
-| 引用不能点击回源 | 只返回预览片段，答案正文也未标注 `[n]` 编号 | P0 完整版 |
+| 无按用户频率限制 | 已有全局并发上限与单次生成 deadline，但没有 per-user QPS / 日配额 | P1 |
+| 引用只能定位到片段 | 已有 `[n]` 角标与片段高亮，但没有原文页码/段落定位与历史版本快照 | P0 完整版 |
 | 单进程建索引 | 多副本需要共享向量库或独立构建；索引目录可写即等同于代码执行（pickle） | P2 |
 
 完整的差距清单、目标架构与分期路线见 [`docs/政府级RAG改造方案.md`](../docs/政府级RAG改造方案.md)。

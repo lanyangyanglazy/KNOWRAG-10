@@ -31,7 +31,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import List
+from typing import List, Sequence
 
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
@@ -100,6 +100,49 @@ RRF_K = 60       # RRF 融合参数，越大两种检索结果越均衡
 MAX_HISTORY_TURNS = 3  # 多轮对话保留的最近轮数（1 轮 = 1 问 + 1 答）
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """读取整数环境变量，非法值回退默认（避免一个错配置打挂整个服务）。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} 不是整数，使用默认值 {default}")
+        return default
+    if value < minimum:
+        print(f"⚠️ {name}={value} 小于下限 {minimum}，使用默认值 {default}")
+        return default
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float = 1.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} 不是数字，使用默认值 {default}")
+        return default
+    if value < minimum:
+        print(f"⚠️ {name}={value} 小于下限 {minimum}，使用默认值 {default}")
+        return default
+    return value
+
+
+# LLM 预算：显式设置，避免 Ollama 默认 num_ctx（常见 2048/4096）静默截断上下文，
+# 表现为「答案突然变差」却没有任何报错。超时避免单次生成无限占住线程。
+LLM_NUM_CTX = _env_int("LLM_NUM_CTX", 4096)
+LLM_NUM_PREDICT = _env_int("LLM_NUM_PREDICT", 1024)
+LLM_TIMEOUT_S = _env_float("LLM_TIMEOUT_S", 120.0)
+
+# 上下文/历史预算：按字符保守估算（中文 1 字约 1 token，英文 4 字符约 1 token）。
+# 宁可比 num_ctx 小，也不要让服务端做静默截断。
+MAX_CONTEXT_CHARS = _env_int("MAX_CONTEXT_CHARS", 6000)
+MAX_HISTORY_CHARS = _env_int("MAX_HISTORY_CHARS", 3000)
+
+
 # ============== 中文分词 ==============
 
 def tokenize(text: str) -> List[str]:
@@ -147,12 +190,25 @@ def init_llm(provider: str | None = None):
                 "（获取地址：https://platform.deepseek.com/api_keys）"
             )
         print(f"🔧 初始化 DeepSeek LLM (model={DEEPSEEK_MODEL})...")
-        # temperature=0 让 RAG 答案稳定可复现
-        return ChatDeepSeek(model=DEEPSEEK_MODEL, api_key=api_key, temperature=0)
+        # temperature=0 让 RAG 答案稳定可复现；max_tokens 与 ollama 的 num_predict 对齐
+        return ChatDeepSeek(
+            model=DEEPSEEK_MODEL,
+            api_key=api_key,
+            temperature=0,
+            max_tokens=LLM_NUM_PREDICT,
+            request_timeout=LLM_TIMEOUT_S,
+            max_retries=1,
+        )
 
     # 默认 ollama
     print(f"🔧 初始化 Ollama LLM (model={OLLAMA_LLM_MODEL})...")
-    return ChatOllama(model=OLLAMA_LLM_MODEL, temperature=0)
+    return ChatOllama(
+        model=OLLAMA_LLM_MODEL,
+        temperature=0,
+        num_ctx=LLM_NUM_CTX,
+        num_predict=LLM_NUM_PREDICT,
+        client_kwargs={"timeout": LLM_TIMEOUT_S},
+    )
 
 
 def init_embedding():
@@ -404,11 +460,63 @@ def hybrid_search(vectorstore, bm25, doc_texts, documents, query: str) -> List[L
 
 # ============== 问答 ==============
 
+def format_context(docs: Sequence[LCDocument], budget: int | None = None) -> str:
+    """
+    把检索结果编号后拼成上下文，并在字符预算内截断。
+
+    编号与 `rag_service.RetrievalResult.citations()` 的 rank 一致（1-based），
+    Prompt 要求模型用 [n] 标注依据，前端据此做锚点定位。
+    预算按字符保守估算，避免超出 num_ctx 后被 Ollama 静默截断。
+    """
+    budget = MAX_CONTEXT_CHARS if budget is None else budget
+    blocks: list[str] = []
+    used = 0
+    for rank, doc in enumerate(docs, start=1):
+        meta = doc.metadata or {}
+        header = f"[{rank}] {meta.get('title') or '未命名文档'}"
+        extra = " / ".join(str(x) for x in (meta.get("dept"), meta.get("classification")) if x)
+        if extra:
+            header += f"（{extra}）"
+        remaining = budget - used
+        if remaining <= 0:
+            break
+        body = doc.page_content or ""
+        # 预留标题与分隔符的字符；预算再小也保留标题，避免上下文为空
+        allowed = max(0, remaining - len(header) - 2)
+        block = f"{header}\n{body[:allowed]}" if allowed else header
+        blocks.append(block)
+        used += len(block) + 2
+    return "\n\n".join(blocks)
+
+
+def trim_history(history: Sequence, budget: int | None = None) -> list:
+    """
+    从最近一轮往前保留历史，总字符不超过预算（至少保留最后一条）。
+
+    只按「轮数」裁剪在长答案下仍可能撑爆上下文，这里再加一道字符预算。
+    """
+    budget = MAX_HISTORY_CHARS if budget is None else budget
+    if not history:
+        return []
+    kept: list = []
+    used = 0
+    for message in reversed(history):
+        size = len(getattr(message, "content", "") or "")
+        if kept and used + size > budget:
+            break
+        kept.append(message)
+        used += size
+    kept.reverse()
+    return kept
+
+
 # RAG 问答 Prompt 模板：system 约束"仅基于上下文回答"，human 放上下文与问题。
 # 用 ChatPromptTemplate 而非裸字符串，规范 system/human 角色，便于复用与切换模型。
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system", "你是一个严谨的问答助手。请只基于下面提供的上下文回答问题；"
                "如果上下文中没有相关内容，请如实说明，不要编造。"
+               "上下文中的每个片段都带 [编号]，回答里的每条事实性结论必须用 [编号] 标注依据，"
+               "编号只能取自上下文中已有的 [n]，不得编造编号。"
                "如果用户的问题是对之前对话的追问，请结合对话历史理解其中的指代。"),
     MessagesPlaceholder("history", optional=True),
     ("human", "上下文：\n{context}\n\n问题：{question}"),
@@ -500,7 +608,8 @@ def answer_question(question: str, vectorstore, bm25, doc_texts, documents, llm,
     """
     回答用户问题（使用混合检索 + 多轮历史），返回答案文本供主循环写入历史。
     """
-    history = history or []
+    # 历史先按字符预算裁剪，避免长答案把上下文撑爆
+    history = trim_history(history or [])
 
     # 检索用改写后的独立问题（能处理指代），生成仍用用户原问题
     search_query = condense_question(llm, history, question)
@@ -508,8 +617,8 @@ def answer_question(question: str, vectorstore, bm25, doc_texts, documents, llm,
     # 混合检索 Top-K 相关文档
     docs = hybrid_search(vectorstore, bm25, doc_texts, documents, search_query)
 
-    # 构建上下文
-    context = "\n\n".join([doc.page_content for doc in docs])
+    # 构建带编号、受预算约束的上下文（编号与下方「参考来源」顺序一致）
+    context = format_context(docs)
 
     print(f"\n❓ 问题: {question}")
     print(f"📖 参考 {len(docs)} 个文档片段：")
