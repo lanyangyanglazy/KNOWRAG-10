@@ -8,6 +8,7 @@ can_view：管理员也不能越过部门/密级限制。所有不可见情形�
 from __future__ import annotations
 
 import re
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from psycopg import Connection
@@ -18,11 +19,20 @@ from ingest import repository as repo
 
 router = APIRouter(prefix="/api/chunks", tags=["source"])
 
-CHUNK_ID = re.compile(r"^(?P<doc>[0-9a-f-]{36})@v(?P<ver>\d+)#(?P<ord>\d+)$")
+# 尾部的版本/序号限制位数：不限长时 int() 在超长数字上会抛 ValueError（→ 500）。
+CHUNK_ID = re.compile(r"^(?P<doc>[0-9a-f-]{36})@v(?P<ver>\d{1,9})#(?P<ord>\d{1,9})$")
 _LOCATOR_FIELDS = ("chunk_type", "sheet", "cell_range", "row_range",
                    "page", "bbox", "heading_path", "block_id")
 
 _NOT_FOUND = "切片不存在"
+
+
+def _parse_doc_id(raw: str) -> UUID:
+    """正则只约束长度与字符集（36 个连字符也能通过），必须真正解析 UUID。"""
+    try:
+        return UUID(raw)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
 
 
 @router.get("/{chunk_id}/source")
@@ -31,7 +41,10 @@ def chunk_source(chunk_id: str, user: User = Depends(current_user),
     match = CHUNK_ID.match(chunk_id)
     if match is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    doc = repo.get_document(conn, match["doc"])
+    # 先解析再进 SQL：非法 UUID 直接作为 404 处理，不能被 psycopg 的
+    # InvalidTextRepresentation 冒泡成 500。
+    doc_id = _parse_doc_id(match["doc"])
+    doc = repo.get_document(conn, doc_id)
     if doc is None or doc["deleted_at"] is not None or doc["status"] != "active":
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     if not can_view(user, {"classification_level": doc["classification"],

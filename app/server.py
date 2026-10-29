@@ -384,28 +384,43 @@ def health():
 
     仅当配置了 INGEST_DB_URL（pg 模式）才探测数据库与队列；FAISS 单机模式下
     没有 DB，不能因为「连不上库」把原有部署判为不健康。
+
+    所有结果分支返回同一套键（db/queue_depth 无 DB 时为 None），消费方不必
+    按状态分支取字段；stats 缺键只降级为 None，绝不因缺键 500。
     """
+    from ingest.config import get_settings
+
     if _service is None:
         return JSONResponse(
             status_code=503,
             content={
                 "ok": False,
                 "error": _service_error or "服务未初始化（语料/索引尚未加载）",
+                "docs": None,
+                "chunks": None,
+                "skipped_docs": 0,
+                "skipped_files": [],
+                "max_distance": max_distance(),
+                "embed_model": None,
+                "db": None,
+                "queue_depth": None,
             },
         )
     stats = _service.stats()
     issues = stats.get("load_issues", [])
     payload = {
         "ok": True,
-        "docs": stats["docs"],
-        "chunks": stats["chunks"],
+        "docs": stats.get("docs", 0),
+        "chunks": stats.get("chunks", 0),
         "skipped_docs": len(issues),
         "skipped_files": [item["file"] for item in issues],
         "max_distance": max_distance(),
         # faiss 模式是 EMBED_MODEL，pg 模式是 INGEST_EMBED_MODEL——由 stats 给出，别在这里猜
-        "embed_model": stats["embed_model"],
+        "embed_model": stats.get("embed_model"),
+        # FAISS 单机模式没有 DB：键仍保留，值为 None
+        "db": None,
+        "queue_depth": None,
     }
-    from ingest.config import get_settings
 
     if get_settings().db_url:
         try:
@@ -419,6 +434,7 @@ def health():
         except Exception as exc:  # noqa: BLE001 - 探针要把依赖故障暴露为 503
             payload["ok"] = False
             payload["db"] = f"error: {type(exc).__name__}"
+            payload["queue_depth"] = None
             return JSONResponse(status_code=503, content=payload)
     return payload
 

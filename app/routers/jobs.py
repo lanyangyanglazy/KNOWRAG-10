@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -61,15 +61,17 @@ def _event(name: str, data: dict) -> str:
 
 
 @router.get("/{job_id}/events")
-def job_events(job_id: int, user: User = Depends(current_user),
-               conn: Connection = Depends(get_db)) -> StreamingResponse:
-    # 复用请求内的连接只做一次鉴权；流式生成期间请求作用域可能已结束，
-    # 每次轮询都必须拿新连接，不能把 get_db 的连接带进生成器。
-    _load_job(conn, job_id, user)
+def job_events(job_id: int, user: User = Depends(current_user)) -> StreamingResponse:
+    # 鉴权用一次性短连接，绝不通过 Depends(get_db) 把请求作用域连接带进流：
+    # SSE 可存活 10 分钟，期间每次轮询还要再借一个，几路观众就能耗尽连接池。
+    from ingest.db import connection
 
-    def stream():
-        from ingest.db import connection
+    with connection() as conn:
+        _load_job(conn, job_id, user)
 
+    # 异步生成器：客户端断开会取消 await，循环随之停止；同步 DB 调用很短，
+    # P0 允许直接放在事件循环上。
+    async def stream():
         last = None
         for _ in range(POLL_LIMIT):
             with connection() as c:
@@ -88,7 +90,7 @@ def job_events(job_id: int, user: User = Depends(current_user),
                 last = state
             if state in ("done", "failed"):
                 return
-            time.sleep(POLL_INTERVAL_S)
+            await asyncio.sleep(POLL_INTERVAL_S)
 
     return StreamingResponse(
         stream(), media_type="text/event-stream",

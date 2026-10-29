@@ -10,6 +10,10 @@ from psycopg.types.json import Jsonb
 from ingest import repository as repo
 from ingest.queue import enqueue
 
+# health 在所有结果分支都应返回同一套键，消费方不必按状态分支取字段。
+HEALTH_KEYS = {"ok", "docs", "chunks", "skipped_docs", "skipped_files",
+               "max_distance", "embed_model", "db", "queue_depth"}
+
 
 def seed_version(db_url: str, *, dept: str = "财务处",
                  classification: int | None = 1) -> tuple[str, str]:
@@ -83,6 +87,17 @@ def test_job_visibility_is_department_scoped(api):
     assert chen.get(f"/api/jobs/{job_id}").status_code == 200
 
 
+def test_job_events_does_not_hold_request_db_connection():
+    # SSE 若通过 Depends(get_db) 持有请求作用域连接，该连接会一直占到流结束；
+    # 加上每次轮询再借一个，几路观众就能打满小连接池。
+    from app.routers import jobs
+
+    route = next(r for r in jobs.router.routes if r.path == "/api/jobs/{job_id}/events")
+    deps = {getattr(d.call, "__name__", "") for d in route.dependant.dependencies}
+    assert "get_db" not in deps
+    assert "current_user" in deps
+
+
 def test_chunk_source_returns_locator_and_rechecks_acl(api):
     make, db_url = api
     doc_id, version_id = seed_version(db_url)
@@ -106,6 +121,24 @@ def test_chunk_source_returns_locator_and_rechecks_acl(api):
     assert wang.get(chunk_url(chunk_id)).status_code == 404
 
 
+def test_chunk_source_invalid_ids_are_404_not_500(api):
+    make, db_url = api
+    doc_id, version_id = seed_version(db_url)
+    seed_chunk(db_url, doc_id, version_id)  # 置文档 active，确保请求走到 id 解析而非状态检查
+    wang = make("wang")
+
+    # 36 个连字符能通过旧的 [0-9a-f-]{36} 正则，但不是合法 UUID：
+    # 直接拼进 SQL 会被 psycopg 以 InvalidTextRepresentation 拒绝 → 500。
+    bare = "-" * 36
+    resp = wang.get(chunk_url(f"{bare}@v1#1"))
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "切片不存在"
+
+    # 版本号不限长时 int() 在超长数字上抛 ValueError → 500。
+    huge = f"{doc_id}@v{'9' * 5000}#7"
+    assert wang.get(chunk_url(huge)).status_code == 404
+
+
 def test_public_chunk_is_visible_cross_department(api):
     make, db_url = api
     doc_id, version_id = seed_version(db_url, classification=0)
@@ -116,7 +149,7 @@ def test_public_chunk_is_visible_cross_department(api):
 
 
 def test_health_reports_db_and_queue(api, monkeypatch):
-    make, _ = api
+    make, db_url = api
     client = make("wang")
     from app import server
 
@@ -125,17 +158,51 @@ def test_health_reports_db_and_queue(api, monkeypatch):
             # health() 直接透传 stats 的 embed_model：faiss=bge-m3、pg=INGEST_EMBED_MODEL
             return {"docs": 0, "chunks": 0, "embed_model": "bge-m3"}
 
+    # 队列里先放一个 queued 任务：恒返回 0 的实现必须在这里失败。
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        enqueue(conn, "parse",
+                {"version_id": "00000000-0000-0000-0000-000000000000"}, priority=50)
+
     monkeypatch.setattr(server, "_service", _Service())
     monkeypatch.setattr(server, "_service_error", None)
     resp = client.get("/api/health")
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["db"] == "ok"
-    assert body["queue_depth"] == 0
+    assert body["queue_depth"] == 1
     assert body["embed_model"]
     # 既有字段必须保留，避免前端/探针消费方回归。
     assert body["skipped_docs"] == 0
     assert body["skipped_files"] == []
+    assert HEALTH_KEYS <= set(body)
+
+
+def test_health_without_db_keeps_stable_keys(api, monkeypatch):
+    make, _ = api
+    client = make("wang")
+    from app import server
+    import ingest.config as ingest_config
+
+    class _Service:
+        def stats(self):
+            # 故意不带 embed_model / load_issues：缺键不能让 health 变 500。
+            return {"docs": 1, "chunks": 2}
+
+    class _Settings:
+        db_url = ""
+
+    monkeypatch.setattr(server, "_service", _Service())
+    monkeypatch.setattr(server, "_service_error", None)
+    monkeypatch.setattr(ingest_config, "get_settings", lambda: _Settings())
+    resp = client.get("/api/health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["db"] is None
+    assert body["queue_depth"] is None
+    assert body["embed_model"] is None
+    assert body["skipped_docs"] == 0
+    assert body["skipped_files"] == []
+    assert HEALTH_KEYS <= set(body)
 
 
 def test_health_returns_503_when_db_probe_fails(api, monkeypatch):
@@ -161,3 +228,7 @@ def test_health_returns_503_when_db_probe_fails(api, monkeypatch):
     body = resp.json()
     assert body["ok"] is False
     assert body["db"] == "error: RuntimeError"
+    # 探针失败也返回完整键集，queue_depth 明确置 None 而不是缺键。
+    assert body["queue_depth"] is None
+    assert body["embed_model"] == "bge-m3"
+    assert HEALTH_KEYS <= set(body)
