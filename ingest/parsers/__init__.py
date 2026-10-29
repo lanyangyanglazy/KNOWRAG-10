@@ -13,4 +13,7 @@ def get_parser(kind: str, **kwargs) -> Parser:
     if kind == "doc":
         from ingest.parsers.docx_parser import DocParser
         return DocParser(**kwargs)
+    if kind == "pdf":
+        from ingest.parsers.pdf_parser import PdfParser
+        return PdfParser(**kwargs)
     raise KeyError(f"未注册的解析器类型: {kind}")

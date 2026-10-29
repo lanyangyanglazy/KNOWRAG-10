@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import filetype
-import fitz
+import pymupdf as fitz
 
 from ingest.config import Settings, get_settings
 from ingest.errors import Quarantined, TooLarge, UnsupportedType
