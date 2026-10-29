@@ -92,12 +92,21 @@ def set_document_meta(conn: Connection, document_id: str, **fields) -> None:
 def ensure_review_item(conn: Connection, version_id: str, kind: str,
                        payload: dict) -> int:
     reason = payload.get("reason")
-    row = conn.execute(
-        """SELECT id FROM review_items
-           WHERE version_id=%s AND kind=%s AND status='open'
-             AND payload->>'reason' = %s ORDER BY id LIMIT 1""",
-        (version_id, kind, reason),
-    ).fetchone()
+    # payload->>'reason' 为 NULL 时不能用 `= NULL`（永远不命中），必须用 IS NULL。
+    if reason is None:
+        row = conn.execute(
+            """SELECT id FROM review_items
+               WHERE version_id=%s AND kind=%s AND status='open'
+                 AND payload->>'reason' IS NULL ORDER BY id LIMIT 1""",
+            (version_id, kind),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT id FROM review_items
+               WHERE version_id=%s AND kind=%s AND status='open'
+                 AND payload->>'reason' = %s ORDER BY id LIMIT 1""",
+            (version_id, kind, reason),
+        ).fetchone()
     if row:
         return int(row["id"])
     created = conn.execute(

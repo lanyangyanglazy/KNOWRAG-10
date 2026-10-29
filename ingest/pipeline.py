@@ -27,7 +27,11 @@ _INJECTION_PATTERNS = (
 
 
 def scan_injection(ir) -> list[str]:
-    """返回命中的注入特征片段（最多 5 条），用于警告与审计。"""
+    """返回命中的注入特征片段（最多 5 条），用于警告与审计。
+
+    片段围绕命中位置截取（前 20 / 后 40 字符），保证触发词一定出现在
+    警告与审计里，而不是被长段落的开头截断掉。
+    """
     texts: list[str] = []
     for block in ir.blocks:
         if block.text:
@@ -39,11 +43,15 @@ def scan_injection(ir) -> list[str]:
     for pattern in _INJECTION_PATTERNS:
         needle = pattern.lower()
         for text in texts:
-            if needle in text.lower():
-                snippet = " ".join(text.split())[:80]
-                if snippet not in hits:
-                    hits.append(snippet)
-                break
+            pos = text.lower().find(needle)
+            if pos < 0:
+                continue
+            start = max(0, pos - 20)
+            end = min(len(text), pos + len(needle) + 40)
+            snippet = " ".join(text[start:end].split())
+            if snippet not in hits:
+                hits.append(snippet)
+            break
         if len(hits) >= 5:
             break
     return hits
@@ -67,7 +75,7 @@ def _parser_for(conn: Connection, kind: str, dept: str, settings: Settings):
     return get_parser(kind, templates=templates, llm=llm, settings=settings)
 
 
-def _parse_file(conn: Connection, version: dict, source: Path,
+def _parse_file(conn: Connection, dept: str, version: dict, source: Path,
                 settings: Settings):
     sniff = sniff_file(source, version["filename"], settings)
     path = source
@@ -80,7 +88,6 @@ def _parse_file(conn: Connection, version: dict, source: Path,
             raise Quarantined("宏剥离失败")
         path = stripped
     try:
-        dept = _dept_of(conn, version)
         parser = _parser_for(conn, sniff.kind, dept, settings)
         return parser.parse(path)
     finally:
@@ -88,38 +95,45 @@ def _parse_file(conn: Connection, version: dict, source: Path,
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _dept_of(conn: Connection, version: dict) -> str:
-    doc = repo.get_document(conn, version["document_id"])
-    return doc["dept"]
-
-
 def handle_parse(conn: Connection, payload: dict) -> None:
     settings = get_settings()
     version = repo.get_version(conn, payload["version_id"])
     if version is None:
         raise ValueError(f"版本不存在: {payload['version_id']}")
+    # 幂等护栏：reap_stale 重投可能让同一个 version 的 parse job 被再次执行。
+    # 已解析完成（待复核/已入嵌入/已就绪/已隔离）的版本不得回退状态或重复入队 embed。
+    if version["status"] in {"needs_review", "embedding", "ready", "quarantined"}:
+        return
     doc = repo.get_document(conn, version["document_id"])
+    if doc is None:
+        raise ValueError(f"文档不存在: {version['document_id']}")
     repo.set_version_status(conn, version["id"], "parsing")
     conn.commit()
 
     source = FileStore(settings.upload_dir).resolve(version["storage_path"])
-    ir = _parse_file(conn, version, source, settings)
+    ir = _parse_file(conn, doc["dept"], version, source, settings)
     warnings = [w.model_dump() for w in ir.warnings]
 
     injection_hits = scan_injection(ir)
     if injection_hits:
         warnings.append({"code": "prompt_injection_suspected",
                          "detail": "；".join(injection_hits)})
-        # 审计落盘是 JSON：UUID 必须转字符串，否则 json.dumps 抛 TypeError。
-        write_audit({
-            "action": "prompt_injection_suspected",
-            "user": "worker",
-            "dept": doc["dept"],
-            "doc_id": str(doc["id"]),
-            "version_id": str(version["id"]),
-            "classification": doc["classification"],
-            "detail": injection_hits,
-        })
+        # 注入检测按设计「只告警不阻断」，且警告已随 versions.warnings 持久化；
+        # 审计 JSONL 写失败不能让入库重试到死信，故 fail-open。
+        try:
+            # 审计落盘是 JSON：UUID 必须转字符串，否则 json.dumps 抛 TypeError。
+            write_audit({
+                "action": "prompt_injection_suspected",
+                "user": "worker",
+                "dept": doc["dept"],
+                "doc_id": str(doc["id"]),
+                "version_id": str(version["id"]),
+                "classification": doc["classification"],
+                "detail": injection_hits,
+            })
+        except Exception as exc:  # noqa: BLE001 - 审计失败不阻断入库
+            warnings.append({"code": "audit_write_failed",
+                             "detail": f"prompt_injection_suspected 审计写入失败: {exc}"})
 
     if not payload.get("trusted_import"):
         if _needs_structure_review(ir, settings):
@@ -149,15 +163,28 @@ def handle_parse(conn: Connection, payload: dict) -> None:
 
 
 def handle_parse_dead_letter(conn: Connection, job: dict) -> None:
+    """死信钩子：run_forever 对钩子异常没有兜底，本函数绝不外抛。
+
+    先把证据落库（versions.error + parse_warning 复核项）并提交，审计失败
+    只影响审计文件，不影响已持久化的证据。
+    """
     version_id = job["payload"]["version_id"]
-    row = conn.execute("SELECT last_error FROM jobs WHERE id=%s", (job["id"],)).fetchone()
-    error = (row or {}).get("last_error") or "parse failed"
-    repo.set_version_status(conn, version_id, "failed", error=error)
-    repo.ensure_review_item(conn, version_id, "parse_warning",
-                            {"reason": "parse_failed", "error": error})
-    conn.commit()
-    write_audit({"action": "parse_failed", "version_id": str(version_id),
-                 "detail": error})
+    try:
+        row = conn.execute("SELECT last_error FROM jobs WHERE id=%s",
+                           (job["id"],)).fetchone()
+        error = (row or {}).get("last_error") or "parse failed"
+        repo.set_version_status(conn, version_id, "failed", error=error)
+        repo.ensure_review_item(conn, version_id, "parse_warning",
+                                {"reason": "parse_failed", "error": error})
+        conn.commit()
+    except Exception:  # noqa: BLE001 - 钩子不得外抛，否则杀死 worker 循环
+        conn.rollback()
+        return
+    try:
+        write_audit({"action": "parse_failed", "version_id": str(version_id),
+                     "detail": error})
+    except Exception:  # noqa: BLE001 - 证据已由 versions.error 与复核项持久化
+        pass
 
 
 HANDLERS = {"parse": handle_parse}
