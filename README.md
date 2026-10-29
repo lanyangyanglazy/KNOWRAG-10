@@ -1,24 +1,32 @@
-# LangChain RAG 教程 - 个人知识库问答
+# 政务知识问答（RAG）— 教学主线 + 政务试点
 
-一个基于 **LangChain** 构建的 RAG（检索增强生成）实战项目，支持**本地 Ollama**与**在线 DeepSeek**两种 LLM，帮助你快速入门 RAG 系统的核心概念和用法。
+一套基于 **LangChain** 的 RAG 实战项目：既保留单文件教学主线（`main.py`），也提供可运行的
+**权限感知 + 审计**政务问答系统（`app/` + `frontend/`）。
 
-> 本项目展示 RAG 系统的完整实现：文档加载 → 向量索引 → 相似度检索 → LLM 生成答案
+后端 **FastAPI + SSE**，前端 **React 18 + TypeScript + Vite**（开发期 Vite 代理，生产期由后端同源托管），
+同时保留一份**零依赖单页**（`app/static/index.html`）作为离线/回退界面。
 
-## 🏛️ 政府级扩展（试点原型，可运行）
+> 完整链路：文档加载 → 密级/部门裁剪 → FAISS + BM25 混合检索 → RRF 融合 → `[n]` 引用编号 → LLM 流式回答 → 审计留痕
 
-在原有教学项目之上，增加了一套**权限感知 + 审计**的政务问答原型：
+## 🏛️ 政务试点（可运行）
 
 - 方案设计：[docs/政府级RAG改造方案.md](docs/政府级RAG改造方案.md)（现状差距、目标架构、密级治理、拒答策略、分期路线）
-- 可运行原型：[app/README.md](app/README.md)（FastAPI + SSE 流式 + 文档级 ACL + 审计日志）
+- 可运行原型：[app/README.md](app/README.md)（FastAPI + SSE + 文档级 ACL + 审计 + React 前端）
+- 技术深改：[docs/生产级RAG架构演进分析.md](docs/生产级RAG架构演进分析.md)（Rerank、缓存、可观测、多租户、容器化）
 
 ```bash
-# 在仓库根目录启动（需 Ollama 已运行）
+# 后端（需 Ollama 已运行）
 # 首次先复制 .env.example 为 .env，并设置 DEMO_PASSWORD 与 SESSION_SECRET
 uv run uvicorn app.server:app --host 127.0.0.1 --port 8000
-# 浏览器打开 http://127.0.0.1:8000 ，输入演示口令后，用不同账号对比可见范围
+
+# 前端（开发模式，可选：不启动则用内置单页）
+cd frontend && npm install && npm run dev
 ```
 
-核心原则：**权限层必须位于检索层之前**——先按用户裁剪候选集，再检索，最后生成；没有依据直接拒答，不调用 LLM。浏览器页面同时解决了内置终端无法输入中文的问题。
+打开 `http://127.0.0.1:5173`（Vite 开发服务器）或 `http://127.0.0.1:8000`（后端托管），
+输入演示口令后，用不同账号对比可见范围。
+
+核心原则：**越权内容不得进入生成上下文**——先按用户裁剪候选集，再检索，最后生成；没有依据直接拒答，不调用 LLM。
 
 ## 🎯 项目目标
 
@@ -26,28 +34,54 @@ uv run uvicorn app.server:app --host 127.0.0.1 --port 8000
 - 掌握 LangChain 的核心概念（Document、Embeddings、VectorStore）
 - 跑通个人知识库问答系统
 - 了解向量索引、相似度检索等关键概念
+- 了解政务场景下的权限裁剪、引用可核查与审计留痕
 
 ## 🛠️ 技术栈
 
-- **LangChain**：LLM 应用框架（核心组件 + LCEL）
-- **langchain-ollama**：Ollama 官方集成（ChatOllama / OllamaEmbeddings）
-- **langchain-deepseek**：DeepSeek 官方集成（ChatDeepSeek，可选，在线 LLM）
-- **Ollama**：本地运行 LLM（默认 deepseek-r1:1.5b，可换 qwen3:4b）与 Embedding（默认 nomic-embed-text，可换 bge-m3）
-- **FAISS**：向量数据库（稠密检索）
-- **BM25（rank-bm25）**：倒排索引（稀疏检索）
-- **jieba**：中文分词（让 BM25 在中文语料上真正生效）
-- **FastAPI + Uvicorn**：政务原型的 HTTP 服务与 SSE 流式接口
-- **itsdangerous**：签名 Cookie 会话
-- **python-dotenv**：从 .env 加载环境变量（安全管理 API Key）
-- **RRF 融合算法**：多路检索结果合并
-- **Python 3.11+**
+**后端 / 检索**
+
+- **Python 3.11+**、**FastAPI + Uvicorn**：HTTP 服务与 SSE 流式接口
+- **LangChain 1.x**（核心组件 + LCEL）、**langchain-ollama**、**langchain-deepseek**（可选在线 LLM）
+- **Ollama**：本地 LLM（默认 `deepseek-r1:1.5b`，推荐 `qwen3:4b`）与 Embedding（默认 `bge-m3`）
+- **FAISS**：稠密向量检索；**BM25（rank-bm25）+ jieba**：中文稀疏检索；**RRF**：多路结果融合
+- **itsdangerous**：签名 Cookie 会话；**python-dotenv**：环境变量；**PyYAML**：语料 front matter
+
+**前端**
+
+- **React 18 + TypeScript 5.5 + Vite 5**：组件化 SPA，开发期 `/api` 代理到后端
+- **零依赖单页**（`app/static/index.html`）：不构建、不联网也能运行，作为回退界面
+- **自建 Markdown 渲染器**：不用 `innerHTML`，加粗/列表/表格/代码块/`[n]` 引用角标
+
+**质量 / 评测**
+
+- **pytest**：171 个用例（权限矩阵、会话、审计、检索、预算、评测台）
+- **evaluation/**：Recall@K、MRR、证据命中率、拒答准确率、越权泄露数、时延分位
+
+## 🧭 前后端选型与部署形态
+
+| 层 | 选型 | 说明 |
+|---|---|---|
+| 前端 | React 18 + TypeScript + Vite 5 | 组件化、类型约束；Vite 开发代理解决 Cookie 同源问题 |
+| 回退界面 | 原生 HTML/CSS/JS 单页 | 零依赖、断网可用，不构建也能演示 |
+| 后端 | FastAPI + Uvicorn | 同步端点 + `StreamingResponse`（SSE），接口统一 `/api/*` |
+| 会话 | itsdangerous 签名 Cookie | HttpOnly / SameSite=Lax；服务端校验过期 + `jti` 吊销，无 Redis |
+| 检索 | FAISS + BM25 + RRF | 单进程内存索引；语料变化按指纹重建 |
+| 模型 | Ollama（默认）/ DeepSeek（可选） | Embedding 始终本地，切 LLM 不重建索引 |
+| 评测 | pytest + `evaluation/` | 离线校验进 CI；真实指标需本地模型 |
+| 交付 | 单机 / 内网 | 无数据库、无消息队列；生产建议 Nginx + HTTPS + 只读语料目录 |
+
+**同源策略**：开发期 Vite 把 `/api` 代理到 `127.0.0.1:8000`，浏览器视角同源，Cookie 正常回传；
+生产期 `npm run build` 后由 FastAPI 托管 `frontend/dist`，仍然同源，不需要 CORS。
+
+**`/` 的解析顺序**：`frontend/dist/index.html` 存在 → React 构建产物；否则回退 `app/static/index.html`。
+构建产物变化后需要重启后端（资源挂载在启动时完成）。
 
 ## 📦 安装
 
 ```bash
 # 1. 克隆项目
-git clone <your-repo-url>
-cd langchain-rag-tutorial
+git clone https://github.com/lanyangyanglazy/KNOWRAG-10.git
+cd KNOWRAG-10
 
 # 2. 同步依赖（推荐使用 uv）
 uv sync
@@ -55,39 +89,51 @@ uv sync
 # 3. 确保 Ollama 运行中
 ollama serve
 
-# 4. 下载所需模型（如果未安装）
-ollama pull deepseek-r1:1.5b
-ollama pull nomic-embed-text
+# 4. 下载模型（与 .env.example 默认组合一致）
+ollama pull qwen3:4b      # 生成；也可用 deepseek-r1:1.5b（质量较弱）
+ollama pull bge-m3        # 嵌入；拒答阈值按 bge-m3 校准，换模型需重新校准
 
-# （可选，推荐）中文效果更好的组合，然后在 .env 中指定：
-# ollama pull qwen3:4b && ollama pull bge-m3
-# OLLAMA_LLM_MODEL=qwen3:4b
-# EMBED_MODEL=bge-m3
-
-# 5.（可选）使用在线 DeepSeek 时，复制环境变量模板并填入 API Key
+# 5. 配置环境变量（口令、会话密钥、模型 provider 等）
 cp .env.example .env
-#    然后编辑 .env，设置 DEEPSEEK_API_KEY 和 LLM_PROVIDER=deepseek
+
+# 6. 前端依赖（可选，仅 React 界面需要）
+cd frontend && npm install && cd ..
 ```
 
 > **注意**：项目使用 `uv` 管理依赖，确保已安装 uv。如果未安装，请运行：`pip install uv`
 
 ## 🚀 运行
 
+### 教学主线（CLI）
+
 ```bash
-# 方式 1：使用 uv run（推荐）
 uv run python main.py
-
-# 方式 2：激活虚拟环境后运行
-source .venv/bin/activate
-python main.py
-
-# 方式 3：直接使用虚拟环境的 Python
-.venv/bin/python main.py
 ```
 
-⚠️ **重要提示**：请使用 `uv run` 或激活虚拟环境后运行，否则可能遇到 `ModuleNotFoundError: No module named 'ollama'` 错误。
+首次运行从 `data/knowledge_base.txt` 构建索引到 `faiss_index/`，之后直接加载。
 
-首次运行会自动从 `./data` 构建向量索引并持久化到 `./faiss_index/`；后续运行直接加载索引，速度快很多。
+### 政务问答（后端 + 前端）
+
+```bash
+# 后端（端口 8000；首次请求会加载语料并构建 web_index/）
+uv run uvicorn app.server:app --host 127.0.0.1 --port 8000
+
+# 前端开发模式（端口 5173，/api 代理到 8000）
+cd frontend
+npm run dev
+
+# 前端生产构建（产物 frontend/dist，由后端同源托管）
+npm run build
+```
+
+| 入口 | 地址 | 说明 |
+|---|---|---|
+| Vite 开发服务器 | http://127.0.0.1:5173 | 热更新，`/api` 代理到后端 |
+| 后端托管 | http://127.0.0.1:8000 | 有 `frontend/dist` 用 React，否则回退单页 |
+
+⚠️ 请使用 `uv run` 或先激活虚拟环境（Windows：`.venv\Scripts\activate`），
+否则会缺依赖（如 `ModuleNotFoundError: No module named 'langchain_ollama'`）。
+生产构建后需重启后端，`/assets` 挂载在启动时完成。
 
 ## 🌐 使用 DeepSeek 在线模型（可选）
 
@@ -127,6 +173,23 @@ DeepSeek **不提供 Embedding API**，因此本项目在在线模式下依然�
 
 > 想看推理过程？在 `.env` 设置 `DEEPSEEK_MODEL=deepseek-reasoner`，答案前会打印模型的 `reasoning_content`（思考链）。
 
+## 🧪 测试与评测
+
+```bash
+# 单元/接口测试（不需要模型）
+uv run pytest -q
+
+# 真实检索评测（需要 Ollama；默认读取 evaluation/cases.jsonl）
+uv run python -m evaluation.runner --mode retrieval
+
+# 存基线后做回归门禁：指标跌幅超过 --tolerance 即失败
+uv run python -m evaluation.runner --mode retrieval --save-baseline
+uv run python -m evaluation.runner --mode retrieval --baseline evaluation/reports/baseline.json
+```
+
+评测指标：Recall@K、MRR、证据命中率、拒答准确率、越权泄露数、时延分位。
+种子集 33 条，覆盖单文档事实、数值、跨文档、权限拒答、超纲拒答、多轮指代。
+
 ## 📖 知识库内容
 
 `data/knowledge_base.txt` 包含以下主题：
@@ -142,27 +205,31 @@ DeepSeek **不提供 Embedding API**，因此本项目在在线模式下依然�
 
 ```
 langchain-rag-tutorial/
-├── README.md                    # 本文件
-├── main.py                      # 教学主线：单文件 RAG（FAISS + BM25 + RRF + 多轮 + 流式）
-├── pyproject.toml               # 依赖配置
-├── .env.example                 # 环境变量模板（复制为 .env 使用，.env 已被 gitignore）
+├── README.md                      # 本文件
+├── main.py                        # 教学主线：单文件 RAG（FAISS + BM25 + RRF + 多轮 + 流式）
+├── pyproject.toml / uv.lock       # 依赖与锁文件
+├── .env.example                   # 环境变量模板（.env 已 gitignore）
 ├── data/
-│   ├── knowledge_base.txt       # 教学用知识库
-│   └── gov_docs/                # 政务演示语料（4 篇，front matter 标注部门与密级）
-├── app/                         # 政务试点原型（权限 + 审计 + SSE）
-│   ├── README.md
-│   ├── users.py                 # 演示用户 + can_view()
-│   ├── rag_service.py           # 密级解析 / 检索前裁剪 / 拒答 / 流式生成
-│   ├── server.py                # FastAPI 路由 / 会话 / SSE / 审计
-│   └── static/index.html        # 单页前端（无外部依赖）
-├── docs/
-│   └── 政府级RAG改造方案.md      # 差距分析、目标架构、分期路线
-├── faiss_index/                 # 教学索引（运行时生成）
-├── web_index/                   # 政务索引（运行时生成）
-├── logs/                        # 审计日志 audit.jsonl（运行时生成，已 gitignore）
-└── tests/                       # 单元测试
-    ├── test_main.py
-    └── test_web.py
+│   ├── knowledge_base.txt         # 教学知识库
+│   └── gov_docs/                  # 政务语料（4 篇，front matter 标注部门/密级/生效日期）
+├── app/                           # 后端：FastAPI + SSE + ACL + 审计
+│   ├── users.py                   # 演示用户、口令校验、can_view()
+│   ├── rag_service.py             # 密级解析 / 权限裁剪 / 检索 / 拒答 / 流式生成
+│   ├── server.py                  # 路由 / 会话 / SSE / 审计 / 健康检查
+│   └── static/index.html          # 零依赖单页（回退界面）
+├── frontend/                      # 前端：React 18 + TypeScript + Vite 5
+│   ├── src/                       # App / components / hooks / api / markdown
+│   ├── package.json
+│   └── dist/                      # 构建产物（gitignore；存在时由后端同源托管）
+├── evaluation/                    # 评测台
+│   ├── cases.jsonl                # 33 条种子用例（六类标签）
+│   ├── cases.py / metrics.py      # 用例校验与指标
+│   └── runner.py                  # 评测执行器（retrieval / answer）
+├── docs/                          # 方案、架构、摄取设计、交付路线
+├── faiss_index/                   # 教学索引（运行时生成，gitignore）
+├── web_index/                     # 政务索引（运行时生成，gitignore）
+├── logs/                          # 审计日志 audit.jsonl（gitignore）
+└── tests/                         # pytest：test_main / test_web / test_eval
 ```
 
 ## 💡 核心代码流程
@@ -189,7 +256,7 @@ langchain-rag-tutorial/
 1. **更多数据源**：PDF、Word、网页
 2. **多文档管理**：政务原型已按「文档 + 部门 + 密级」管理多文件语料
 3. **聊天历史**：✅ 已实现（追问改写 + 最近 3 轮）
-4. **Web UI**：✅ 已实现（`app/static/index.html`，单页、离线可用）
+4. **Web UI**：✅ 已实现（React 18 + TS + Vite，`frontend/`；另保留零依赖单页作为回退）
 5. **API 服务**：✅ 已实现（FastAPI + SSE 流式接口）
 6. **权限与审计**：✅ 试点原型（`app/`），检索前裁剪 + JSONL 审计
 7. **生产级混合检索**：本项目手写 RRF 便于讲清原理；落地时可直接用 LangChain 官方 [`EnsembleRetriever`](https://reference.langchain.com/python/langchain-classic/retrievers/ensemble/EnsembleRetriever)（langchain 1.x 位于 `langchain_classic` 包，内置 RRF 融合），组合 BM25 与向量检索器，省去自维护融合逻辑

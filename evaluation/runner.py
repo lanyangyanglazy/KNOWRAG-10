@@ -12,7 +12,7 @@
 
     uv run python -m evaluation.runner                       # retrieval 基线
     uv run python -m evaluation.runner --mode answer         # 含生成
-    uv run python -m evaluation.runner --baseline evaluation/reports/baseline.json
+    uv run python -m evaluation.runner --baseline evaluation/baseline.json
     uv run python -m evaluation.runner --save-baseline       # 把本次结果存为基线
 
 退出码：0 = 通过；1 = 相对基线回归（可直接用于 CI 门禁）；2 = 用例金标与语料对不上。
@@ -245,6 +245,10 @@ def _ms(value: float | None) -> str:
     return "—" if value is None else f"{value:.0f} ms"
 
 
+def _num(value: float | None) -> str:
+    return "—" if value is None else f"{value:.3f}"
+
+
 def render_markdown(report: dict) -> str:
     """把报告渲染成人读的 Markdown（指标 + 分类 + 失败清单）。"""
     metrics = report["metrics"]
@@ -267,7 +271,7 @@ def render_markdown(report: dict) -> str:
         f"| 用例数 | {metrics['cases']}（应答 {metrics['answerable']} / 应拒答 {metrics['refusal_expected']}） |",
         f"| 证据命中率 | {_pct(metrics['evidence_recall'])} |",
         f"| 文档召回率@K | {_pct(metrics['doc_recall'])} |",
-        f"| MRR@K | {metrics['mrr']:.3f} |",
+        f"| MRR@K | {_num(metrics['mrr'])} |",
         f"| 引用命中率 | {_pct(metrics['citation_recall'])} |",
         f"| 拒答准确率 | {_pct(metrics['refusal_accuracy'])} |",
         f"| 误拒率（应答被拒） | {_pct(metrics['false_refusal_rate'])} |",
@@ -288,7 +292,7 @@ def render_markdown(report: dict) -> str:
         for tag, item in by_tag.items():
             lines.append(
                 f"| {tag} | {item['cases']} | {_pct(item['evidence_recall'])} "
-                f"| {_pct(item['doc_recall'])} | {item['mrr']:.3f} | {_pct(item['refusal_accuracy'])} |"
+                f"| {_pct(item['doc_recall'])} | {_num(item['mrr'])} | {_pct(item['refusal_accuracy'])} |"
             )
         lines.append("")
 
@@ -371,6 +375,11 @@ def run(
     if mode not in MODES:
         raise ValueError(f"mode 只能是 {'/'.join(MODES)}，收到 {mode!r}")
 
+    # 基线路径先校验：写错路径时立刻失败，不白跑一轮、也不在输出目录留报告
+    baseline_path = Path(baseline) if baseline else None
+    if baseline_path is not None and not baseline_path.exists():
+        raise FileNotFoundError(f"基线报告不存在: {baseline_path}")
+
     cases = load_cases(cases_path)
     service = service if service is not None else _build_service()
 
@@ -392,23 +401,22 @@ def run(
 
     json_path, md_path = write_report(report, out_dir)
     if save_baseline:
-        baseline_path = Path(out_dir or DEFAULT_OUT_DIR) / BASELINE_NAME
-        baseline_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"💾 已保存为基线：{baseline_path}")
+        # 基线放在报告目录的上一级：reports/ 被 gitignore，基线要能进版本库当门禁
+        baseline_out = Path(out_dir or DEFAULT_OUT_DIR).parent / BASELINE_NAME
+        baseline_out.parent.mkdir(parents=True, exist_ok=True)
+        baseline_out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"💾 已保存为基线：{baseline_out}")
 
     metrics = report["metrics"]
     print(
         f"✅ 证据命中率 {_pct(metrics['evidence_recall'])} | 文档召回 {_pct(metrics['doc_recall'])} "
-        f"| MRR {metrics['mrr']:.3f} | 拒答准确率 {_pct(metrics['refusal_accuracy'])} "
+        f"| MRR {_num(metrics['mrr'])} | 拒答准确率 {_pct(metrics['refusal_accuracy'])} "
         f"| 越权泄露 {metrics['leaks']}"
     )
     print(f"   失败 {len(report['failures'])} 条；报告：{md_path}")
 
     comparison = None
-    if baseline:
-        baseline_path = Path(baseline)
-        if not baseline_path.exists():
-            raise FileNotFoundError(f"基线报告不存在: {baseline_path}")
+    if baseline_path is not None:
         baseline_report = json.loads(baseline_path.read_text(encoding="utf-8"))
         comparison = compare_reports(report, baseline_report, tolerance=tolerance)
         for item in comparison["improvements"]:
@@ -438,7 +446,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", default=None, help="报告输出目录")
     parser.add_argument("--baseline", default=None, help="基线报告 JSON，用于回归门禁")
     parser.add_argument("--tolerance", type=float, default=0.03, help="允许的指标跌幅，默认 0.03")
-    parser.add_argument("--save-baseline", action="store_true", help="把本次结果另存为 baseline.json")
+    parser.add_argument("--save-baseline", action="store_true",
+                        help="把本次结果另存为基线（写在报告目录上一级，默认 evaluation/baseline.json）")
     args = parser.parse_args(argv)
 
     code, _, _ = run(

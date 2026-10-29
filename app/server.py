@@ -28,6 +28,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
@@ -39,6 +40,8 @@ logger = logging.getLogger("rag.server")
 COOKIE_NAME = "rag_session"
 SESSION_MAX_AGE = 8 * 3600  # 8 小时（服务端同样校验，不再只依赖浏览器 cookie 过期）
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# React 生产构建产物（frontend/dist）。存在时由本服务直接托管，否则回退到单文件原型页面。
+DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 AUDIT_FILE = BASE_DIR / "logs" / "audit.jsonl"
 
 # 审计落盘后是否 fsync：政务场景要求「写入即可靠」，默认开启；高吞吐场景可用 AUDIT_FSYNC=0 关闭。
@@ -280,6 +283,15 @@ class ChatPayload(BaseModel):
     question: str
 
 
+class HistoryTurn(BaseModel):
+    question: str
+    answer: str
+
+
+class HistorySeedPayload(BaseModel):
+    turns: list[HistoryTurn] = []
+
+
 # ---------- 应用 ----------
 
 app = FastAPI(title="政务知识问答（试点原型）", version="0.1.0")
@@ -287,6 +299,10 @@ app = FastAPI(title="政务知识问答（试点原型）", version="0.1.0")
 
 @app.get("/")
 def index() -> FileResponse:
+    # 生产构建存在时优先托管 React 产物，否则回退到单文件原型页面
+    dist_index = DIST_DIR / "index.html"
+    if dist_index.exists():
+        return FileResponse(dist_index)
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -408,6 +424,50 @@ def clear_history(request: Request, user: User = Depends(current_user)) -> dict:
         "username": user.username, "ip": _client_ip(request),
     })
     return {"ok": True}
+
+
+@app.post("/api/history/seed")
+def seed_history(
+    payload: HistorySeedPayload,
+    request: Request,
+    user: User = Depends(current_user),
+) -> dict:
+    """
+    回填历史轮次。
+
+    前端把本地保存的对话恢复到界面后，需要把轮次同步回服务端，
+    否则「那报销标准呢？」这类追问会因缺少上下文而被改写失败。
+    """
+    turns = [(t.question, t.answer) for t in payload.turns if t.question and t.answer]
+    if turns:
+        get_service().restore_history(user.username, turns)
+        _safe_audit({
+            "event": "history.seed", "status": "ok", "turns": len(turns),
+            "username": user.username, "ip": _client_ip(request),
+        })
+    return {"ok": True, "seeded": len(turns)}
+
+
+@app.get("/api/chunks/{chunk_id}")
+def chunk_detail(chunk_id: str, request: Request, user: User = Depends(current_user)) -> dict:
+    """
+    取回单个命中切片的原文，供前端「查看原文」使用。
+
+    权限判定在服务层用检索同一套 can_view 完成；不可见时统一返回 404，
+    不区分「不存在」与「无权查看」，避免成为枚举密级归属的旁路。
+    """
+    detail = get_service().chunk_detail(user, chunk_id)
+    if detail is None:
+        _safe_audit({
+            "event": "chunk.read", "status": "denied",
+            "username": user.username, "chunk_id": chunk_id, "ip": _client_ip(request),
+        })
+        raise HTTPException(status_code=404, detail="原文不存在或无权查看")
+    _safe_audit({
+        "event": "chunk.read", "status": "ok",
+        "username": user.username, "chunk_id": chunk_id, "ip": _client_ip(request),
+    })
+    return detail
 
 
 def _sse(event: dict) -> str:
@@ -537,6 +597,12 @@ def chat(
             "X-Request-Id": request_id,
         },
     )
+
+
+# 挂载 React 构建产物中的静态资源（dist/assets）。仅当该目录存在时挂载，
+# 否则 StaticFiles 会在启动时因目录缺失而报错。API 路由（/api/*）已在上方注册，不受影响。
+if (DIST_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="dist-assets")
 
 
 if __name__ == "__main__":

@@ -264,6 +264,27 @@ class _FakeService:
     def clear_history(self, username):
         pass
 
+    def restore_history(self, username, turns):
+        self.seeded = list(turns)
+
+    def chunk_detail(self, user, chunk_id):
+        # 替身：只有 chunk-ok 对 zhang 可见，chunk-secret 仅 wang 可见
+        if chunk_id == "chunk-ok" and user.username == "zhang":
+            return {
+                "chunk_id": chunk_id, "doc_id": "gov-001", "title": "公开制度",
+                "dept": "综合处", "classification": "公开",
+                "effective_date": "2024-01-01", "source": "gov-001",
+                "text": "这是可查看的原文。",
+            }
+        if chunk_id == "chunk-secret" and user.username == "wang":
+            return {
+                "chunk_id": chunk_id, "doc_id": "gov-003", "title": "秘密制度",
+                "dept": "财务处", "classification": "秘密",
+                "effective_date": "2024-01-01", "source": "gov-003",
+                "text": "这是机密原文。",
+            }
+        return None
+
     def visible_docs(self, user):
         return []
 
@@ -458,3 +479,117 @@ class TestHttpApi:
         record = _audit_records(tmp_path / "audit.jsonl")[-1]
         assert record["status"] == "error"
         assert "TimeoutError" in record["error"]
+
+
+class TestSourceReading:
+    """引用原文接口（/api/chunks/{chunk_id}）的权限与审计。"""
+
+    def test_chunk_requires_login(self, client):
+        assert client.get("/api/chunks/chunk-ok").status_code == 401
+
+    def test_chunk_returns_text_for_authorized_user(self, client):
+        assert _login(client).status_code == 200
+        res = client.get("/api/chunks/chunk-ok")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["text"] == "这是可查看的原文。"
+        assert body["title"] == "公开制度"
+        assert body["classification"] == "公开"
+
+    def test_chunk_denied_for_other_user(self, client):
+        """zhang 无权查看 wang 的秘密切片：必须 404，且不泄露「存在」信息。"""
+        assert _login(client).status_code == 200
+        res = client.get("/api/chunks/chunk-secret")
+        assert res.status_code == 404
+        assert "原文不存在或无权查看" in res.json()["detail"]
+
+    def test_chunk_not_found_returns_404(self, client):
+        assert _login(client).status_code == 200
+        assert client.get("/api/chunks/no-such-chunk").status_code == 404
+
+    def test_chunk_read_is_audited(self, client, tmp_path):
+        assert _login(client).status_code == 200
+        client.get("/api/chunks/chunk-ok")
+        record = _audit_records(tmp_path / "audit.jsonl")[-1]
+        assert record["event"] == "chunk.read"
+        assert record["status"] == "ok"
+        assert record["chunk_id"] == "chunk-ok"
+
+    def test_denied_chunk_read_is_audited(self, client, tmp_path):
+        assert _login(client).status_code == 200
+        client.get("/api/chunks/chunk-secret")
+        record = _audit_records(tmp_path / "audit.jsonl")[-1]
+        assert record["event"] == "chunk.read"
+        assert record["status"] == "denied"
+
+
+class TestHistorySeed:
+    """历史回填接口（/api/history/seed）。"""
+
+    def test_seed_requires_login(self, client):
+        res = client.post("/api/history/seed", json={"turns": [{"question": "q", "answer": "a"}]})
+        assert res.status_code == 401
+
+    def test_seed_backfills_service_history(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            server, "get_service",
+            lambda: type("S", (), {
+                "restore_history": staticmethod(lambda u, t: captured.update(turns=t)),
+            })(),
+        )
+        assert _login(client).status_code == 200
+        res = client.post(
+            "/api/history/seed",
+            json={"turns": [{"question": "差旅标准？", "answer": "350元"}, {"question": "", "answer": "x"}]},
+        )
+        assert res.status_code == 200
+        assert res.json()["seeded"] == 1, "空问题应被过滤"
+        assert captured["turns"] == [("差旅标准？", "350元")]
+
+    def test_seed_with_empty_turns_is_noop(self, client):
+        assert _login(client).status_code == 200
+        res = client.post("/api/history/seed", json={"turns": []})
+        assert res.status_code == 200
+        assert res.json()["seeded"] == 0
+
+    def test_seed_is_audited(self, client, tmp_path):
+        assert _login(client).status_code == 200
+        client.post("/api/history/seed", json={"turns": [{"question": "q", "answer": "a"}]})
+        record = _audit_records(tmp_path / "audit.jsonl")[-1]
+        assert record["event"] == "history.seed"
+        assert record["turns"] == 1
+
+
+class TestChunkDetailService:
+    """服务层 chunk_detail 的权限判定。"""
+
+    def test_returns_text_for_authorized_user(self, service):
+        secret = next(
+            d for d in service.documents if d.metadata["classification_level"] == 2
+        )
+        chunk_id = secret.metadata["chunk_id"]
+        wang = get_user("wang")
+        detail = service.chunk_detail(wang, chunk_id)
+        assert detail is not None
+        assert detail["text"]
+        assert detail["chunk_id"] == chunk_id
+
+    def test_returns_none_for_unauthorized_user(self, service):
+        secret = next(
+            d for d in service.documents if d.metadata["classification_level"] == 2
+        )
+        chunk_id = secret.metadata["chunk_id"]
+        zhang = get_user("zhang")  # 密级上限 1，看不到秘密级
+        assert service.chunk_detail(zhang, chunk_id) is None
+
+    def test_returns_none_for_unknown_chunk(self, service):
+        assert service.chunk_detail(get_user("wang"), "no-such-chunk") is None
+
+    def test_restore_history_skips_empty_turns(self, service):
+        service.restore_history(
+            "someone",
+            [("q1", "a1"), ("", "a2"), ("q3", ""), ("q4", "a4")],
+        )
+        contents = [m.content for m in service.history("someone")]
+        assert contents == ["q1", "a1", "q4", "a4"]

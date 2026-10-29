@@ -1,0 +1,939 @@
+{
+  "generated_at": "2026-10-29T15:20:16",
+  "mode": "retrieval",
+  "corpus": {
+    "docs": 4,
+    "chunks": 12,
+    "embed_model": "bge-m3",
+    "llm_model": "qwen3:4b",
+    "max_distance": 0.78
+  },
+  "config": {
+    "k": 5,
+    "cases_file": "evaluation/cases.jsonl",
+    "tolerance": 0.03
+  },
+  "metrics": {
+    "cases": 33,
+    "answerable": 24,
+    "refusal_expected": 9,
+    "evidence_recall": 1.0,
+    "doc_recall": 1.0,
+    "mrr": 1.0,
+    "citation_recall": null,
+    "refusal_accuracy": 0.9393939393939394,
+    "false_refusal_rate": 0.08333333333333333,
+    "missed_refusal_rate": 0.0,
+    "leaks": 0,
+    "latency_ms": {
+      "p50": 16.074500046670437,
+      "p95": 77.20487997867153,
+      "mean": 144.630857566936
+    },
+    "by_tag": {
+      "cross_doc": {
+        "cases": 3,
+        "evidence_recall": 1.0,
+        "doc_recall": 1.0,
+        "mrr": 1.0,
+        "refusal_accuracy": 1.0
+      },
+      "multi_turn": {
+        "cases": 4,
+        "evidence_recall": 1.0,
+        "doc_recall": 1.0,
+        "mrr": 1.0,
+        "refusal_accuracy": 0.75
+      },
+      "numeric": {
+        "cases": 5,
+        "evidence_recall": 1.0,
+        "doc_recall": 1.0,
+        "mrr": 1.0,
+        "refusal_accuracy": 0.8
+      },
+      "out_of_scope": {
+        "cases": 3,
+        "evidence_recall": null,
+        "doc_recall": null,
+        "mrr": null,
+        "refusal_accuracy": 1.0
+      },
+      "permission": {
+        "cases": 6,
+        "evidence_recall": null,
+        "doc_recall": null,
+        "mrr": null,
+        "refusal_accuracy": 1.0
+      },
+      "single_fact": {
+        "cases": 12,
+        "evidence_recall": 1.0,
+        "doc_recall": 1.0,
+        "mrr": 1.0,
+        "refusal_accuracy": 1.0
+      }
+    }
+  },
+  "failures": [
+    {
+      "id": "num-002",
+      "question": "20 万到 50 万的支出由谁审批？",
+      "tags": [
+        "numeric"
+      ],
+      "kinds": [
+        "false_refusal"
+      ],
+      "expected_refuse": false,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-003",
+        "gov-003",
+        "gov-001",
+        "gov-001",
+        "gov-003"
+      ],
+      "leaked_doc_ids": [],
+      "evidence": 1.0,
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "citation_recall": null
+    },
+    {
+      "id": "multi-003",
+      "question": "多久要换一次？",
+      "tags": [
+        "multi_turn"
+      ],
+      "kinds": [
+        "false_refusal"
+      ],
+      "expected_refuse": false,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-001",
+        "gov-001",
+        "gov-004",
+        "gov-001"
+      ],
+      "leaked_doc_ids": [],
+      "evidence": 1.0,
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "citation_recall": null
+    }
+  ],
+  "cases": [
+    {
+      "id": "fact-001",
+      "question": "政务服务中心的办公时间是几点到几点？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 4019.237499916926,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-002",
+      "question": "承诺件多久能办结？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 38.72639988549054,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-003",
+      "question": "政务信息公开申请多久答复？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 38.15159993246198,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-004",
+      "question": "线上办理遇到系统问题怎么反馈？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.732399886474013,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-005",
+      "question": "年休假有多少天？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-002",
+        "gov-002",
+        "gov-001",
+        "gov-002",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 33.64580008201301,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-006",
+      "question": "请病假需要什么证明？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-002",
+        "gov-001",
+        "gov-002",
+        "gov-002",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 17.288600094616413,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-007",
+      "question": "迟到多久会被记录？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-002",
+        "gov-002",
+        "gov-002",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 18.05279986001551,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-008",
+      "question": "差旅住宿费标准是多少？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-003",
+        "gov-003",
+        "gov-003",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 14.958800049498677,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-009",
+      "question": "报销费用后多久内要提交？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-003",
+        "gov-003",
+        "gov-003",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 35.52319994196296,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-010",
+      "question": "口令长度有什么要求？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-001",
+        "gov-004",
+        "gov-001",
+        "gov-004"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 16.436199890449643,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-011",
+      "question": "发现安全事件后多久报告？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-004",
+        "gov-004",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.761099988594651,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "fact-012",
+      "question": "数据外发需要谁审批？",
+      "tags": [
+        "single_fact"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-004",
+        "gov-004",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 17.694300040602684,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "num-001",
+      "question": "旷工一天扣多少绩效？",
+      "tags": [
+        "numeric"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-002",
+        "gov-002",
+        "gov-002",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 14.426700072363019,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "num-002",
+      "question": "20 万到 50 万的支出由谁审批？",
+      "tags": [
+        "numeric"
+      ],
+      "expected_refuse": false,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-003",
+        "gov-003",
+        "gov-001",
+        "gov-001",
+        "gov-003"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 37.593199871480465,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "num-003",
+      "question": "口令多久必须更换一次？",
+      "tags": [
+        "numeric"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-001",
+        "gov-004",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.807300107553601,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "num-004",
+      "question": "出差伙食补助每天多少钱？",
+      "tags": [
+        "numeric"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-003",
+        "gov-003",
+        "gov-001",
+        "gov-003",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 12.990099843591452,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "num-005",
+      "question": "年度事假最多多少天？",
+      "tags": [
+        "numeric"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-002",
+        "gov-002",
+        "gov-002",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 12.769399909302592,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "cross-001",
+      "question": "政务服务中心的办公时间和单位作息时间有什么不同？",
+      "tags": [
+        "cross_doc"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-002",
+        "gov-001",
+        "gov-002",
+        "gov-002"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 134.92260011844337,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "cross-002",
+      "question": "办事大厅办公时间和差旅住宿标准分别是什么？",
+      "tags": [
+        "cross_doc"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-003",
+        "gov-001",
+        "gov-001",
+        "gov-001",
+        "gov-003"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 17.19140005297959,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "cross-003",
+      "question": "办公时间和口令要求分别是什么？",
+      "tags": [
+        "cross_doc"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-001",
+        "gov-001",
+        "gov-004",
+        "gov-004"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 16.814099857583642,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "perm-001",
+      "question": "差旅住宿费标准是多少？",
+      "tags": [
+        "permission"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 13.657300034537911,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "perm-002",
+      "question": "年休假有几天？",
+      "tags": [
+        "permission"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 13.57729989103973,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "perm-003",
+      "question": "差旅住宿费标准是多少？",
+      "tags": [
+        "permission"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-002",
+        "gov-002",
+        "gov-002",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.081000048667192,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "perm-004",
+      "question": "年休假有几天？",
+      "tags": [
+        "permission"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-003",
+        "gov-001",
+        "gov-003",
+        "gov-003"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.14360005967319,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "perm-005",
+      "question": "差旅住宿费标准是多少？",
+      "tags": [
+        "permission"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-004",
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 14.783100225031376,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "perm-006",
+      "question": "口令有什么要求？",
+      "tags": [
+        "permission"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 30.788900097832084,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "scope-001",
+      "question": "如何申请公租房？",
+      "tags": [
+        "out_of_scope"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 16.074500046670437,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "scope-002",
+      "question": "今天天气怎么样？",
+      "tags": [
+        "out_of_scope"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001",
+        "gov-003",
+        "gov-003"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 30.914700124412775,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "scope-003",
+      "question": "单位今年科研项目立项情况如何？",
+      "tags": [
+        "out_of_scope"
+      ],
+      "expected_refuse": true,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-004",
+        "gov-001",
+        "gov-004"
+      ],
+      "doc_recall": null,
+      "mrr": null,
+      "evidence": null,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.598299913108349,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "multi-001",
+      "question": "那伙食补助和市内交通费呢？",
+      "tags": [
+        "multi_turn"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-003",
+        "gov-003",
+        "gov-003",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 16.032699961215258,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "multi-002",
+      "question": "没休完能结转吗？",
+      "tags": [
+        "multi_turn"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-002",
+        "gov-001",
+        "gov-002",
+        "gov-002",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.892300056293607,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "multi-003",
+      "question": "多久要换一次？",
+      "tags": [
+        "multi_turn"
+      ],
+      "expected_refuse": false,
+      "refused": true,
+      "refusal_reason": "low_relevance",
+      "retrieved_doc_ids": [
+        "gov-004",
+        "gov-001",
+        "gov-001",
+        "gov-004",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 15.184399904683232,
+      "answer": "",
+      "rewritten_to": ""
+    },
+    {
+      "id": "multi-004",
+      "question": "可以延长吗？",
+      "tags": [
+        "multi_turn"
+      ],
+      "expected_refuse": false,
+      "refused": false,
+      "refusal_reason": "",
+      "retrieved_doc_ids": [
+        "gov-001",
+        "gov-001",
+        "gov-001"
+      ],
+      "doc_recall": 1.0,
+      "mrr": 1.0,
+      "evidence": 1.0,
+      "citation_recall": null,
+      "leaked_doc_ids": [],
+      "elapsed_ms": 16.366699943318963,
+      "answer": "",
+      "rewritten_to": ""
+    }
+  ]
+}

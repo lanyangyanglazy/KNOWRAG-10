@@ -162,9 +162,10 @@ def summarize(results: Sequence[CaseOutcome]) -> dict:
         "answerable": len(answerable),
         "refusal_expected": len(refusals),
         # 检索质量：只对「金标为应答」的用例统计，误拒按 0 分计入
-        "evidence_recall": _mean(r.evidence for r in answerable) or 0.0,
-        "doc_recall": _mean(r.doc_recall for r in answerable) or 0.0,
-        "mrr": _mean(r.mrr for r in answerable) or 0.0,
+        # 没有应答用例时保持 None（不适用），不能折算成 0.0 让人误以为全错
+        "evidence_recall": _mean(r.evidence for r in answerable),
+        "doc_recall": _mean(r.doc_recall for r in answerable),
+        "mrr": _mean(r.mrr for r in answerable),
         # 引用质量：只有 answer 模式才有数据
         "citation_recall": _mean(r.citation_recall for r in answerable),
         # 拒答判定
@@ -195,9 +196,9 @@ def _by_tag(results: Sequence[CaseOutcome]) -> dict:
         correct = sum(1 for r in items if r.refused == r.expected_refuse)
         breakdown[tag] = {
             "cases": len(items),
-            "evidence_recall": _mean(r.evidence for r in answerable) or 0.0,
-            "doc_recall": _mean(r.doc_recall for r in answerable) or 0.0,
-            "mrr": _mean(r.mrr for r in answerable) or 0.0,
+            "evidence_recall": _mean(r.evidence for r in answerable),
+            "doc_recall": _mean(r.doc_recall for r in answerable),
+            "mrr": _mean(r.mrr for r in answerable),
             "refusal_accuracy": correct / len(items) if items else 0.0,
         }
     return breakdown

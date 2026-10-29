@@ -41,8 +41,15 @@ cp .env.example .env
 # 3. 启动服务（在仓库根目录执行）
 uv run uvicorn app.server:app --host 127.0.0.1 --port 8000
 
-# 4. 浏览器打开
-#    http://127.0.0.1:8000
+# 4. 前端（二选一，不装 Node 也能用）
+#    a) React 开发模式（热更新，端口 5173，/api 代理到 8000）
+cd frontend && npm install && npm run dev
+#    b) 生产构建：产物 frontend/dist 由后端同源托管，访问 8000（构建后重启后端）
+cd frontend && npm install && npm run build
+
+# 5. 浏览器打开
+#    http://127.0.0.1:5173  （开发模式）
+#    http://127.0.0.1:8000  （后端托管：有 dist 用 React，否则用内置单页）
 ```
 
 > 认证强度说明：演示口令只是把「点一下就能进」变成「需要知道口令」，
@@ -83,7 +90,18 @@ effective_date: 2026-09-01
 
 ## 界面
 
-前端是单文件 `app/static/index.html`，不加载任何外部字体、图标或脚本，断网内网均可使用。整体按政务服务门户的视觉习惯设计：
+前端有两套，**接口与交互一致**，按部署条件选择：
+
+| 方案 | 位置 | 适用场景 |
+|---|---|---|
+| React 工程 | `frontend/`（React 18 + TypeScript + Vite 5） | 日常开发、生产构建；组件化、热更新 |
+| 零依赖单页 | `app/static/index.html` | 无 Node 环境、断网演示；`dist` 不存在时自动回退 |
+
+- 开发：`npm run dev` → `127.0.0.1:5173`，`/api` 代理到 8000；生产：`npm run build` → `frontend/dist`，由 FastAPI 同源托管。
+- 单页不加载任何外部字体、图标或脚本，断网内网均可使用。
+- 两套前端都实现：SSE 增量渲染、`[n]` 引用角标与点击定位、停止生成、打印、密级徽章。
+
+整体按政务服务门户的视觉习惯设计：
 
 - **版式**：顶部 3px 政务蓝条 + 白色报头，正文使用衬线标题与无衬线正文；直角、1px 细边框，不用圆角卡片和聊天气泡。
 - **登录页**：左侧系统说明（访问控制 / 检索原则 / 审计留痕），右侧演示账号表格（姓名、部门、职务、最高密级、操作）。会话过期时自动回到此页并在顶部说明原因。
@@ -122,11 +140,16 @@ curl -N -b zhang.cookies -H "Content-Type: application/json" \
 ## 代码地图
 
 ```
-app/
-├── users.py          # 演示用户 + can_view()：纯函数，方便单测
-├── rag_service.py    # 语料加载 / 密级解析 / 权限前置检索 / 拒答 / 流式生成
-├── server.py         # FastAPI 路由 / 会话 Cookie / SSE / 审计
-└── static/index.html # 单页前端（无外部依赖，离线可用）
+app/                    # 后端（FastAPI）
+├── users.py            # 演示用户 + 口令校验 + can_view()：纯函数，方便单测
+├── rag_service.py      # 语料加载 / 密级解析 / 权限裁剪 / 拒答 / 流式生成
+└── server.py           # 路由 / 会话 / SSE / 审计 / 健康检查
+
+app/static/index.html   # 零依赖单页前端（回退界面，离线可用）
+
+frontend/               # React 前端（React 18 + TypeScript + Vite 5）
+├── src/                # App / components / hooks / api / markdown
+└── dist/               # 构建产物（gitignore，存在时由后端托管）
 ```
 
 复用 `main.py` 的部分（不重复造轮子，也保证与教学主线一致）：

@@ -5,7 +5,9 @@ import json
 import pytest
 from langchain_core.documents import Document as LCDocument
 
-from evaluation.cases import EvalCase, load_cases, validate_against_corpus
+from app.rag_service import load_gov_documents
+from app.users import can_view, get_user
+from evaluation.cases import KNOWN_TAGS, EvalCase, load_cases, validate_against_corpus
 from evaluation.metrics import (
     CaseOutcome,
     compare_reports,
@@ -17,7 +19,7 @@ from evaluation.metrics import (
     recall_at_k,
     summarize,
 )
-from evaluation.runner import evaluate, make_report, render_markdown, run, write_report
+from evaluation.runner import DEFAULT_CASES, evaluate, make_report, render_markdown, run, write_report
 
 
 # ---------- 指标：证据命中 ----------
@@ -183,6 +185,25 @@ class TestSummarize:
             _outcome(id="b", citation_recall=0.0),
         ]
         assert summarize(results)["citation_recall"] == 0.5
+
+    def test_refusal_only_tag_is_not_applicable(self):
+        """只有拒答用例的标签，检索指标要显示「不适用」，不能折算成 0.0% 看着像全错。"""
+        results = [_outcome(id="r", tags=["permission"], expected_refuse=True, refused=True,
+                            evidence=None, doc_recall=None, mrr=None)]
+        by_tag = summarize(results)["by_tag"]["permission"]
+        assert by_tag["evidence_recall"] is None
+        assert by_tag["doc_recall"] is None
+        assert by_tag["mrr"] is None
+        assert by_tag["refusal_accuracy"] == 1.0
+
+    def test_all_refusal_run_reports_not_applicable(self):
+        results = [_outcome(id="r", expected_refuse=True, refused=True,
+                            evidence=None, doc_recall=None, mrr=None)]
+        s = summarize(results)
+        assert s["evidence_recall"] is None
+        assert s["doc_recall"] is None
+        assert s["mrr"] is None
+        assert s["refusal_accuracy"] == 1.0
 
 
 # ---------- 基线对比 ----------
@@ -636,6 +657,27 @@ class TestReport:
         assert "误拒" in md
         assert "b" in md and "low_relevance" in md
 
+    def test_markdown_renders_not_applicable_metrics_as_dash(self):
+        """全是拒答用例时，检索指标是「不适用」，渲染成 — 而不是 0.000。"""
+        outcomes = [CaseOutcome(id="r", question="口令有什么要求？", tags=["permission"],
+                                expected_refuse=True, refused=True, evidence=None,
+                                doc_recall=None, mrr=None, elapsed_ms=10.0)]
+        md = render_markdown(make_report(outcomes, mode="retrieval"))
+        assert "| MRR@K | — |" in md
+        assert "| 证据命中率 | — |" in md
+        assert "| 文档召回率@K | — |" in md
+
+    def test_markdown_tag_row_marks_refusal_only_tag_not_applicable(self):
+        outcomes = [
+            _good_outcome(),
+            CaseOutcome(id="r", question="口令有什么要求？", tags=["permission"],
+                        expected_refuse=True, refused=True, evidence=None,
+                        doc_recall=None, mrr=None),
+        ]
+        md = render_markdown(make_report(outcomes, mode="retrieval"))
+        row = next(line for line in md.splitlines() if line.startswith("| permission |"))
+        assert row == "| permission | 1 | — | — | — | 100.0% |"
+
     def test_write_report_creates_json_and_markdown(self, tmp_path):
         report = make_report([_good_outcome()], mode="retrieval")
         json_path, md_path = write_report(report, tmp_path)
@@ -712,10 +754,137 @@ class TestRun:
             run(_write_cases(tmp_path, [_MINIMAL]), mode="vibes",
                 service=_FakeEvalService(_CORPUS))
 
-    def test_missing_baseline_file_raises(self, tmp_path):
+    def test_missing_baseline_file_fails_before_running(self, tmp_path):
+        """基线路径写错要立刻报错：先跑完一轮再报错，等于白跑还在仓库里留垃圾报告。"""
+        service = _FakeEvalService(_CORPUS, result=_FakeRetrieval(_CORPUS[:1]))
         with pytest.raises(FileNotFoundError):
-            run(_write_cases(tmp_path, [_MINIMAL]), mode="retrieval",
-                service=_FakeEvalService(_CORPUS), baseline=tmp_path / "nope.json")
+            run(_write_cases(tmp_path, [_MINIMAL]), mode="retrieval", service=service,
+                out_dir=tmp_path / "reports", baseline=tmp_path / "nope.json")
+        assert service.retrieve_calls == [], "基线不存在时不应跑任何用例"
+        assert not (tmp_path / "reports").exists(), "不应留下报告文件"
+
+    def test_save_baseline_lands_outside_the_ignored_reports_dir(self, tmp_path):
+        """reports/ 被 gitignore，基线必须存在它的上一级才能进版本库当门禁。"""
+        service = _FakeEvalService(_CORPUS, result=_FakeRetrieval(_CORPUS[:1]))
+        code, _, _ = run(_write_cases(tmp_path, [_MINIMAL]), mode="retrieval", service=service,
+                         out_dir=tmp_path / "reports", save_baseline=True)
+        assert code == 0
+        assert (tmp_path / "baseline.json").exists()
+        assert not (tmp_path / "reports" / "baseline.json").exists()
+
+    def test_saved_baseline_can_gate_the_next_run(self, tmp_path):
+        """存基线 → 再跑一次 → 门禁通过，这条闭环必须能自己转起来。"""
+        cases_path = _write_cases(tmp_path, [_MINIMAL])
+        run(cases_path, mode="retrieval",
+            service=_FakeEvalService(_CORPUS, result=_FakeRetrieval(_CORPUS[:1])),
+            out_dir=tmp_path / "reports", save_baseline=True)
+
+        code, _, comparison = run(
+            cases_path, mode="retrieval",
+            service=_FakeEvalService(_CORPUS, result=_FakeRetrieval(_CORPUS[:1])),
+            out_dir=tmp_path / "reports", baseline=tmp_path / "baseline.json",
+        )
+        assert code == 0
+        assert comparison["ok"] is True
+        assert comparison["regressions"] == []
+
+
+# ---------- 种子评测集（evaluation/cases.jsonl） ----------
+
+@pytest.fixture(scope="module")
+def seed_cases():
+    return load_cases(DEFAULT_CASES)
+
+
+@pytest.fixture(scope="module")
+def gov_documents():
+    return load_gov_documents()
+
+
+@pytest.fixture(scope="module")
+def gov_meta(gov_documents):
+    """doc_id → 切片元数据（取第一条即可，同一文档的密级/部门一致）。"""
+    return {doc.metadata["doc_id"]: doc.metadata for doc in gov_documents}
+
+
+class TestSeedCases:
+    def test_has_enough_cases(self, seed_cases):
+        assert len(seed_cases) >= 30, "种子集至少 30 条，否则指标波动太大"
+
+    def test_gold_matches_corpus(self, seed_cases, gov_documents):
+        """金标证据必须真在语料里——写错一个字，这条用例就永远得 0 分。"""
+        assert validate_against_corpus(seed_cases, gov_documents) == []
+
+    def test_covers_all_six_tags(self, seed_cases):
+        used = {tag for case in seed_cases for tag in case.tags}
+        assert used == KNOWN_TAGS, f"缺少标签覆盖: {KNOWN_TAGS - used}"
+
+    def test_every_tag_has_at_least_three_cases(self, seed_cases):
+        counts: dict[str, int] = {}
+        for case in seed_cases:
+            for tag in case.tags:
+                counts[tag] = counts.get(tag, 0) + 1
+        thin = {tag: n for tag, n in counts.items() if n < 3}
+        assert not thin, f"这些标签样本太少，指标没有解释力: {thin}"
+
+    def test_mixes_answerable_and_refusal(self, seed_cases):
+        answerable = [c for c in seed_cases if not c.should_refuse]
+        refusals = [c for c in seed_cases if c.should_refuse]
+        assert len(answerable) >= 20
+        assert len(refusals) >= 6, "拒答用例太少，测不出误拒/漏拒"
+
+    def test_refusal_cases_are_categorized(self, seed_cases):
+        """每条拒答用例都要说明「为什么该拒」：越权还是超纲。"""
+        for case in seed_cases:
+            if case.should_refuse:
+                assert set(case.tags) & {"permission", "out_of_scope"}, f"{case.id} 缺少拒答类型标签"
+
+    def test_answerable_gold_docs_are_visible_to_the_user(self, seed_cases, gov_meta):
+        """金标文档对该用户不可见的话，这条用例永远不可能通过。"""
+        for case in seed_cases:
+            if case.should_refuse:
+                continue
+            user = get_user(case.user)
+            for doc_id in case.expected_doc_ids:
+                assert can_view(user, gov_meta[doc_id]), f"{case.id}: {case.user} 看不到 {doc_id}"
+
+    def test_permission_refusals_are_genuinely_hidden(self, seed_cases, gov_meta):
+        """权限拒答用例的前提是：那份文档对该用户确实不可见。"""
+        for case in seed_cases:
+            if not case.should_refuse or "permission" not in case.tags:
+                continue
+            assert case.forbidden_doc_ids, f"{case.id} 应标注不可见文档"
+            user = get_user(case.user)
+            for doc_id in case.forbidden_doc_ids:
+                assert not can_view(user, gov_meta[doc_id]), f"{case.id}: {case.user} 其实能看到 {doc_id}"
+
+    def test_multi_turn_cases_carry_history_and_search_query(self, seed_cases):
+        """多轮用例要能被 retrieval-only 模式评测，所以必须给出改写后的独立问题。"""
+        for case in seed_cases:
+            if "multi_turn" not in case.tags:
+                continue
+            assert case.history, f"{case.id} 缺少对话历史"
+            assert case.search_query, f"{case.id} 缺少 search_query"
+            assert len(case.history) % 2 == 0, f"{case.id} 的历史应成对（问+答）"
+
+    def test_every_corpus_doc_is_covered(self, seed_cases, gov_documents):
+        """语料里每篇文档都要有用例，否则某篇文档检索不到也没人发现。"""
+        referenced = set()
+        for case in seed_cases:
+            referenced.update(case.expected_doc_ids)
+            referenced.update(case.forbidden_doc_ids)
+        corpus_docs = {doc.metadata["doc_id"] for doc in gov_documents}
+        assert corpus_docs <= referenced, f"这些文档没有任何用例覆盖: {corpus_docs - referenced}"
+
+    def test_questions_are_unique(self, seed_cases):
+        """同一问题配不同用户是有意的（权限对照），但完全重复的行是复制粘贴事故。"""
+        keys = [(c.user, c.question) for c in seed_cases]
+        assert len(keys) == len(set(keys)), "存在重复用例（同用户 + 同问题）"
+
+    def test_each_user_appears(self, seed_cases):
+        """四个演示账号都要有用例，才能覆盖不同的可见范围。"""
+        users = {case.user for case in seed_cases}
+        assert users == {"zhang", "li", "wang", "chen"}
 
 
 class TestSeedCorpus:

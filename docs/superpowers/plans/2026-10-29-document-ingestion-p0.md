@@ -33,13 +33,14 @@
 这些差异是为了让设计可落地而补的，均不改变安全边界：
 
 1. `documents` 增加 `effective_date date`。设计 §11 的确认请求包含该字段，但 §5.2 表结构漏列；否则该字段无处持久化。
-2. `Table` 增加 `header_values: list[list[str]]`。复核台需要“改表头起始行”后重切，仅靠 `columns + rows` 无法还原原始表头单元格。
+2. `Table` 增加 `header_values` 与 `pre_rows`。复核台需要“改表头起始行”后重切：`header_values` 保存当前表头单元格，`pre_rows` 保存 range 顶部到表头之前的原始行（标题行等）；否则把表头往前移时，原表头会无处安放、标题行已被丢弃，`full_grid()` 也就无法按绝对行号还原。
 3. `jobs.max_attempts` 语义定为**首次执行 + 最多 max_attempts 次重试**（默认 3 次重试），这样退避 30 s / 2 min / 10 min 才有意义；`attempts > max_attempts` 才进入 `failed`。
-4. `HEADER_LLM=auto` 在评测门禁通过前等同 `off`；只有显式 `always` 才调用 LLM。设计 §8.5 要求“不达标自动关闭”，P0 没有评测门禁，因此不能默认开启。
+4. `HEADER_LLM=auto` 在**表头识别专项评测集**建立前等同 `off`；只有显式 `always` 才调用 LLM。设计 §8.5 要求“不达标自动关闭”，P0 只有检索后端门禁（Task 24），没有表头识别门禁，因此不能默认开启。
 5. 现有语料导入走 `trusted_import=true`（设计 §14.1 “免解析复核”），直接进入嵌入与激活；该入口只存在于 CLI/内部任务，不经 HTTP 暴露。
 6. `RETRIEVAL_BACKEND` 的解析顺序：显式参数 > 环境变量 > （设置了 `INGEST_DB_URL` 则 `pg`，否则 `faiss`）。这样现有测试无需注入数据库即可保持 FAISS 路径。
 7. `purge` 完成后保留 `documents` 墓碑行（`status='deleting'`, `deleted_at` 非空），删除切片、版本与原件；审计仍可按 document_id 追溯。
 8. `User` 增加 `roles: tuple[str, ...] = ()`，演示账号映射为 `uploader / reviewer / admin`；现有 5 参数构造保持兼容。
+9. P0 的评测门禁用现有 33 条种子用例（`evaluation/cases.jsonl`）而不是设计 §13 的 ≥100 条：33 条已覆盖单事实/权限/数值/多轮/跨文档/越界六类，足够挡住“切 pg 后明显变差”；≥100 条的规模用例留到第一个客户语料到位后扩充，扩题不改门禁规则（同一脚本、同一 3% 容忍与零泄露硬条件），因此不算降低标准。
 
 ## 文件结构（先锁定边界，再拆任务）
 
@@ -90,22 +91,23 @@ app/
     index.html         # 增加导航与两个视图容器
     ingest.js          # 文档库 + 复核台 + 回源（无外部依赖）
     ingest.css
-scripts/
-  eval_retrieval.py    # Recall@5 / 引用准确率 / 拒答准确率
-docs/eval/
-  gov_questions.yaml   # 种子问题集
+evaluation/
+  pg_corpus.py         # pg 后端的金标校验语料视图（Task 24）
+  compare_backends.py  # FAISS vs pg 评测门禁与报告（Task 24）
 tests/ingest/
   conftest.py
   builders.py          # 测试用 docx/xlsx/pdf 生成器
   test_config.py test_schema.py test_ir.py test_sniff.py test_storage.py
-  test_queue.py test_xlsx_reader.py test_regions.py test_header_rules.py
-  test_header_llm.py test_templates.py test_table_build.py
+  test_queue.py test_worker_main.py test_xlsx_reader.py test_regions.py
+  test_header_rules.py test_header_llm.py test_templates.py test_table_build.py
   test_docx_parser.py test_pdf_parser.py test_markdown_parser.py
   test_pipeline.py test_documents_api.py test_review_api.py
   test_jobs_source_api.py test_chunking.py test_embedding.py
   test_activation.py test_retrieval.py test_rag_service_pg.py
-  test_import_gov_docs.py test_eval_metrics.py test_end_to_end.py
+  test_import_gov_docs.py test_eval_gate.py test_acceptance.py
 ```
+
+现有评测台（`evaluation/runner.py`、`cases.py`、`metrics.py`、`baseline.json` 与 33 条种子用例）复用不改名：Task 24 只在 `runner.py` 上做加法（`--backend`、`_validate_gold`），新增 `pg_corpus.py` 与 `compare_backends.py`。
 
 ## 任务索引
 
@@ -124,16 +126,17 @@ tests/ingest/
 | 11 | PDF 解析器 | M1 | 2,3,9 |
 | 12 | Markdown 解析器 | M1 | 2 |
 | 13 | 解析流水线（parse job） | M1 | 4,9,10,11,12 |
-| 14 | 上传与文档 API | M1 | 3,4,13 |
+| 14 | 上传、列表、详情、下线、删除 API | M1 | 3,4,13 |
 | 15 | 复核 API（含秘密级双人） | M1 | 13,14 |
 | 16 | 任务查询、健康检查、引用回源 | M1 | 14 |
 | 17 | 文档库与复核台前端 | M1 | 14,15,16 |
 | 18 | 切片（文本/表格摘要/行窗口） | M2 | 2 |
 | 19 | 嵌入 job 与 chunks 写入 | M2 | 13,18 |
-| 20 | 激活、下线、清理 | M2 | 19 |
+| 20 | 激活事务、版本切换与清理 | M2 | 19 |
 | 21 | pgvector 混合检索与拒答 | M2 | 18,19 |
 | 22 | RagService 后端切换与现有语料导入 | M2 | 20,21 |
-| 23 | 评测基准与全链路验收 | M2 | 22 |
+| 23 | 运维入口（schema 迁移与 worker 进程） | M2 | 22 |
+| 24 | 评测门禁与 P0 全链路验收 | M2 | 23 |
 
 ---
 
@@ -680,26 +683,45 @@ def migrate(conn: Connection) -> None:
     conn.commit()
 ```
 
-`app/audit.py`（从 `app/server.py` 原样搬移，保留函数签名）：
+`app/audit.py`（从 `app/server.py` 搬移 `write_audit`，**必须连并发锁与 fsync 一起搬**，否则 worker 与 API 并发写同一文件会交错，断电后已返回的问答会丢审计）：
 
 ```python
 from __future__ import annotations
 
 import json
+import os
+import threading
 from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 AUDIT_FILE = BASE_DIR / "logs" / "audit.jsonl"
+# 审计落盘后是否 fsync：政务场景要求「写入即可靠」，默认开启；高吞吐场景可用 AUDIT_FSYNC=0 关闭。
+AUDIT_FSYNC = os.getenv("AUDIT_FSYNC", "1").strip().lower() not in {"0", "false", "no"}
+
+_AUDIT_LOCK = threading.Lock()
 
 
 def write_audit(record: dict, audit_file: Path | None = None) -> None:
-    """追加一行 JSON 审计日志；等保留存/防篡改属于 P1。"""
-    audit_file = Path(audit_file or AUDIT_FILE)
-    audit_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"ts": datetime.now().isoformat(timespec="seconds"), **record}
-    with audit_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    """
+    追加一行 JSON 审计日志。
+
+    - 时间带本机时区偏移，跨时区/容器 UTC 下仍能对齐业务时间；
+    - 进程内加锁，避免 API 与 worker 多线程并发写入时行内交错；
+    - 默认 fsync，保证进程崩溃/断电后已返回的问答仍有审计。
+
+    留存、归档、防篡改、独立加密存储属于 P1。
+    """
+    target = Path(audit_file or AUDIT_FILE)
+    payload = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), **record}
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    with _AUDIT_LOCK:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            if AUDIT_FSYNC:
+                os.fsync(f.fileno())
 ```
 
 `app/server.py` 中删除本地 `write_audit` 与 `json`/`datetime` 的相关实现，改为兼容包装（**不要**改调用点，保证现有测试仍能 patch `server.AUDIT_FILE`）：
@@ -767,7 +789,7 @@ def _table(**over):
         "sheet": "2025预算",
         "range": "A3:H57",
         "header_rows": [3, 4],
-        "header_values": [["", "Q1", "Q2"], ["部门", "预算", "预算"]],
+        "header_values": [["", "Q1"], ["部门", "预算"]],
         "columns": [
             {"key": "c1", "name": "部门", "dtype": "string", "source_names": ["部门"]},
             {"key": "c2", "name": "Q1/预算", "dtype": "number", "unit": "万元"},
@@ -810,7 +832,7 @@ def test_table_helpers():
     assert table.data_start_row == 5
     assert table.data_rows() == [["综合处", "120"], ["人事处", "98"]]
     assert table.footer_values() == [["合计", "218"]]
-    assert table.full_grid()[0] == ["", "Q1", "Q2"]
+    assert table.full_grid()[0] == ["", "Q1"]
 
 
 def test_rejects_unsorted_header_rows():
@@ -899,6 +921,9 @@ class Table(_Strict):
     range: str
     header_rows: list[int] = Field(default_factory=list)
     header_values: list[list[str]] = Field(default_factory=list)
+    # 表头之前的原始行（标题行等）。复核台把表头起始行往前改时，靠它还原被“降级”成正文的行；
+    # 没有它就只能在 full_grid 里丢掉 range 顶部，改表头的语义就错了。
+    pre_rows: list[list[str]] = Field(default_factory=list)
     columns: list[Column]
     rows: list[list[str]]
     footer_rows: list[int] = Field(default_factory=list)
@@ -918,6 +943,12 @@ class Table(_Strict):
             raise ValueError("header_rows 必须严格递增且不重复")
         if len(self.header_values) != len(self.header_rows):
             raise ValueError("header_values 行数必须等于 header_rows 行数")
+        expected_pre = (
+            self.header_rows[0] - self.range_start_row if self.header_rows else 0
+        )
+        if len(self.pre_rows) != expected_pre:
+            raise ValueError(
+                f"pre_rows 行数必须等于表头起始行之前的数据行数（期望 {expected_pre}）")
         if len({c.key for c in self.columns}) != len(self.columns):
             raise ValueError("columns.key 必须唯一")
         for row in self.rows:
@@ -926,6 +957,9 @@ class Table(_Strict):
         for row in self.header_values:
             if len(row) != len(self.columns):
                 raise ValueError("header_values 每行列数必须等于 columns 数")
+        for row in self.pre_rows:
+            if len(row) != len(self.columns):
+                raise ValueError("pre_rows 每行列数必须等于 columns 数")
         if set(self.header_rows) & set(self.footer_rows):
             raise ValueError("footer_rows 不能与 header_rows 重叠")
         return self
@@ -947,7 +981,10 @@ class Table(_Strict):
         return [row for i, row in enumerate(self.rows) if start + i in self.footer_rows]
 
     def full_grid(self) -> list[list[str]]:
-        return [list(row) for row in self.header_values] + [list(row) for row in self.rows]
+        """从 range 第一行起的完整单元格网格，供 rebuild_table 按绝对行号重切表头。"""
+        return ([list(row) for row in self.pre_rows]
+                + [list(row) for row in self.header_values]
+                + [list(row) for row in self.rows])
 
 
 class Block(_Strict):
@@ -1416,7 +1453,9 @@ git commit -m "feat(ingest): 文件安全嗅探与内容寻址存储"
 import time
 from datetime import datetime, timezone
 
+import psycopg
 import pytest
+from psycopg.rows import dict_row
 
 from ingest.queue import (
     claim, complete, enqueue, fail, heartbeat, queue_depth, reap_stale,
@@ -1432,8 +1471,6 @@ def test_enqueue_and_claim_are_skip_locked(conn):
     first = claim(conn, "worker-a")
     assert first["payload"]["version_id"] == "v1"
     # conn 已提交，锁释放；另一个连接抢到第二条
-    import psycopg
-    from psycopg.rows import dict_row
     with psycopg.connect(conn.info.dsn, row_factory=dict_row) as other:
         second = claim(other, "worker-b")
     assert second["payload"]["version_id"] == "v2"
@@ -2874,6 +2911,8 @@ def build_signature(sheet_name: str | None, region: Region,
         "relative_header_row": candidate.start_row - region.start_row,
         "columns_norm": [normalize_header_name(n) for n in names],
         "sheet_pattern": f"^{re.escape(sheet_name)}$" if sheet_name else None,
+        # 测试与实现共用同一个函数，匹配时不必再由调用方注入 _sheet_name
+        "sheet_name": sheet_name,
     }
 
 
@@ -2889,11 +2928,8 @@ def match_template(signature: dict, templates: list[dict]) -> dict | None:
         if sig.get("ncols") != signature.get("ncols"):
             continue
         pattern = sig.get("sheet_pattern")
-        if pattern and not re.search(pattern, signature.get("sheet_name") or
-                                     signature.get("_sheet_name") or ""):
-            # signature 本身不带 sheet 名，调用方在匹配前注入 _sheet_name
-            if not re.search(pattern, signature.get("sheet_name", "")):
-                continue
+        if pattern and not re.search(pattern, signature.get("sheet_name") or ""):
+            continue
         if _jaccard(set(sig.get("columns_norm", [])),
                     set(signature.get("columns_norm", []))) >= 0.90:
             return template
@@ -2908,37 +2944,6 @@ def template_header_rows(template: dict, region: Region) -> list[int]:
 
 def template_columns(template: dict) -> list[dict]:
     return list(template.get("config", {}).get("columns", []))
-```
-
-> 说明：`match_template` 需要 sheet 名做 `sheet_pattern` 匹配。调用方在 `build_signature` 后把 `signature["sheet_name"] = sheet.name` 注入；测试里的 signature 直接来自 `build_signature`，因此 `sheet_pattern` 匹配会失败。为保持测试与实现一致，`build_signature` 直接写入 `"sheet_name": sheet_name`，`match_template` 读该字段即可。上面代码的兼容分支保留为防御，但主路径是 `sheet_name`。
-
-修正后的关键实现（以这段为准）：
-
-```python
-def build_signature(sheet_name: str | None, region: Region,
-                    candidate: HeaderCandidate, names: list[str]) -> dict:
-    return {
-        "ncols": len(names),
-        "header_depth": candidate.depth,
-        "relative_header_row": candidate.start_row - region.start_row,
-        "columns_norm": [normalize_header_name(n) for n in names],
-        "sheet_pattern": f"^{re.escape(sheet_name)}$" if sheet_name else None,
-        "sheet_name": sheet_name,
-    }
-
-
-def match_template(signature: dict, templates: list[dict]) -> dict | None:
-    for template in templates:
-        sig = template["signature"]
-        if sig.get("ncols") != signature.get("ncols"):
-            continue
-        pattern = sig.get("sheet_pattern")
-        if pattern and not re.search(pattern, signature.get("sheet_name") or ""):
-            continue
-        if _jaccard(set(sig.get("columns_norm", [])),
-                    set(signature.get("columns_norm", []))) >= 0.90:
-            return template
-    return None
 ```
 
 `ingest/parsers/header_llm.py`：
@@ -3344,6 +3349,11 @@ def build_table(sheet: SheetGrid, region: Region, header: HeaderCandidate | None
         [sheet.cell(r, c).text for c in range(region.start_col, region.end_col + 1)]
         for r in header_rows
     ]
+    # range 顶部、表头之前的行（标题/单位说明）：复核台前移表头时要能还原
+    pre_rows = [
+        [sheet.cell(r, c).text for c in range(region.start_col, region.end_col + 1)]
+        for r in range(region.start_row, header.start_row)
+    ] if header else []
     names = (compose_header_names(sheet, region, header.start_row, header.depth)
              if header else [f"列{i}" for i in range(1, ncols + 1)])
 
@@ -3376,8 +3386,6 @@ def build_table(sheet: SheetGrid, region: Region, header: HeaderCandidate | None
                 source_names=cfg.get("source_names", []),
             ))
     else:
-        data_columns = list(zip(*[row for row in kept_rows
-                                  if not _is_number(row[0] if row else "")]))
         for i, name in enumerate(names):
             clean, unit = _clean_name(name, i + 1)
             values = [row[i] for row in kept_rows if i < len(row)]
@@ -3417,6 +3425,7 @@ def build_table(sheet: SheetGrid, region: Region, header: HeaderCandidate | None
                f"{get_column_letter(region.end_col)}{region.end_row}"),
         header_rows=header_rows,
         header_values=header_values,
+        pre_rows=pre_rows,
         columns=columns,
         rows=kept_rows,
         footer_rows=footer_rows,
@@ -3468,7 +3477,6 @@ def rebuild_table(table: Table, new_header_rows: list[int],
 ```python
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 from ingest.config import Settings, get_settings
@@ -3483,6 +3491,7 @@ from ingest.parsers.templates import (
     build_signature, match_template, template_columns,
 )
 from ingest.parsers.xlsx_reader import read_workbook
+from ingest.sniff import sha256_file
 
 
 class XlsxParser:
@@ -3515,22 +3524,27 @@ class XlsxParser:
             for region in regions:
                 table_no += 1
                 decision = detect_header(sheet, region, self.settings)
-                header = decision.candidate if decision.accepted else None
+                header = None
                 forced_columns = None
 
-                if header is None and decision.candidates:
-                    for cand in decision.candidates[:3]:
-                        names = compose_header_names(
-                            sheet, region, cand.start_row, cand.depth)
-                        signature = build_signature(
-                            sheet.name, region, cand, names)
-                        template = match_template(signature, self.templates)
-                        if template:
-                            header = HeaderCandidate(
-                                cand.start_row, cand.depth, 0.95,
-                                dict(cand.features), (), "template")
-                            forced_columns = template_columns(template)
-                            break
+                # 模板优先（设计 §8.5：模板在规则打分之前）：人工确认过的版式比启发式分数
+                # 更可信，命中即用；不能等规则“拒绝”了才回头看模板，否则规则一旦接受别的行，
+                # 模板就永远不生效。
+                for cand in decision.candidates:
+                    names = compose_header_names(
+                        sheet, region, cand.start_row, cand.depth)
+                    signature = build_signature(
+                        sheet.name, region, cand, names)
+                    template = match_template(signature, self.templates)
+                    if template:
+                        header = HeaderCandidate(
+                            cand.start_row, cand.depth, 0.95,
+                            dict(cand.features), (), "template")
+                        forced_columns = template_columns(template)
+                        break
+
+                if header is None and decision.accepted:
+                    header = decision.candidate
 
                 if header is None and self.settings.header_llm_enabled \
                         and self.llm is not None and llm_calls < 3:
@@ -3563,7 +3577,7 @@ class XlsxParser:
 
         if not blocks:
             warnings.append({"code": "empty_document", "detail": "未找到可入库内容"})
-        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        sha = sha256_file(path)
         return DocModel(
             parser=ParserInfo(name=self.name, version=self.version),
             meta=DocMeta(title=path.stem, source_filename=path.name, sha256=sha),
@@ -3729,7 +3743,6 @@ Expected: FAIL，`No module named 'ingest.parsers.docx_parser'`。
 ```python
 from __future__ import annotations
 
-import hashlib
 import re
 
 from docx import Document
@@ -3898,7 +3911,7 @@ class DocxParser:
             parser=ParserInfo(name=self.name, version=self.version),
             meta=DocMeta(
                 title=title, source_filename=path.name,
-                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                sha256=sha256_file(path),
                 effective_date=effective_date,
             ),
             blocks=blocks, warnings=warnings,
@@ -3974,9 +3987,11 @@ git commit -m "feat(ingest): DOCX/DOC 解析（标题层级/表格/文本框/修
 - [ ] **Step 1: 写失败测试**
 
 ```python
+from dataclasses import replace
+
 import pytest
 
-from ingest.config import Settings, get_settings
+from ingest.config import get_settings
 from ingest.errors import TooLarge
 from ingest.parsers.pdf_parser import PdfParser
 
@@ -4022,7 +4037,7 @@ def test_scanned_pdf_is_flagged(tmp_path):
 def test_page_limit_is_enforced(tmp_path):
     path = tmp_path / "a.pdf"
     _text_pdf(path, pages=1)
-    settings = get_settings().__class__(**{**get_settings().__dict__, "max_pdf_pages": 0})
+    settings = replace(get_settings(), max_pdf_pages=0)
     with pytest.raises(TooLarge):
         PdfParser(settings=settings).parse(path)
 
@@ -4068,7 +4083,6 @@ Expected: FAIL，`No module named 'ingest.parsers.pdf_parser'`。
 ```python
 from __future__ import annotations
 
-import hashlib
 import re
 import statistics
 from collections import Counter
@@ -4087,6 +4101,7 @@ from ingest.parsers.regions import Region
 from ingest.parsers.table_build import build_table
 from ingest.parsers.templates import build_signature, match_template, template_columns
 from ingest.parsers.xlsx_reader import Cell, SheetGrid
+from ingest.sniff import sha256_file
 
 
 def _norm(text: str) -> str:
@@ -4262,7 +4277,7 @@ class PdfParser:
         return DocModel(
             parser=ParserInfo(name=self.name, version=self.version),
             meta=DocMeta(title=path.stem, source_filename=path.name,
-                         sha256=hashlib.sha256(path.read_bytes()).hexdigest()),
+                         sha256=sha256_file(path)),
             blocks=blocks_out, warnings=warnings,
         )
 ```
@@ -4346,7 +4361,6 @@ Expected: FAIL，`No module named 'ingest.parsers.markdown_parser'`。
 ```python
 from __future__ import annotations
 
-import hashlib
 import re
 from pathlib import Path
 
@@ -4354,6 +4368,7 @@ import yaml
 
 from ingest.config import Settings, get_settings
 from ingest.ir import Block, DocMeta, DocModel, ParserInfo, Warning
+from ingest.sniff import sha256_file
 
 _FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -4420,7 +4435,7 @@ class MarkdownParser:
                 title=str(meta.get("title") or path.stem),
                 effective_date=str(effective) if effective else None,
                 source_filename=path.name,
-                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                sha256=sha256_file(path),
             ),
             blocks=blocks, warnings=warnings,
         )
@@ -4814,7 +4829,8 @@ def _parse_file(conn: Connection, version: dict, source: Path,
             raise Quarantined("宏剥离失败")
         path = stripped
     try:
-        parser = _parser_for(conn, sniff.kind, version_dept := _dept_of(conn, version), settings)
+        dept = _dept_of(conn, version)
+        parser = _parser_for(conn, sniff.kind, dept, settings)
         return parser.parse(path)
     finally:
         if tmpdir:
@@ -4878,14 +4894,6 @@ def handle_parse_dead_letter(conn: Connection, job: dict) -> None:
 
 HANDLERS = {"parse": handle_parse}
 DEAD_LETTER_HOOKS = {"parse": handle_parse_dead_letter}
-```
-
-> `_parse_file` 里的海象表达式只为少写一行，实现时直接写 `dept = _dept_of(conn, version)` 更清楚。下面的代码以此为准：
-
-```python
-        dept = _dept_of(conn, version)
-        parser = _parser_for(conn, sniff.kind, dept, settings)
-        return parser.parse(path)
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -4952,6 +4960,10 @@ def api(clean_db, tmp_path, monkeypatch):
     get_settings.cache_clear()
     reset_pool_for_tests()
     from app import server
+
+    # 问答路径 audit_ready() 是 fail-closed：把审计文件指到 tmp，既不写脏仓库 logs/，
+    # 也避免并发测试互相关掉对方的可写性判断。
+    monkeypatch.setattr(server, "AUDIT_FILE", tmp_path / "audit.jsonl")
 
     def make(username: str = "wang") -> TestClient:
         client = TestClient(server.app)
@@ -6501,7 +6513,8 @@ def test_health_reports_db_and_queue(api, monkeypatch):
 
     class _Service:
         def stats(self):
-            return {"docs": 0, "chunks": 0}
+            # health() 直接透传 stats 的 embed_model：faiss=bge-m3、pg=INGEST_EMBED_MODEL
+            return {"docs": 0, "chunks": 0, "embed_model": "bge-m3"}
 
     monkeypatch.setattr(server, "_service", _Service())
     monkeypatch.setattr(server, "_service_error", None)
@@ -6680,6 +6693,8 @@ def health():
     payload = {
         "ok": True, "docs": stats["docs"], "chunks": stats["chunks"],
         "max_distance": max_distance(),
+        # faiss 模式是 EMBED_MODEL，pg 模式是 INGEST_EMBED_MODEL——由 stats 给出，别在这里猜
+        "embed_model": stats["embed_model"],
     }
     try:
         from ingest.config import get_settings
@@ -6693,7 +6708,6 @@ def health():
                 conn.execute("SELECT 1")
                 payload["queue_depth"] = queue_depth(conn)
             payload["db"] = "ok"
-            payload["embed_model"] = os.getenv("EMBED_MODEL", "bge-m3")
     except Exception as exc:  # noqa: BLE001 - 探针要把依赖故障暴露为 503
         payload["ok"] = False
         payload["db"] = f"error: {type(exc).__name__}"
@@ -9398,6 +9412,2512 @@ Expected: 既有测试全绿（本任务只动 `ingest/` 与 `.env.example`）�
 git add ingest/config.py ingest/repository.py ingest/activation.py \
   ingest/pipeline.py .env.example tests/ingest/test_activation.py
 git commit -m "feat(ingest): 版本激活事务、下线保留策略与异步清理"
+```
+
+---
+
+### Task 21: pgvector 混合检索与拒答
+
+**Files:**
+- Create: `ingest/retrieval.py`, `tests/ingest/test_retrieval.py`
+
+**Interfaces:**
+- Consumes: `ingest.chunking.tokenize()`、`ingest.embedding.Embedder / get_embedder()`、`ingest.config.Settings`（`dense_top / sparse_top / fusion_top / embed_dim`）、`app.users.User`。
+- Produces:
+  - `ingest.retrieval.Hit`：`db_id`、`chunk_id`、`doc_id`、`version_id`、`ordinal`、`chunk_type`、`content`、`title`、`dept`、`classification`、`effective_date`、`metadata`、`distance`、`expanded`。
+  - `ingest.retrieval.RetrievalOutcome`：`query`、`hits`、`best_distance`、`dense_hits`、`sparse_hits`、`visible_docs`、`visible_chunks`、`grounded`、`reason`。
+  - `retrieve(conn, user, query, *, embedder=None, settings=None, max_distance=None) -> RetrievalOutcome`。
+  - `RRF_K = 60`、`NEIGHBOR_LIMIT = 2`。
+
+**检索契约（设计 §5.4）：**
+
+- ACL 在 SQL 里前置：`c.active AND d.status='active' AND d.deleted_at IS NULL AND c.classification IS NOT NULL AND c.classification <= 用户上限 AND (c.classification=0 OR c.dept=用户部门)`。禁止先检索后删。
+- 稠密：按用户可读密级逐级查询（0/1/2 各一次），每级命中对应 partial HNSW 索引，物理上不混候选；公开级不加部门条件。
+- 稀疏：jieba 分词后拼成 `'词' | '词'` 的 OR 查询，`ts_rank_cd` 排序；查询中的标点不会拼进 tsquery。
+- 融合：应用层 RRF（`k=60`），按 `chunks.id` 去重；取 `FUSION_TOP=5`。
+- 邻片扩展：命中 `table_rows` 时，按 `(version_id, table_key)` 取相邻 `ordinal±1` 的窗口追加到结果尾部，**总计最多 2 片**，不参与排序。
+- 拒答：可见切片为 0 → `no_visible_docs`；无稠密命中 → `no_dense_hits`；最佳 L2 距离大于阈值 → `low_relevance`。只有 `grounded=True` 才允许生成。
+- 阈值由调用方传入（Task 22 传 `app.rag_service.max_distance()`，保证 FAISS / pg 共用同一套环境变量语义）；未传时读 `RAG_MAX_DISTANCE`，非法值回退 `0.78`。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_retrieval.py`：
+
+```python
+import re
+import uuid
+from dataclasses import replace
+
+import pytest
+from pgvector import Vector
+from psycopg.types.json import Jsonb
+
+from app.users import User
+from ingest import repository as repo, retrieval
+from ingest.chunking import tokenize
+from ingest.config import get_settings
+
+DIM = 1024
+
+
+def _vec(index=0, weight=1.0):
+    values = [0.0] * DIM
+    values[index % DIM] = float(weight)
+    return values
+
+
+class FakeEmbedder:
+    model = "bge-m3"
+    dim = DIM
+
+    def __init__(self, vector):
+        self.vector = vector
+        self.calls = 0
+
+    def embed(self, texts):
+        self.calls += len(texts)
+        return [list(self.vector) for _ in texts]
+
+
+class BoomEmbedder:
+    model = "bge-m3"
+    dim = DIM
+
+    def embed(self, texts):
+        raise AssertionError("不可见时不应调用嵌入服务")
+
+
+def _user(**over):
+    values = {"username": "zhang", "display_name": "张伟", "dept": "综合处",
+              "max_level": 1, "role": "工作人员"}
+    values.update(over)
+    return User(**values)
+
+
+def _doc(conn, *, dept="综合处", classification=1, title="预算说明"):
+    doc = repo.create_document(
+        conn, title=title, dept=dept, classification=classification,
+        effective_date=None, created_by="zhang")
+    version = repo.create_version(
+        conn, document_id=doc["id"], version_no=1,
+        sha256=uuid.uuid4().hex + uuid.uuid4().hex,
+        filename="a.xlsx", mime="application/vnd.ms-excel", size_bytes=100,
+        storage_path=f"aa/{uuid.uuid4().hex}", parser="xlsx",
+        parser_version="0.1.0", status="ready")
+    conn.execute(
+        "UPDATE documents SET status='active', current_version_id=%s WHERE id=%s",
+        (version["id"], doc["id"]))
+    conn.commit()
+    return repo.get_document(conn, doc["id"]), version
+
+
+def _add_chunk(conn, doc, version, ordinal, content, vector, *,
+               chunk_type="text", extra=None, active=True):
+    chunk_id = f"{doc['id']}@v1#{ordinal}"
+    metadata = {
+        "chunk_id": chunk_id, "chunk_type": chunk_type, "title": doc["title"],
+        "dept": doc["dept"], "classification": doc["classification"],
+        "source": "a.xlsx", **(extra or {}),
+    }
+    tokens = " ".join(tokenize(content))
+    conn.execute(
+        """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type,
+               content, content_tokens, tsv, embedding, embed_model, dept,
+               classification, metadata, chunk_hash, active)
+           VALUES (%s,%s,%s,%s,%s,%s,to_tsvector('simple', %s),%s,'bge-m3',
+                   %s,%s,%s,%s,%s)""",
+        (doc["id"], version["id"], ordinal, chunk_type, content, tokens, tokens,
+         Vector(vector), doc["dept"], doc["classification"], Jsonb(metadata),
+         uuid.uuid4().hex + uuid.uuid4().hex, active))
+    conn.commit()
+    return chunk_id
+
+
+def test_acl_prefilters_before_retrieval(conn):
+    user = _user()
+    own, own_version = _doc(conn, dept="综合处", classification=1)
+    _add_chunk(conn, own, own_version, 0, "预算 编制", _vec(0))
+    public, public_version = _doc(conn, dept="人事处", classification=0,
+                                  title="全局公开")
+    _add_chunk(conn, public, public_version, 0, "预算 公开", _vec(1))
+    secret, secret_version = _doc(conn, dept="综合处", classification=2,
+                                  title="秘密文档")
+    _add_chunk(conn, secret, secret_version, 0, "预算 秘密", _vec(0))
+    other, other_version = _doc(conn, dept="人事处", classification=1,
+                                title="他部门内部")
+    _add_chunk(conn, other, other_version, 0, "预算 内部", _vec(0))
+
+    outcome = retrieval.retrieve(conn, user, "预算",
+                                 embedder=FakeEmbedder(_vec(0)))
+
+    assert outcome.visible_chunks == 2
+    assert outcome.visible_docs == 2
+    assert {h.doc_id for h in outcome.hits} == {
+        str(own["id"]), str(public["id"])}
+
+
+def test_dense_and_sparse_fuse_by_rrf(conn):
+    user = _user()
+    doc, version = _doc(conn)
+    dense_chunk = _add_chunk(conn, doc, version, 0, "第一条 总则", _vec(0))
+    sparse_chunk = _add_chunk(conn, doc, version, 1, "预算 编制 说明", _vec(1))
+
+    outcome = retrieval.retrieve(conn, user, "预算",
+                                 embedder=FakeEmbedder(_vec(0)))
+
+    ids = [h.chunk_id for h in outcome.hits]
+    assert ids[0] == dense_chunk
+    assert sparse_chunk in ids
+    assert outcome.sparse_hits >= 1
+    assert outcome.grounded is True
+
+
+def test_low_relevance_refuses_with_best_distance(conn):
+    user = _user()
+    doc, version = _doc(conn)
+    _add_chunk(conn, doc, version, 0, "预算 数据", _vec(0))
+
+    outcome = retrieval.retrieve(conn, user, "预算",
+                                 embedder=FakeEmbedder(_vec(5)))
+
+    assert outcome.grounded is False
+    assert outcome.reason == "low_relevance"
+    assert outcome.best_distance == pytest.approx(2 ** 0.5)
+    assert outcome.hits
+
+
+def test_no_visible_chunks_refuses_without_embedding(conn):
+    user = _user()
+    doc, version = _doc(conn, classification=2)
+    _add_chunk(conn, doc, version, 0, "预算 秘密", _vec(0))
+
+    outcome = retrieval.retrieve(conn, user, "预算", embedder=BoomEmbedder())
+
+    assert outcome.visible_chunks == 0
+    assert outcome.reason == "no_visible_docs"
+    assert outcome.hits == []
+
+
+def test_table_rows_pull_adjacent_windows(conn):
+    user = _user()
+    doc, version = _doc(conn)
+    for ordinal, (text, vector) in enumerate([
+        ("第 1-10 行 其他 内容", _vec(1)),
+        ("第 11-20 行 预算 数据", _vec(0)),
+        ("第 21-30 行 其他 内容", _vec(2)),
+    ]):
+        _add_chunk(conn, doc, version, ordinal, text, vector,
+                   chunk_type="table_rows",
+                   extra={"table_key": "t1",
+                          "row_range": f"{ordinal * 10 + 1}-{ordinal * 10 + 10}"})
+    settings = replace(get_settings(), dense_top=1, sparse_top=1)
+
+    outcome = retrieval.retrieve(conn, user, "预算", settings=settings,
+                                 embedder=FakeEmbedder(_vec(0)))
+
+    assert [h.ordinal for h in outcome.hits] == [1, 0, 2]
+    assert [h.expanded for h in outcome.hits] == [False, True, True]
+
+
+def test_fusion_top_caps_context(conn):
+    user = _user()
+    doc, version = _doc(conn)
+    for ordinal in range(7):
+        _add_chunk(conn, doc, version, ordinal, f"预算 条目 {ordinal}", _vec(0))
+
+    outcome = retrieval.retrieve(conn, user, "预算",
+                                 embedder=FakeEmbedder(_vec(0)))
+
+    assert len(outcome.hits) == 5
+
+
+def test_sparse_query_tolerates_punctuation(conn):
+    user = _user()
+    doc, version = _doc(conn)
+    _add_chunk(conn, doc, version, 0, "2025 年 预算 （万元）", _vec(1))
+
+    outcome = retrieval.retrieve(conn, user, "预算（万元）& 2025!",
+                                 embedder=FakeEmbedder(_vec(9)))
+
+    assert outcome.sparse_hits == 1
+    assert outcome.grounded is False
+
+
+def test_hits_carry_citation_fields(conn):
+    user = _user()
+    doc, version = _doc(conn)
+    _add_chunk(conn, doc, version, 0, "预算 数据", _vec(0))
+
+    outcome = retrieval.retrieve(conn, user, "预算",
+                                 embedder=FakeEmbedder(_vec(0)))
+
+    hit = outcome.hits[0]
+    assert re.fullmatch(r"[0-9a-f-]{36}@v\d+#\d+", hit.chunk_id)
+    assert hit.title == "预算说明"
+    assert hit.dept == "综合处"
+    assert hit.classification == 1
+    assert hit.effective_date == ""
+    assert hit.metadata["source"] == "a.xlsx"
+    assert hit.expanded is False
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_retrieval.py -v
+```
+
+Expected: FAIL，`ModuleNotFoundError: No module named 'ingest.retrieval'`。
+
+- [ ] **Step 3: 写实现**
+
+`ingest/retrieval.py`：
+
+```python
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+
+from pgvector import Vector
+from psycopg import Connection
+
+from app.users import User
+from ingest.chunking import tokenize
+from ingest.config import Settings, get_settings
+from ingest.embedding import Embedder, get_embedder
+from ingest.errors import ModelUnavailable
+
+RRF_K = 60
+NEIGHBOR_LIMIT = 2
+DEFAULT_MAX_DISTANCE = 0.78
+
+# tsquery 里只保留词/数字/下划线；jieba 切出的标点直接丢弃
+_TS_SAFE = re.compile(r"[^\w]+", re.UNICODE)
+
+_BASE = """
+SELECT c.id AS db_id, c.document_id, c.version_id, c.ordinal, c.chunk_type,
+       c.content, c.metadata, c.dept, c.classification, v.version_no,
+       d.title AS doc_title, d.effective_date
+  FROM chunks c
+  JOIN documents d ON d.id = c.document_id
+  JOIN doc_versions v ON v.id = c.version_id
+"""
+
+_ACL = """
+c.active
+AND d.status = 'active' AND d.deleted_at IS NULL
+AND c.classification IS NOT NULL
+AND c.classification <= %s
+AND (c.classification = 0 OR c.dept = %s)
+"""
+
+
+@dataclass
+class Hit:
+    db_id: int
+    chunk_id: str
+    doc_id: str
+    version_id: str
+    ordinal: int
+    chunk_type: str
+    content: str
+    title: str
+    dept: str
+    classification: int
+    effective_date: str
+    metadata: dict
+    distance: float | None = None
+    expanded: bool = False
+
+
+@dataclass
+class RetrievalOutcome:
+    query: str
+    hits: list[Hit] = field(default_factory=list)
+    best_distance: float | None = None
+    dense_hits: int = 0
+    sparse_hits: int = 0
+    visible_docs: int = 0
+    visible_chunks: int = 0
+    grounded: bool = False
+    reason: str = ""
+
+
+def _threshold(explicit: float | None) -> float:
+    if explicit is not None:
+        return explicit
+    raw = os.getenv("RAG_MAX_DISTANCE")
+    if not raw or not raw.strip():
+        return DEFAULT_MAX_DISTANCE
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_DISTANCE
+    return value if value > 0 else DEFAULT_MAX_DISTANCE
+
+
+def _tsquery(query: str) -> str | None:
+    raw = " ".join(tokenize(query))
+    terms = [t for t in _TS_SAFE.sub(" ", raw).split() if t]
+    if not terms:
+        return None
+    return " | ".join(f"'{term}'" for term in terms)
+
+
+def _hit(row: dict, *, distance: float | None = None,
+         expanded: bool = False) -> Hit:
+    metadata = row["metadata"] or {}
+    chunk_id = metadata.get("chunk_id") or (
+        f"{row['document_id']}@v{row['version_no']}#{row['ordinal']}")
+    return Hit(
+        db_id=int(row["db_id"]), chunk_id=chunk_id,
+        doc_id=str(row["document_id"]), version_id=str(row["version_id"]),
+        ordinal=int(row["ordinal"]), chunk_type=row["chunk_type"],
+        content=row["content"], title=row["doc_title"], dept=row["dept"],
+        classification=int(row["classification"]),
+        effective_date=str(row["effective_date"] or ""),
+        metadata=metadata, distance=distance, expanded=expanded,
+    )
+
+
+def _visible_counts(conn: Connection, user: User) -> tuple[int, int]:
+    row = conn.execute(
+        f"""SELECT count(*) AS chunks, count(DISTINCT c.document_id) AS docs
+              FROM chunks c
+              JOIN documents d ON d.id = c.document_id
+             WHERE {_ACL}""",
+        (user.max_level, user.dept),
+    ).fetchone()
+    return int(row["chunks"]), int(row["docs"])
+
+
+def _dense(conn: Connection, user: User, vector: list[float],
+           settings: Settings) -> list[Hit]:
+    merged: dict[int, Hit] = {}
+    for level in range(0, user.max_level + 1):
+        # 公开级不限部门；内部/秘密级只查本部门，命中各自的 partial HNSW 索引
+        dept_sql = "" if level == 0 else " AND c.dept = %s"
+        params: list = [Vector(vector), level]
+        if level:
+            params.append(user.dept)
+        params.append(settings.dense_top)
+        rows = conn.execute(
+            f"""SELECT c.id AS db_id, c.document_id, c.version_id, c.ordinal,
+                       c.chunk_type, c.content, c.metadata, c.dept,
+                       c.classification, v.version_no,
+                       d.title AS doc_title, d.effective_date,
+                       c.embedding <-> %s AS distance
+                  FROM chunks c
+                  JOIN documents d ON d.id = c.document_id
+                  JOIN doc_versions v ON v.id = c.version_id
+                 WHERE c.active
+                   AND d.status = 'active' AND d.deleted_at IS NULL
+                   AND c.classification = %s{dept_sql}
+                   AND c.embedding IS NOT NULL
+                 ORDER BY distance
+                 LIMIT %s""",
+            params,
+        ).fetchall()
+        for row in rows:
+            hit = _hit(row, distance=float(row["distance"]))
+            merged.setdefault(hit.db_id, hit)
+    return sorted(merged.values(), key=lambda h: (h.distance, h.db_id))[
+        : settings.dense_top]
+
+
+def _sparse(conn: Connection, user: User, query: str,
+            settings: Settings) -> list[Hit]:
+    tsquery = _tsquery(query)
+    if tsquery is None:
+        return []
+    rows = conn.execute(
+        f"""{_BASE}
+            WHERE {_ACL}
+              AND c.tsv @@ to_tsquery('simple', %s)
+            ORDER BY ts_rank_cd(c.tsv, to_tsquery('simple', %s)) DESC, c.id
+            LIMIT %s""",
+        (user.max_level, user.dept, tsquery, tsquery, settings.sparse_top),
+    ).fetchall()
+    return [_hit(row) for row in rows]
+
+
+def _fuse(dense: list[Hit], sparse: list[Hit], *, top: int) -> list[Hit]:
+    scores: dict[int, float] = {}
+    hits: dict[int, Hit] = {}
+    for results in (dense, sparse):
+        for rank, hit in enumerate(results, start=1):
+            scores[hit.db_id] = scores.get(hit.db_id, 0.0) + 1.0 / (RRF_K + rank)
+            hits.setdefault(hit.db_id, hit)
+    ordered = sorted(hits.values(), key=lambda h: (-scores[h.db_id], h.db_id))
+    return ordered[:top]
+
+
+def _expand_table_neighbors(conn: Connection, hits: list[Hit], *,
+                            limit: int = NEIGHBOR_LIMIT) -> list[Hit]:
+    if limit <= 0:
+        return []
+    selected = {h.db_id for h in hits}
+    added: list[Hit] = []
+    for hit in hits:
+        if len(added) >= limit:
+            break
+        if hit.chunk_type != "table_rows":
+            continue
+        table_key = hit.metadata.get("table_key")
+        if not table_key:
+            continue
+        rows = conn.execute(
+            f"""{_BASE}
+                WHERE c.version_id = %s AND c.chunk_type = 'table_rows'
+                  AND c.active AND d.status = 'active'
+                  AND d.deleted_at IS NULL
+                  AND c.metadata->>'table_key' = %s
+                  AND c.ordinal = ANY(%s)
+                  AND NOT (c.id = ANY(%s))
+                ORDER BY c.ordinal""",
+            (hit.version_id, table_key,
+             [hit.ordinal - 1, hit.ordinal + 1], list(selected)),
+        ).fetchall()
+        for row in rows:
+            if len(added) >= limit:
+                break
+            neighbor = _hit(row, expanded=True)
+            if neighbor.db_id in selected:
+                continue
+            selected.add(neighbor.db_id)
+            added.append(neighbor)
+    return added
+
+
+def retrieve(conn: Connection, user: User, query: str, *,
+             embedder: Embedder | None = None,
+             settings: Settings | None = None,
+             max_distance: float | None = None) -> RetrievalOutcome:
+    settings = settings or get_settings()
+    outcome = RetrievalOutcome(query=query)
+    outcome.visible_chunks, outcome.visible_docs = _visible_counts(conn, user)
+    if outcome.visible_chunks == 0:
+        outcome.reason = "no_visible_docs"
+        return outcome
+
+    embedder = embedder or get_embedder(settings)
+    vector = embedder.embed([query])[0]
+    if len(vector) != settings.embed_dim:
+        raise ModelUnavailable(
+            f"查询向量维度 {len(vector)} != EMBED_DIM {settings.embed_dim}")
+
+    dense = _dense(conn, user, vector, settings)
+    sparse = _sparse(conn, user, query, settings)
+    outcome.dense_hits = len(dense)
+    outcome.sparse_hits = len(sparse)
+    outcome.best_distance = dense[0].distance if dense else None
+
+    fused = _fuse(dense, sparse, top=settings.fusion_top)
+    outcome.hits = fused + _expand_table_neighbors(conn, fused)
+
+    if outcome.best_distance is None:
+        outcome.reason = "no_dense_hits"
+    elif outcome.best_distance > _threshold(max_distance):
+        outcome.reason = "low_relevance"
+    else:
+        outcome.grounded = True
+    return outcome
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_retrieval.py -v
+```
+
+Expected: 8 passed。
+
+- [ ] **Step 5: 回归既有测试**
+
+```bash
+uv run pytest tests/test_web.py tests/test_main.py -q
+```
+
+Expected: 既有测试全绿（`app/rag_service.py` 尚未改动）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ingest/retrieval.py tests/ingest/test_retrieval.py
+git commit -m "feat(ingest): pgvector 分级稠密检索、FTS 与 RRF 拒答"
+```
+
+---
+
+### Task 22: RagService 后端切换与现有语料导入
+
+**Files:**
+- Modify: `app/rag_service.py`（`resolve_backend` + pg 分支；FAISS 逻辑原样保留）、`app/server.py`（初始化失败提示分后端）、`.env.example`、`tests/test_web.py`（service fixture 显式 `backend="faiss"`）
+- Create: `ingest/import_gov_docs.py`、`tests/ingest/test_rag_service_pg.py`、`tests/ingest/test_import_gov_docs.py`
+
+**Interfaces:**
+- Consumes: Task 21 的 `ingest.retrieval.retrieve / RetrievalOutcome / Hit`、Task 19 的 `ingest.embedding.get_embedder`、Task 20 的 `activate` 任务、`ingest.repository`、`ingest.storage.FileStore`、`ingest.queue.enqueue`、Task 12 的 `MarkdownParser / read_front_matter`、`app.users.CLASSIFICATION_LEVELS`。
+- Produces:
+  - `app.rag_service.resolve_backend(explicit: str | None = None) -> str`（`faiss|pg`，非法值抛 `ValueError`）。
+  - `RagService(..., *, backend=None, conn_factory=None, embedder=None)`；属性 `backend`、`embedder`、`_conn_factory`；`retrieve / visible_docs / stats` 按后端分派。
+  - `ingest.import_gov_docs.import_file(conn, path, *, created_by="import", settings=None) -> dict`、`import_dir(conn, directory, *, created_by="import", settings=None) -> list[dict]`、`main(argv=None) -> int`。
+
+**行为约定（与设计 §14.1 迁移步骤对齐）：**
+
+- **P0 部署配置默认 `pg`**：`resolve_backend` 的顺序是「构造参数 > `RETRIEVAL_BACKEND` > （配置了 `INGEST_DB_URL` 则 `pg`，否则 `faiss`）」；`DEFAULT_BACKEND = "faiss"` 只是「既没写后端也没配数据库」时的兜底，保证教学主线与既有测试开箱即用。Task 24 在 `.env.example` 里显式写 `RETRIEVAL_BACKEND=pg` 并保留 `faiss` 回退一个版本周期。
+- pg 模式启动时**不加载** `data/gov_docs`、不碰 FAISS、不初始化 LangChain embedding；只执行一次 `SELECT 1 FROM documents LIMIT 1` 探库。未迁移/连不上时启动即失败，由 `server.get_service()` 变成可读的 503，而不是首个提问才 500。
+- 查询向量由 `ingest.embedding.get_embedder()` 生成（`INGEST_EMBED_MODEL=bge-m3`，1024 维），**不能**复用 FAISS 的 `EMBED_MODEL`（`nomic-embed-text`，768 维）；两套模型写同一个向量列本身就是数据损坏。
+- 权限仍前置：pg 分支一律走 Task 21 的 SQL 过滤；`visible_documents()` 在 pg 模式显式抛 `RuntimeError`，避免调用方把空列表误判成「无可见文档」而错误拒答。
+- 引用元数据保持既有契约：`chunk_id / doc_id / title / dept / classification / effective_date / source / preview`。`classification` 转回中文名，`classification_level` 保留整数；`source` 取切片 metadata 里的文件名；表格邻片 `expanded=true`。
+- `import_gov_docs` 是 **trusted_import 的唯一入口**（仅 CLI，不经 HTTP）：sha256 全库去重，重复导入返回 `skipped=True` 且不建行/不入队；先解析校验再写库（坏文件不会留下半条 `documents`）；原件进内容寻址存储；版本直接置 `embedding` 并入队 `embed`（priority 50），之后由 embed → activate 两个 job 完成切片、向量化与激活；审计 `action="import"`。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_rag_service_pg.py`：
+
+```python
+from __future__ import annotations
+
+import contextlib
+import uuid
+
+import pytest
+from langchain_community.vectorstores import FAISS
+from langchain_core.messages import AIMessage
+from pgvector import Vector
+from psycopg.types.json import Jsonb
+
+from app import rag_service as rs
+from app.users import User, get_user
+from ingest import repository as repo
+from ingest.chunking import tokenize
+
+DIM = 1024
+
+
+class FakeLLM:
+    def __init__(self):
+        self.stream_called = False
+
+    def invoke(self, messages):
+        return AIMessage(content="")
+
+    def stream(self, messages):
+        self.stream_called = True
+        yield AIMessage(content="这是答案")
+
+
+class FakeEmbedder:
+    model = "bge-m3"
+    dim = DIM
+
+    def __init__(self, index=0):
+        self.vector = [0.0] * DIM
+        self.vector[index] = 1.0
+        self.calls = 0
+
+    def embed(self, texts):
+        self.calls += len(texts)
+        return [list(self.vector) for _ in texts]
+
+
+class FakeEmbeddings:
+    """LangChain Embeddings 替身，只用于验证 faiss 分支仍能构建。"""
+
+    def embed_documents(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    def embed_query(self, text):
+        return [1.0, 0.0]
+
+
+@pytest.fixture()
+def service(conn):
+    return rs.RagService(
+        llm=FakeLLM(), backend="pg", embedder=FakeEmbedder(),
+        conn_factory=lambda: contextlib.nullcontext(conn),
+    )
+
+
+def _seed(conn, *, dept="综合处", classification=1, title="预算说明",
+          content="2025 年预算为 100 万元"):
+    doc = repo.create_document(
+        conn, title=title, dept=dept, classification=classification,
+        effective_date="2026-01-01", created_by="zhang")
+    version = repo.create_version(
+        conn, document_id=doc["id"], version_no=1,
+        sha256=uuid.uuid4().hex + uuid.uuid4().hex,
+        filename="预算.xlsx", mime="application/vnd.ms-excel", size_bytes=10,
+        storage_path=f"aa/{uuid.uuid4().hex}", parser="xlsx",
+        parser_version="0.1.0", status="ready")
+    conn.execute(
+        "UPDATE documents SET status='active', current_version_id=%s WHERE id=%s",
+        (version["id"], doc["id"]))
+    tokens = " ".join(tokenize(content))
+    metadata = {
+        "chunk_id": f"{doc['id']}@v1#0", "chunk_type": "text",
+        "title": title, "dept": dept, "classification": classification,
+        "source": "预算.xlsx",
+    }
+    conn.execute(
+        """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type,
+               content, content_tokens, tsv, embedding, embed_model, dept,
+               classification, metadata, chunk_hash, active)
+           VALUES (%s,%s,0,'text',%s,%s,to_tsvector('simple', %s),%s,'bge-m3',
+                   %s,%s,%s,%s,true)""",
+        (doc["id"], version["id"], content, tokens, tokens,
+         Vector([1.0] + [0.0] * (DIM - 1)), dept, classification,
+         Jsonb(metadata), uuid.uuid4().hex + uuid.uuid4().hex))
+    conn.commit()
+    return repo.get_document(conn, doc["id"]), version
+
+
+def test_resolve_backend_precedence(monkeypatch):
+    monkeypatch.delenv("RETRIEVAL_BACKEND", raising=False)
+    monkeypatch.delenv("INGEST_DB_URL", raising=False)
+    assert rs.resolve_backend() == "faiss"
+
+    # 配了数据库但没写 RETRIEVAL_BACKEND：默认走 pg，避免「数据入 pg、查询却查 FAISS」
+    monkeypatch.setenv("INGEST_DB_URL", "postgresql://rag:rag@127.0.0.1:5433/rag")
+    assert rs.resolve_backend() == "pg"
+
+    monkeypatch.setenv("RETRIEVAL_BACKEND", " FAISS ")
+    assert rs.resolve_backend() == "faiss"
+    assert rs.resolve_backend("pg") == "pg"
+
+    with pytest.raises(ValueError, match="RETRIEVAL_BACKEND"):
+        rs.resolve_backend("chroma")
+
+
+def test_pg_mode_does_not_bootstrap_faiss(monkeypatch, conn):
+    def boom(*args, **kwargs):
+        raise AssertionError("pg 后端不应加载语料、FAISS 或 LangChain embedding")
+
+    monkeypatch.setattr(rs, "load_gov_documents", boom)
+    monkeypatch.setattr(rs, "build_or_load_index", boom)
+    monkeypatch.setattr(rs.core, "init_embedding", boom)
+
+    service = rs.RagService(
+        llm=FakeLLM(), backend="pg", embedder=FakeEmbedder(),
+        conn_factory=lambda: contextlib.nullcontext(conn))
+
+    assert service.backend == "pg"
+    assert service.documents == []
+    assert service.vectorstore is None
+    assert service.embed_model is None
+
+
+def test_pg_retrieve_maps_citation_metadata(service, conn, monkeypatch):
+    monkeypatch.setattr(rs, "max_distance", lambda: 999.0)
+    visible, _ = _seed(conn)
+    hidden, _ = _seed(conn, dept="人事处", title="考勤细则")
+
+    result = service.retrieve(get_user("zhang"), "2025 年预算")
+
+    assert result.grounded is True
+    assert result.visible_docs == 1
+    assert result.visible_chunks == 1
+    assert result.docs
+    metadata = result.docs[0].metadata
+    assert metadata["doc_id"] == str(visible["id"])
+    assert metadata["classification"] == "内部"
+    assert metadata["classification_level"] == 1
+    assert metadata["effective_date"] == "2026-01-01"
+    assert metadata["source"] == "预算.xlsx"
+    assert metadata["chunk_id"].startswith(str(visible["id"]))
+    assert metadata["expanded"] is False
+    assert all(d.metadata["doc_id"] != str(hidden["id"]) for d in result.docs)
+
+
+def test_pg_refuses_without_embedding_when_nothing_visible(service, conn):
+    _seed(conn)
+    outsider = User("outsider", "外部人员", "外部单位", max_level=-1, role="访客")
+
+    result = service.retrieve(outsider, "预算")
+
+    assert result.reason == "no_visible_docs"
+    assert result.grounded is False
+    assert result.docs == []
+    assert service.embedder.calls == 0
+
+
+def test_pg_visible_docs_and_stats(service, conn):
+    public, _ = _seed(conn, dept="信息中心", classification=0, title="公开指南")
+    internal, _ = _seed(conn, title="预算说明")
+    _seed(conn, dept="人事处", title="考勤细则")
+
+    visible = service.visible_docs(get_user("zhang"))
+
+    assert {item["doc_id"] for item in visible} == {str(public["id"]), str(internal["id"])}
+    assert {item["classification"] for item in visible} == {"公开", "内部"}
+
+    stats = service.stats()
+    assert stats["backend"] == "pg"
+    assert stats["docs"] == 3
+    assert stats["chunks"] == 3
+    assert stats["chunks_by_classification"] == {"公开": 1, "内部": 2}
+    assert stats["load_issues"] == []
+    assert stats["max_distance"] == rs.max_distance()
+
+
+def test_pg_visible_documents_is_explicitly_unsupported(service):
+    with pytest.raises(RuntimeError, match="visible_documents"):
+        service.visible_documents(get_user("zhang"))
+
+
+def test_faiss_mode_reports_backend(monkeypatch):
+    monkeypatch.setattr(
+        rs, "build_or_load_index",
+        lambda documents, embed_model: FAISS.from_documents(documents, embed_model))
+
+    service = rs.RagService(llm=FakeLLM(), embed_model=FakeEmbeddings(),
+                            backend="faiss")
+
+    assert service.backend == "faiss"
+    assert service.stats()["backend"] == "faiss"
+    assert service.stats()["docs"] == 4
+```
+
+`tests/ingest/test_import_gov_docs.py`：
+
+```python
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from ingest import import_gov_docs as importer
+from ingest.config import get_settings
+
+CORPUS = Path(__file__).resolve().parents[2] / "data" / "gov_docs"
+
+
+def _settings(tmp_path):
+    return replace(get_settings(), upload_dir=tmp_path / "uploads")
+
+
+def _write(path: Path, *, classification="内部", doc_id="doc-1",
+           effective_date="2026-05-01"):
+    path.write_text(
+        "---\n"
+        f"doc_id: {doc_id}\n"
+        "title: 测试文档\n"
+        "dept: 综合处\n"
+        f"classification: {classification}\n"
+        f"effective_date: {effective_date}\n"
+        "---\n\n"
+        "# 标题\n\n正文内容\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture()
+def audited(monkeypatch):
+    records: list[dict] = []
+    monkeypatch.setattr(importer, "write_audit", records.append)
+    return records
+
+
+def test_import_file_parses_stores_and_enqueues(conn, tmp_path, audited):
+    path = _write(tmp_path / "测试.md")
+    settings = _settings(tmp_path)
+
+    result = importer.import_file(conn, path, settings=settings)
+
+    doc = conn.execute("SELECT * FROM documents").fetchone()
+    assert str(doc["id"]) == result["document_id"]
+    assert doc["status"] == "draft"
+    assert doc["classification"] == 1
+    assert str(doc["effective_date"]) == "2026-05-01"
+    assert doc["created_by"] == "import"
+
+    version = conn.execute("SELECT * FROM doc_versions").fetchone()
+    assert version["status"] == "embedding"
+    assert version["parser"] == "markdown"
+    assert version["ir"]["blocks"]
+    assert version["sha256"] == result["sha256"]
+
+    job = conn.execute("SELECT * FROM jobs WHERE kind='embed'").fetchone()
+    assert job["payload"]["version_id"] == result["version_id"]
+    assert job["priority"] == 50
+
+    stored = settings.upload_dir / result["sha256"][:2] / result["sha256"]
+    assert stored.read_bytes() == path.read_bytes()
+    assert audited[-1]["action"] == "import"
+
+
+def test_import_is_idempotent_by_content(conn, tmp_path, audited):
+    path = _write(tmp_path / "测试.md")
+    settings = _settings(tmp_path)
+
+    first = importer.import_file(conn, path, settings=settings)
+    second = importer.import_file(conn, path, settings=settings)
+
+    assert first["skipped"] is False
+    assert second["skipped"] is True
+    assert second["document_id"] == first["document_id"]
+
+    counts = conn.execute(
+        """SELECT (SELECT count(*) FROM documents) AS docs,
+                  (SELECT count(*) FROM doc_versions) AS versions,
+                  (SELECT count(*) FROM jobs) AS jobs"""
+    ).fetchone()
+    assert dict(counts) == {"docs": 1, "versions": 1, "jobs": 1}
+
+
+def test_invalid_classification_creates_nothing(conn, tmp_path, audited):
+    path = _write(tmp_path / "坏.md", classification="绝密")
+    settings = _settings(tmp_path)
+
+    with pytest.raises(ValueError, match="classification"):
+        importer.import_file(conn, path, settings=settings)
+
+    assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 0
+    assert not settings.upload_dir.exists() or not any(settings.upload_dir.rglob("*"))
+    assert audited == []
+
+
+def test_imports_existing_corpus(conn, tmp_path, audited):
+    results = importer.import_dir(conn, CORPUS, settings=_settings(tmp_path))
+
+    assert len(results) == 4
+    assert all(r["skipped"] is False and r["job_id"] for r in results)
+    assert {r["doc_id"] for r in results} == {
+        "gov-001", "gov-002", "gov-003", "gov-004"}
+    assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 4
+    assert conn.execute(
+        "SELECT count(*) AS n FROM jobs WHERE kind='embed'").fetchone()["n"] == 4
+
+    classes = conn.execute(
+        """SELECT classification, count(*) AS n FROM documents
+           GROUP BY classification ORDER BY classification"""
+    ).fetchall()
+    assert [(row["classification"], row["n"]) for row in classes] == [
+        (0, 1), (1, 2), (2, 1)]
+
+
+def test_import_dir_reports_bad_file_and_continues(conn, tmp_path, audited):
+    _write(tmp_path / "good.md", doc_id="ok-1")
+    _write(tmp_path / "bad.md", doc_id="bad-1", classification="绝密")
+
+    results = importer.import_dir(conn, tmp_path, settings=_settings(tmp_path))
+
+    by_file = {item["file"]: item for item in results}
+    assert by_file["good.md"]["error"] is None
+    assert "classification" in by_file["bad.md"]["error"]
+    assert conn.execute("SELECT count(*) AS n FROM documents").fetchone()["n"] == 1
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_rag_service_pg.py tests/ingest/test_import_gov_docs.py -v
+```
+
+Expected: FAIL，`AttributeError: module 'app.rag_service' has no attribute 'resolve_backend'`；`No module named 'ingest.import_gov_docs'`。
+
+- [ ] **Step 3: 写实现**
+
+**3.1 `app/rag_service.py`：后端解析与 pg 分支**
+
+在 `DEFAULT_MAX_DISTANCE = 0.78` 之后插入：
+
+```python
+# ---------- 检索后端 ----------
+
+RETRIEVAL_BACKENDS = ("faiss", "pg")
+# 未显式配置后端、也没有数据库时的兜底：教学主线与既有测试仍开箱即用。
+# 配置了 INGEST_DB_URL 就默认走 pg（见 resolve_backend），.env.example 里再显式写死 pg。
+DEFAULT_BACKEND = "faiss"
+
+_CLASSIFICATION_NAMES = {level: name for name, level in CLASSIFICATION_LEVELS.items()}
+
+
+def resolve_backend(explicit: str | None = None) -> str:
+    """
+    解析检索后端：构造参数 > RETRIEVAL_BACKEND > （配置了 INGEST_DB_URL 则 pg，否则 faiss）。
+
+    非法值直接抛错，而不是悄悄回退到 FAISS——部署时后端名写错，
+    应该启动就失败，不能等用户提问后才发现查的是另一个库。
+    """
+    raw = explicit if explicit is not None else os.getenv("RETRIEVAL_BACKEND", "")
+    value = (raw or "").strip().lower()
+    if not value:
+        value = "pg" if os.getenv("INGEST_DB_URL", "").strip() else DEFAULT_BACKEND
+    if value not in RETRIEVAL_BACKENDS:
+        raise ValueError(
+            f"RETRIEVAL_BACKEND={value!r} 非法，可选：{'/'.join(RETRIEVAL_BACKENDS)}")
+    return value
+
+
+def _default_conn_factory():
+    from ingest.db import connection
+
+    return connection()
+```
+
+`__init__` 替换为：
+
+```python
+    def __init__(self, llm=None, embed_model=None,
+                 history_turns: int = core.MAX_HISTORY_TURNS, *,
+                 backend: str | None = None, conn_factory=None,
+                 embedder=None):
+        self.backend = resolve_backend(backend)
+        self.llm = llm or core.init_llm()
+        self.history_turns = history_turns
+        self._history: dict[str, list] = {}
+        self.load_issues: list[DocIssue] = []
+
+        if self.backend == "pg":
+            # pg 后端不需要语料目录、FAISS 与 LangChain embedding：
+            # 查询向量由入库同一模型（INGEST_EMBED_MODEL）生成，见 _require_embedder()。
+            self.embed_model = None
+            self.embedder = embedder
+            self.documents = []
+            self.vectorstore = None
+            self._conn_factory = conn_factory or _default_conn_factory
+            # 启动即探库：未迁移/连不上要让 get_service() 变成 503，
+            # 而不是等第一个提问在 retrieve 里抛 UndefinedTable。
+            with self._conn_factory() as conn:
+                conn.execute("SELECT 1 FROM documents LIMIT 1")
+            return
+
+        self.embedder = None
+        self._conn_factory = None
+        self.embed_model = embed_model or core.init_embedding()
+        # 运行时用宽松模式：单个坏文件只跳过并留痕，不让整库不可用
+        self.documents = load_gov_documents(issues=self.load_issues)
+        if self.load_issues:
+            logger.warning(
+                "语料加载跳过 %d 个文件（以部分文档启动）：%s",
+                len(self.load_issues),
+                "；".join(f"{i.path.name}（{i.reason}）" for i in self.load_issues),
+            )
+        self.vectorstore = build_or_load_index(self.documents, self.embed_model)
+```
+
+`visible_documents` / `visible_docs` 替换为：
+
+```python
+    def visible_documents(self, user: User) -> list[LCDocument]:
+        """
+        用户可见的切片集合——FAISS 检索的唯一候选来源。
+
+        pg 后端没有「内存切片集合」这个概念（切片可能上百万），
+        显式报错，避免调用方把空列表误判成「无可见文档」而错误拒答。
+        """
+        if self.backend == "pg":
+            raise RuntimeError(
+                "pg 后端不提供 visible_documents()，请使用 visible_docs() "
+                "或 ingest.retrieval.retrieve()")
+        return [doc for doc in self.documents if can_view(user, doc.metadata)]
+
+    def visible_docs(self, user: User) -> list[dict]:
+        """可见文档的去重清单（前端展示「您能看到哪些文件」）。"""
+        if self.backend == "pg":
+            return self._visible_docs_pg(user)
+        seen: dict[str, dict] = {}
+        for doc in self.visible_documents(user):
+            md = doc.metadata
+            seen.setdefault(md["doc_id"], {
+                "doc_id": md["doc_id"],
+                "title": md["title"],
+                "dept": md["dept"],
+                "classification": md["classification"],
+                "effective_date": md.get("effective_date", ""),
+            })
+        return list(seen.values())
+
+    def _visible_docs_pg(self, user: User) -> list[dict]:
+        with self._conn_factory() as conn:
+            rows = conn.execute(
+                """SELECT d.id, d.title, d.dept, d.classification, d.effective_date
+                     FROM documents d
+                    WHERE d.status = 'active' AND d.deleted_at IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM chunks c
+                           WHERE c.document_id = d.id AND c.active
+                             AND c.classification IS NOT NULL
+                             AND c.classification <= %s
+                             AND (c.classification = 0 OR c.dept = %s))
+                    ORDER BY d.title""",
+                (user.max_level, user.dept),
+            ).fetchall()
+        return [{
+            "doc_id": str(row["id"]),
+            "title": row["title"],
+            "dept": row["dept"],
+            "classification": _CLASSIFICATION_NAMES.get(row["classification"], "未知"),
+            "effective_date": str(row["effective_date"] or ""),
+        } for row in rows]
+```
+
+`retrieve` 改为分派，原方法体整体改名为 `_retrieve_faiss`（**只改函数名与 docstring，逻辑不动**）：
+
+```python
+    def retrieve(self, user: User, query: str) -> RetrievalResult:
+        if self.backend == "pg":
+            return self._retrieve_pg(user, query)
+        return self._retrieve_faiss(user, query)
+
+    def _retrieve_pg(self, user: User, query: str) -> RetrievalResult:
+        from ingest import retrieval
+
+        with self._conn_factory() as conn:
+            outcome = retrieval.retrieve(
+                conn, user, query, embedder=self._require_embedder(),
+                max_distance=max_distance(),
+            )
+        result = RetrievalResult(query=query)
+        result.visible_docs = outcome.visible_docs
+        result.visible_chunks = outcome.visible_chunks
+        result.best_distance = outcome.best_distance
+        result.dense_hits = outcome.dense_hits
+        result.sparse_hits = outcome.sparse_hits
+        result.grounded = outcome.grounded
+        result.reason = outcome.reason
+        result.docs = [self._to_document(hit) for hit in outcome.hits]
+        return result
+
+    def _require_embedder(self):
+        if self.embedder is None:
+            from ingest.embedding import get_embedder
+
+            self.embedder = get_embedder()
+        return self.embedder
+
+    @staticmethod
+    def _to_document(hit) -> LCDocument:
+        """把 pg 命中还原成原有切片契约，生成/引用/审计代码无需感知后端。"""
+        return LCDocument(
+            page_content=hit.content,
+            metadata={
+                "chunk_id": hit.chunk_id,
+                "doc_id": hit.doc_id,
+                "title": hit.title,
+                "dept": hit.dept,
+                "classification": _CLASSIFICATION_NAMES.get(hit.classification, "未知"),
+                "classification_level": hit.classification,
+                "effective_date": hit.effective_date,
+                "source": hit.metadata.get("source", ""),
+                "chunk_type": hit.chunk_type,
+                "expanded": hit.expanded,
+            },
+        )
+
+    def _retrieve_faiss(self, user: User, query: str) -> RetrievalResult:
+        """FAISS + 内存 BM25（现有教学主线，行为不变）。"""
+        visible = self.visible_documents(user)
+        result = RetrievalResult(query=query, visible_chunks=len(visible))
+        result.visible_docs = len(self.visible_docs(user))
+
+        if not visible:
+            result.reason = "no_visible_docs"
+            return result
+
+        dense = self.vectorstore.similarity_search_with_score(
+            query,
+            k=core.RETRIEVE_K,
+            filter=lambda md: can_view(user, md),
+            fetch_k=max(20, len(self.documents)),
+        )
+        dense_results = [{"doc": doc, "score": float(score)} for doc, score in dense]
+        result.dense_hits = len(dense_results)
+        result.best_distance = float(dense[0][1]) if dense else None
+
+        tokenized = [core.tokenize(doc.page_content) for doc in visible]
+        bm25 = core.BM25Okapi(tokenized) if core.BM25_AVAILABLE else None
+        sparse_results = core.sparse_search(
+            bm25, [doc.page_content for doc in visible], query, visible,
+            k=core.RETRIEVE_K,
+        )
+        result.sparse_hits = len(sparse_results)
+
+        if sparse_results:
+            fused = core.reciprocal_rank_fusion(
+                [dense_results, sparse_results], k=core.RRF_K
+            )
+            result.docs = [item["doc"] for item in fused[: core.FUSION_K]]
+        else:
+            result.docs = [item["doc"] for item in dense_results[: core.FUSION_K]]
+
+        if result.best_distance is None:
+            result.reason = "no_dense_hits"
+        elif result.best_distance > max_distance():
+            result.reason = "low_relevance"
+        else:
+            result.grounded = True
+        return result
+```
+
+`stats` 改为分派，原方法体改名 `_stats_faiss` 并在返回字典里加 `"backend": "faiss"`：
+
+```python
+    def stats(self) -> dict:
+        if self.backend == "pg":
+            return self._stats_pg()
+        return self._stats_faiss()
+
+    def _stats_pg(self) -> dict:
+        from ingest.config import get_settings
+
+        with self._conn_factory() as conn:
+            counts = conn.execute(
+                """SELECT count(*) AS chunks,
+                          count(DISTINCT c.document_id) AS docs
+                     FROM chunks c
+                     JOIN documents d ON d.id = c.document_id
+                    WHERE c.active AND d.status = 'active'
+                      AND d.deleted_at IS NULL""",
+            ).fetchone()
+            by_class = conn.execute(
+                """SELECT d.classification AS level, count(*) AS n
+                     FROM chunks c
+                     JOIN documents d ON d.id = c.document_id
+                    WHERE c.active AND d.status = 'active'
+                      AND d.deleted_at IS NULL
+                    GROUP BY d.classification""",
+            ).fetchall()
+        return {
+            "backend": "pg",
+            "docs": int(counts["docs"]),
+            "chunks": int(counts["chunks"]),
+            "chunks_by_classification": {
+                _CLASSIFICATION_NAMES.get(int(row["level"]), "未知"): int(row["n"])
+                for row in by_class
+                if row["level"] is not None
+            },
+            "load_issues": [],
+            "embed_model": get_settings().embed_model,
+            "llm_provider": core.LLM_PROVIDER,
+            "llm_model": (
+                core.DEEPSEEK_MODEL
+                if core.LLM_PROVIDER == "deepseek"
+                else core.OLLAMA_LLM_MODEL
+            ),
+            "max_distance": max_distance(),
+        }
+
+    def _stats_faiss(self) -> dict:
+        by_class: dict[str, int] = {}
+        for doc in self.documents:
+            name = doc.metadata["classification"]
+            by_class[name] = by_class.get(name, 0) + 1
+        return {
+            "backend": "faiss",
+            "docs": len({doc.metadata["doc_id"] for doc in self.documents}),
+            "chunks": len(self.documents),
+            "chunks_by_classification": by_class,
+            "load_issues": [issue.to_dict() for issue in self.load_issues],
+            "embed_model": core.EMBED_MODEL,
+            "llm_provider": core.LLM_PROVIDER,
+            "llm_model": (
+                core.DEEPSEEK_MODEL
+                if core.LLM_PROVIDER == "deepseek"
+                else core.OLLAMA_LLM_MODEL
+            ),
+            "max_distance": max_distance(),
+        }
+```
+
+**3.2 `ingest/import_gov_docs.py`**
+
+```python
+"""导入现有 Markdown 语料（trusted_import 唯一入口，不经 HTTP）。
+
+data/gov_docs/*.md 自带 front matter（doc_id/title/dept/classification/
+effective_date），元数据已人工维护，因此跳过「上传 → 解析 → 复核」，
+直接解析为 DocModel、把版本置为 embedding 并入队。之后由
+embed → activate 两个 job 完成切片、向量化与激活。
+
+用法：
+    INGEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag \
+      uv run python -m ingest.import_gov_docs [目录]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+from psycopg import Connection
+
+from app.audit import write_audit
+from app.users import CLASSIFICATION_LEVELS
+from ingest import repository as repo
+from ingest.config import Settings, get_settings
+from ingest.parsers.markdown_parser import MarkdownParser, read_front_matter
+from ingest.queue import enqueue
+from ingest.storage import FileStore
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_CORPUS = BASE_DIR / "data" / "gov_docs"
+REQUIRED_FIELDS = ("doc_id", "title", "dept", "classification")
+
+
+def _effective_date(raw, filename: str) -> date | None:
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    try:
+        return date.fromisoformat(str(raw))
+    except ValueError as exc:
+        raise ValueError(
+            f"{filename} 的 effective_date 必须是 YYYY-MM-DD：{raw!r}") from exc
+
+
+def _validate(meta: dict, filename: str) -> int:
+    missing = [key for key in REQUIRED_FIELDS if not meta.get(key)]
+    if missing:
+        raise ValueError(f"{filename} 缺少必填元数据: {', '.join(missing)}")
+    raw = meta["classification"]
+    if raw not in CLASSIFICATION_LEVELS:
+        raise ValueError(
+            f"{filename} 的 classification={raw!r} 非法，"
+            f"可选：{'/'.join(CLASSIFICATION_LEVELS)}")
+    return CLASSIFICATION_LEVELS[raw]
+
+
+def _duplicate(conn: Connection, sha256: str, path: Path) -> dict | None:
+    """全库按内容去重：同一份文件重复导入只返回已有版本，不再建行。"""
+    row = conn.execute(
+        """SELECT id AS version_id, document_id FROM doc_versions
+            WHERE sha256=%s ORDER BY created_at LIMIT 1""",
+        (sha256,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "file": path.name, "doc_id": None,
+        "document_id": str(row["document_id"]),
+        "version_id": str(row["version_id"]),
+        "job_id": None, "sha256": sha256, "skipped": True, "error": None,
+    }
+
+
+def import_file(conn: Connection, path: Path, *, created_by: str = "import",
+                settings: Settings | None = None) -> dict:
+    path = Path(path)
+    settings = settings or get_settings()
+
+    meta, _ = read_front_matter(path)
+    level = _validate(meta, path.name)
+    effective = _effective_date(meta.get("effective_date"), path.name)
+    doc_id = str(meta["doc_id"])
+
+    sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    duplicate = _duplicate(conn, sha256, path)
+    if duplicate is not None:
+        duplicate["doc_id"] = doc_id
+        return duplicate
+
+    model = MarkdownParser(settings=settings).parse(path)
+    try:
+        storage_path = FileStore(settings.upload_dir).put_file(path, sha256)
+        doc = repo.create_document(
+            conn, title=str(meta["title"]), dept=str(meta["dept"]),
+            classification=level, effective_date=effective,
+            created_by=created_by)
+        version = repo.create_version(
+            conn, document_id=doc["id"], version_no=1, sha256=sha256,
+            filename=path.name, mime="text/markdown",
+            size_bytes=path.stat().st_size, storage_path=storage_path,
+            parser=MarkdownParser.name, parser_version=MarkdownParser.version,
+            status="embedding")
+        repo.set_version_status(
+            conn, version["id"], "embedding", ir=model,
+            warnings=[w.model_dump() for w in model.warnings])
+        job_id = enqueue(conn, "embed", {"version_id": str(version["id"])},
+                         priority=50)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    write_audit({
+        "event": "ingest.import", "action": "import", "actor": created_by,
+        "document_id": str(doc["id"]), "version_id": str(version["id"]),
+        "doc_id": doc_id, "file": path.name,
+        "classification": meta["classification"], "sha256": sha256,
+    })
+    return {
+        "file": path.name, "doc_id": doc_id,
+        "document_id": str(doc["id"]), "version_id": str(version["id"]),
+        "job_id": job_id, "sha256": sha256, "skipped": False, "error": None,
+    }
+
+
+def import_dir(conn: Connection, directory: Path, *, created_by: str = "import",
+               settings: Settings | None = None) -> list[dict]:
+    paths = sorted(Path(directory).glob("*.md"))
+    if not paths:
+        raise FileNotFoundError(f"未在 {directory} 找到 Markdown 文档")
+
+    results: list[dict] = []
+    for path in paths:
+        try:
+            results.append(import_file(conn, path, created_by=created_by,
+                                       settings=settings))
+        except Exception as exc:  # noqa: BLE001 - 单个坏文件不拖垮整批
+            conn.rollback()
+            results.append({
+                "file": path.name, "doc_id": None, "document_id": None,
+                "version_id": None, "job_id": None, "sha256": None,
+                "skipped": False, "error": f"{type(exc).__name__}: {exc}",
+            })
+    return results
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="导入现有 Markdown 语料到摄取库（trusted_import，不进复核）")
+    parser.add_argument("path", nargs="?", default=str(DEFAULT_CORPUS))
+    parser.add_argument("--created-by", default="import")
+    args = parser.parse_args(argv)
+
+    # Windows 控制台默认 GBK，直接打印中文会 UnicodeEncodeError
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError, OSError):
+        pass
+
+    from ingest.db import connection
+
+    with connection() as conn:
+        results = import_dir(conn, Path(args.path), created_by=args.created_by)
+
+    imported = [r for r in results if not r["skipped"] and not r["error"]]
+    skipped = [r for r in results if r["skipped"]]
+    failed = [r for r in results if r["error"]]
+    print(f"导入 {len(imported)}，跳过 {len(skipped)}，失败 {len(failed)}")
+    for item in failed:
+        print(f"  ! {item['file']}: {item['error']}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+**3.3 `.env.example` 追加**
+
+```dotenv
+# 检索后端：faiss（现有教学主线）| pg（摄取库）
+# 默认 faiss；Task 23 评测达标后再把默认切到 pg，并保留 faiss 回退一个版本周期。
+RETRIEVAL_BACKEND=faiss
+```
+
+**3.4 现有测试与启动提示同步**
+
+`tests/test_web.py` 的 `service` fixture 显式固定后端，避免环境变量或后续默认值翻转影响既有用例：
+
+```python
+    return rs.RagService(llm=_FakeLLM(), embed_model=_FakeEmbeddings(),
+                         backend="faiss")
+```
+
+`app/server.py` 的初始化失败提示改为分后端（只改 detail 文案，不动 503 逻辑）：
+
+```python
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"服务初始化失败：{_service_error}。"
+                            "FAISS 模式请确认 Ollama 已启动并已拉取模型；"
+                            "pg 模式请确认 PostgreSQL 可连接且已执行 ingest.schema.sql。"
+                        ),
+                    ) from exc
+```
+
+- [ ] **Step 4: 运行新测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_rag_service_pg.py tests/ingest/test_import_gov_docs.py -v
+```
+
+Expected: 12 passed（7 + 5）。
+
+- [ ] **Step 5: 回归全部既有测试**
+
+```bash
+uv run pytest tests/test_main.py tests/test_web.py -q
+uv run pytest tests/ingest -q
+```
+
+Expected: 既有 73 个测试全绿；`tests/ingest` 中未配置数据库的用例按约定 skip，配置了 `INGEST_TEST_DB_URL` 时全部通过。
+
+- [ ] **Step 6: 本地 CLI 冒烟（可选但推荐）**
+
+```bash
+docker compose up -d postgres
+# 只迁移空库并导入 4 份语料，检查输出「导入 4，跳过 0，失败 0」
+INGEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag \
+  uv run python -m ingest.import_gov_docs
+```
+
+Expected: 第一次 `导入 4，跳过 0，失败 0`；再跑一次 `导入 0，跳过 4，失败 0`（sha 去重）。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add app/rag_service.py app/server.py .env.example tests/test_web.py \
+  ingest/import_gov_docs.py tests/ingest/test_rag_service_pg.py \
+  tests/ingest/test_import_gov_docs.py
+git commit -m "feat(ingest): RagService 后端切换与现有语料导入"
+```
+
+---
+
+### Task 23: 运维入口（schema 迁移与 worker 进程）
+
+**Files:**
+- Modify: `ingest/db.py`（`main` 迁移入口）、`ingest/worker.py`（`run_once` + CLI）
+- Create: `tests/ingest/test_worker_main.py`
+
+**Interfaces:**
+- Consumes: `ingest.queue.claim / complete / fail / reap_stale`、`ingest.pipeline.HANDLERS / DEAD_LETTER_HOOKS`、`ingest.db.connection / migrate`。
+- Produces:
+  - `ingest.worker.run_once(handlers, *, worker_id, dead_letter_hooks=None, max_jobs=1000) -> int`：消费到队列暂时为空，返回本次处理条数。
+  - `python -m ingest.worker [--worker-id ID] [--poll 1.0] [--once]`。
+  - `python -m ingest.db`：幂等应用 `ingest/schema.sql`。
+
+**部署约定：** 一个进程只跑一个 worker 循环。「2 个 worker」= 启动两个进程（Compose / systemd 各一个），不要在一个进程里 fork——心跳线程与连接池会串用，任务锁的语义也会失真。`--once` 用于验收、排障和一次性批处理，生产常驻不要带它。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_worker_main.py`：
+
+```python
+from __future__ import annotations
+
+import threading
+from contextlib import nullcontext
+
+from ingest import worker
+from ingest.queue import enqueue
+
+
+def test_run_once_drains_queue_in_priority_order(conn, monkeypatch):
+    seen: list[int] = []
+
+    def handler(db, payload):
+        seen.append(payload["n"])
+
+    enqueue(conn, "demo", {"n": 1}, priority=10)
+    enqueue(conn, "demo", {"n": 2}, priority=20)
+    conn.commit()
+
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(conn))
+    monkeypatch.setattr(worker, "_start_heartbeat",
+                        lambda job_id, worker_id: threading.Event())
+
+    assert worker.run_once({"demo": handler}, worker_id="test") == 2
+    assert seen == [1, 2]
+    assert conn.execute(
+        "SELECT count(*) AS n FROM jobs WHERE status='done'"
+    ).fetchone()["n"] == 2
+
+
+def test_run_once_returns_zero_on_empty_queue(conn, monkeypatch):
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(conn))
+    assert worker.run_once({}, worker_id="test") == 0
+
+
+def test_run_once_unknown_kind_goes_dead_letter(conn, monkeypatch):
+    enqueue(conn, "nobody", {"x": 1}, max_attempts=0)
+    conn.commit()
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(conn))
+    monkeypatch.setattr(worker, "_start_heartbeat",
+                        lambda job_id, worker_id: threading.Event())
+
+    assert worker.run_once({}, worker_id="test") == 1
+    row = conn.execute("SELECT status, last_error FROM jobs").fetchone()
+    assert row["status"] == "failed"
+    assert "unknown job kind" in row["last_error"]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_worker_main.py -v
+```
+
+Expected: FAIL，`AttributeError: module 'ingest.worker' has no attribute 'run_once'`。
+
+- [ ] **Step 3: 写实现**
+
+`ingest/db.py` 末尾追加（`migrate` 已存在于 Task 1）：
+
+```python
+def main(argv: list[str] | None = None) -> int:
+    """python -m ingest.db：部署第一步，幂等应用 schema。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="初始化/升级摄取库 schema（幂等）")
+    parser.parse_args(argv)
+    with connection() as conn:
+        migrate(conn)
+    print("schema 已应用")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+`ingest/worker.py`：顶部导入改为：
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import threading
+import time
+from typing import Callable
+
+from psycopg import Connection
+
+from ingest.db import connection
+from ingest.queue import claim, complete, fail, heartbeat, reap_stale
+```
+
+在 `run_forever` 之后追加：
+
+```python
+def run_once(handlers: dict[str, Handler], *, worker_id: str,
+             dead_letter_hooks: dict[str, Hook] | None = None,
+             max_jobs: int = 1000) -> int:
+    """
+    消费到「此刻没有可领取的任务」为止，返回处理条数。
+
+    只领取 `run_after <= now()` 的任务：退避中的失败任务不会被 `--once` 强行提前执行，
+    这是验收时「跑完一轮」与「把失败任务立刻重跑」的区别。
+    """
+    processed = 0
+    while processed < max_jobs:
+        with connection() as conn:
+            reap_stale(conn)
+            job = claim(conn, worker_id)
+        if job is None:
+            return processed
+        stop = _start_heartbeat(job["id"], worker_id)
+        try:
+            with connection() as conn:
+                run_job(conn, job, handlers, worker_id, dead_letter_hooks)
+        finally:
+            stop.set()
+        processed += 1
+    return processed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="摄取任务 worker（一进程一循环）")
+    parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
+    parser.add_argument("--poll", type=float, default=1.0)
+    parser.add_argument("--once", action="store_true",
+                        help="队列暂时为空就退出（验收/排障用）")
+    args = parser.parse_args(argv)
+
+    # Windows 控制台默认 GBK，中文启动日志会 UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+    # 延迟导入：pipeline 会拉起解析器与嵌入依赖，参数写错时不必加载它们
+    from ingest import pipeline
+
+    if args.once:
+        count = run_once(pipeline.HANDLERS, worker_id=args.worker_id,
+                         dead_letter_hooks=pipeline.DEAD_LETTER_HOOKS)
+        print(f"worker {args.worker_id} 处理 {count} 个任务后退出")
+        return 0
+
+    print(f"worker {args.worker_id} 已启动（poll={args.poll}s）")
+    run_forever(pipeline.HANDLERS, worker_id=args.worker_id,
+                poll_seconds=args.poll,
+                dead_letter_hooks=pipeline.DEAD_LETTER_HOOKS)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_worker_main.py -v
+```
+
+Expected: 3 passed。
+
+- [ ] **Step 5: 冷启动冒烟（需要 Compose）**
+
+```bash
+docker compose up -d postgres
+INGEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag uv run python -m ingest.db
+```
+
+Expected: `schema 已应用`；重复执行同样成功（幂等）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ingest/db.py ingest/worker.py tests/ingest/test_worker_main.py
+git commit -m "feat(ingest): schema 迁移与 worker 进程入口"
+```
+
+---
+
+### Task 24: 评测门禁与 P0 全链路验收
+
+**Files:**
+- Create: `evaluation/pg_corpus.py`、`evaluation/compare_backends.py`、`tests/ingest/test_eval_gate.py`、`tests/ingest/test_acceptance.py`
+- Modify: `evaluation/runner.py`（pg 金标校验 + `--backend`）、`.env.example`（P0 部署默认 `pg`）
+
+**Interfaces:**
+- Consumes: `evaluation.runner.run / make_report`、`evaluation.metrics.compare_reports`、`evaluation.cases.validate_against_corpus`、`app.rag_service.RagService`、`ingest.pipeline.HANDLERS`、`ingest.embedding.embed_version`、`app.server.app`。
+- Produces:
+  - `evaluation.pg_corpus.load_active_chunks(conn) -> list[LCDocument]`
+  - `evaluation.pg_corpus.validate_against_pg(cases, conn) -> list[str]`
+  - `evaluation.runner.run(..., backend: str | None = None)`；CLI 新增 `--backend faiss|pg`。
+  - `evaluation.compare_backends.judge(pg_report, faiss_report, tolerance=0.03) -> dict`
+  - `evaluation.compare_backends.compare(...) -> tuple[int, dict | None]`、`main(argv=None) -> int`。
+
+**门禁规则（设计 §13.1 / §14.1 迁移第 5 步）：**
+
+- 同一批用例、**同一个嵌入模型**分别跑 FAISS 与 pg；`EMBED_MODEL != INGEST_EMBED_MODEL` 时直接拒绝比较（向量空间不同，数字没有解释力）。
+- `evaluation.metrics.compare_reports` 的 `HIGHER_IS_BETTER` 指标跌幅 >3% 阻断；用例数缩水阻断。
+- pg 端出现任何越权泄露都阻断——这是**绝对门槛**，不跟 FAISS 比增量（FAISS 自己漏 1 条也不能给 pg 开后门）。
+- 退出码：0 通过 / 1 有回归 / 2 金标与语料对不上（沿用 runner 约定）。
+- P0 先用现有 33 条种子用例做门禁；设计要求的 ≥100 问在首批客户语料到位后扩充（见计划差异 #9）。门禁脚本与题库解耦，扩题不需要改代码。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_eval_gate.py`：
+
+```python
+from __future__ import annotations
+
+import uuid
+from contextlib import nullcontext
+
+from psycopg.types.json import Jsonb
+
+from evaluation import compare_backends, runner
+from evaluation.cases import EvalCase
+from evaluation.pg_corpus import load_active_chunks, validate_against_pg
+from ingest import repository as repo
+
+
+def _seed(conn, *, doc_status="active", chunk_active=True,
+          content="差旅住宿费标准为每人每天 900 元", title="差旅费管理办法"):
+    doc = repo.create_document(
+        conn, title=title, dept="综合处", classification=1,
+        effective_date="2026-01-01", created_by="zhang")
+    version = repo.create_version(
+        conn, document_id=doc["id"], version_no=1,
+        sha256=uuid.uuid4().hex + uuid.uuid4().hex,
+        filename="差旅.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        size_bytes=10, storage_path=f"aa/{uuid.uuid4().hex}",
+        parser="docx", parser_version="0.1.0", status="ready")
+    conn.execute(
+        "UPDATE documents SET status=%s, current_version_id=%s WHERE id=%s",
+        (doc_status, version["id"], doc["id"]))
+    conn.execute(
+        """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type, content,
+               content_tokens, embed_model, dept, classification, metadata,
+               chunk_hash, active)
+           VALUES (%s,%s,0,'text',%s,%s,'bge-m3','综合处',1,%s,%s,%s)""",
+        (doc["id"], version["id"], content, content,
+         Jsonb({"chunk_id": f"{doc['id']}@v1#0", "source": "差旅.docx"}),
+         uuid.uuid4().hex + uuid.uuid4().hex, chunk_active))
+    conn.commit()
+    return doc, version
+
+
+def _case(**over):
+    values = {"id": "c1", "user": "zhang", "question": "住宿费标准？",
+              "expected_doc_ids": [], "evidence": []}
+    values.update(over)
+    return EvalCase(**values)
+
+
+def test_load_active_chunks_only_returns_searchable(conn):
+    doc, _ = _seed(conn)
+    _seed(conn, doc_status="draft")      # 未激活文档
+    _seed(conn, chunk_active=False)      # 已下线切片
+
+    chunks = load_active_chunks(conn)
+
+    assert len(chunks) == 1
+    assert chunks[0].metadata["doc_id"] == str(doc["id"])
+    assert "900 元" in chunks[0].page_content
+
+
+def test_validate_against_pg_accepts_matching_evidence(conn):
+    doc, _ = _seed(conn)
+    case = _case(expected_doc_ids=[str(doc["id"])], evidence=["每人每天 900 元"])
+    assert validate_against_pg([case], conn) == []
+
+
+def test_validate_against_pg_reports_unknown_document(conn):
+    _seed(conn)
+    case = _case(expected_doc_ids=["00000000-0000-0000-0000-000000000000"],
+                 evidence=["不存在的证据"])
+    problems = validate_against_pg([case], conn)
+    assert any("不在语料中" in problem for problem in problems)
+
+
+def test_validate_against_pg_explains_empty_database(conn):
+    problems = validate_against_pg([_case(expected_doc_ids=["x"], evidence=["y"])], conn)
+    assert len(problems) == 1
+    assert "没有任何已激活切片" in problems[0]
+
+
+def _report(**over):
+    metrics = {
+        "cases": 33, "answerable": 24, "refusal_expected": 9,
+        "evidence_recall": 1.0, "doc_recall": 1.0, "mrr": 1.0,
+        "citation_recall": None, "refusal_accuracy": 1.0,
+        "false_refusal_rate": 0.0, "missed_refusal_rate": 0.0,
+        "leaks": 0,
+    }
+    metrics.update(over)
+    return {"metrics": metrics}
+
+
+def test_gate_blocks_drop_beyond_tolerance():
+    verdict = compare_backends.judge(_report(evidence_recall=0.96),
+                                     _report(evidence_recall=1.0))
+    assert verdict["ok"] is False
+    assert [item["metric"] for item in verdict["regressions"]] == ["evidence_recall"]
+
+
+def test_gate_allows_drop_within_tolerance():
+    verdict = compare_backends.judge(_report(evidence_recall=0.97),
+                                     _report(evidence_recall=1.0))
+    assert verdict["ok"] is True
+
+
+def test_gate_treats_any_leak_as_failure_even_with_flat_metrics():
+    verdict = compare_backends.judge(_report(leaks=1), _report(leaks=1))
+    assert verdict["ok"] is False
+    assert verdict["reasons"]
+
+
+def test_gate_blocks_shrinking_case_set():
+    verdict = compare_backends.judge(_report(cases=30), _report(cases=33))
+    assert verdict["ok"] is False
+    assert [item["metric"] for item in verdict["regressions"]] == ["cases"]
+
+
+def test_validate_gold_reads_pg_corpus(monkeypatch, conn):
+    calls: list[str] = []
+
+    monkeypatch.setattr(runner, "validate_against_corpus",
+                        lambda cases, documents: calls.append("faiss") or [])
+    import evaluation.pg_corpus as pg_corpus
+
+    monkeypatch.setattr(pg_corpus, "validate_against_pg",
+                        lambda cases, connection: calls.append("pg") or [])
+    from ingest import db
+
+    monkeypatch.setattr(db, "connection", lambda: nullcontext(conn))
+
+    class PgService:
+        backend = "pg"
+
+    assert runner._validate_gold([], PgService()) == []
+    assert calls == ["pg"]
+```
+
+`tests/ingest/test_acceptance.py`：
+
+```python
+from __future__ import annotations
+
+import json
+
+import pytest
+from langchain_core.messages import AIMessage
+
+from app import rag_service as rs
+from app import server
+from app.users import get_user
+from ingest import embedding, pipeline
+from tests.ingest.builders import build_xlsx
+
+DIM = 1024
+
+
+class FakeLLM:
+    def invoke(self, messages):
+        return AIMessage(content="")
+
+    def stream(self, messages):
+        yield AIMessage(content="住宿费按差旅费管理办法执行。")
+
+
+class FakeEmbedder:
+    model = "bge-m3"
+    dim = DIM
+
+    def embed(self, texts):
+        return [[1.0] + [0.0] * (DIM - 1) for _ in texts]
+
+
+@pytest.fixture()
+def pg_service(monkeypatch):
+    """pg 模式的真实服务，只替换 LLM 与嵌入模型，测试不依赖 Ollama。"""
+    monkeypatch.setenv("RAG_MAX_DISTANCE", "999")
+    service = rs.RagService(llm=FakeLLM(), backend="pg", embedder=FakeEmbedder())
+    monkeypatch.setattr(server, "get_service", lambda: service)
+    return service
+
+
+def _upload(client, path, **form):
+    return client.post(
+        "/api/documents",
+        files={"file": (path.name, path.read_bytes())},
+        data={k: str(v) for k, v in form.items()},
+    )
+
+
+def _parse(conn, version_id):
+    pipeline.handle_parse(conn, {"version_id": version_id})
+    # 上传时入队的 parse job 已由测试直接执行，标记 done，避免留下僵尸任务
+    conn.execute(
+        """UPDATE jobs SET status='done', finished_at=now()
+            WHERE kind='parse' AND status='queued'
+              AND payload->>'version_id' = %s""", (version_id,))
+    conn.commit()
+
+
+def _queued_payload(conn, kind):
+    row = conn.execute(
+        """SELECT payload FROM jobs
+            WHERE kind=%s AND status='queued'
+            ORDER BY id DESC LIMIT 1""", (kind,)).fetchone()
+    assert row is not None, f"没有待执行的 {kind} 任务"
+    return row["payload"]
+
+
+def _drain_post_parse(conn, monkeypatch, embedder):
+    """执行 embed → activate；嵌入模型换成测试替身。"""
+    def fake_embed(db, version_id):
+        return embedding.embed_version(db, version_id, embedder=embedder)
+
+    monkeypatch.setattr(pipeline, "embed_version", fake_embed)
+    for kind in ("embed", "activate"):
+        pipeline.HANDLERS[kind](conn, _queued_payload(conn, kind))
+
+
+def _events(response):
+    events = []
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line[len("data: "):]))
+    return events
+
+
+def test_full_chain_upload_review_embed_activate_chat_and_source(
+        api, conn, pg_service, monkeypatch, tmp_path):
+    make, _ = api
+    client = make("wang")
+
+    xlsx = build_xlsx(tmp_path / "预算表.xlsx",
+                      [["部门", "预算金额"], ["综合处", 100], ["人事处", 200]])
+    created = _upload(client, xlsx, title="预算表", effective_date="2026-01-01")
+    assert created.status_code == 202, created.text
+    doc_id = created.json()["document_id"]
+    version_id = created.json()["version_id"]
+
+    # 1) 解析：未定级 → 复核项，版本停在 needs_review，尚未产生切片
+    _parse(conn, version_id)
+    assert conn.execute(
+        "SELECT status FROM doc_versions WHERE id=%s", (version_id,)
+    ).fetchone()["status"] == "needs_review"
+    assert conn.execute("SELECT count(*) AS n FROM chunks").fetchone()["n"] == 0
+
+    review = client.get(f"/api/versions/{version_id}/review")
+    assert review.status_code == 200, review.text
+    assert "classification" in {item["kind"] for item in review.json()["open_items"]}
+
+    # 2) 复核：定级为内部 → embedding，并入队 embed
+    confirmed = client.post(f"/api/versions/{version_id}/confirm",
+                            json={"meta": {"classification": 1}})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "embedding"
+
+    # 3) 嵌入 + 激活
+    _drain_post_parse(conn, monkeypatch, FakeEmbedder())
+    doc = conn.execute(
+        "SELECT status, current_version_id FROM documents WHERE id=%s", (doc_id,)
+    ).fetchone()
+    assert doc["status"] == "active"
+    assert str(doc["current_version_id"]) == version_id
+    assert conn.execute(
+        "SELECT count(*) AS n FROM chunks WHERE active").fetchone()["n"] > 0
+
+    # 4) 问答：SSE 引用带 chunk_id
+    chat = client.post("/api/chat", json={"question": "预算金额是多少"})
+    assert chat.status_code == 200, chat.text
+    events = _events(chat)
+    citations = next(item for item in events if item["type"] == "citations")["items"]
+    assert citations[0]["doc_id"] == doc_id
+    chunk_id = citations[0]["chunk_id"]
+    assert chunk_id.startswith(f"{doc_id}@v1#")
+    assert next(item for item in events if item["type"] == "done")["answer"]
+
+    # 5) 回源：本部门可见；跨部门一律 404（回源不复用管理台可见性）
+    source = client.get(f"/api/chunks/{chunk_id}/source")
+    assert source.status_code == 200, source.text
+    assert "预算" in source.json()["content"]
+
+    outsider = make("zhang")
+    assert outsider.get(f"/api/chunks/{chunk_id}/source").status_code == 404
+    assert all(item["id"] != doc_id
+               for item in outsider.get("/api/documents").json()["items"])
+
+
+def test_unclassified_and_deactivated_documents_are_not_retrievable(
+        api, conn, pg_service, monkeypatch, tmp_path):
+    make, _ = api
+    client = make("wang")
+
+    xlsx = build_xlsx(tmp_path / "制度.xlsx", [["部门", "金额"], ["综合处", 10]])
+    created = _upload(client, xlsx, title="制度")
+    doc_id = created.json()["document_id"]
+    version_id = created.json()["version_id"]
+
+    # 未定级：即使解析完成，检索也必须拒答
+    _parse(conn, version_id)
+    assert pg_service.retrieve(get_user("wang"), "金额").grounded is False
+
+    client.post(f"/api/versions/{version_id}/confirm",
+                json={"meta": {"classification": 1}})
+    _drain_post_parse(conn, monkeypatch, FakeEmbedder())
+    assert pg_service.retrieve(get_user("wang"), "金额").grounded is True
+
+    # 下线后立即不可检索（切片 active=false）
+    assert client.post(f"/api/documents/{doc_id}/deactivate").status_code == 200
+    result = pg_service.retrieve(get_user("wang"), "金额")
+    assert result.grounded is False
+    assert result.reason == "no_visible_docs"
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_eval_gate.py tests/ingest/test_acceptance.py -v
+```
+
+Expected: FAIL，`No module named 'evaluation.pg_corpus'`、`No module named 'evaluation.compare_backends'`、`module 'evaluation.runner' has no attribute '_validate_gold'`。
+
+- [ ] **Step 3: 写实现**
+
+**3.1 `evaluation/pg_corpus.py`**
+
+```python
+"""
+pg 后端的评测语料视图。
+
+FAISS 后端可以直接从 `service.documents` 拿到全部切片；pg 后端的切片在库里，
+必须按「已激活文档的 active 切片」读出，才能复用同一套金标校验逻辑。
+
+这里故意不做权限裁剪：评测台属于运维侧，金标校验问的是「语料里有没有这段证据」，
+不是「某个演示用户能不能看到」。权限相关的召回由用例的 `user` + `forbidden_doc_ids` 表达。
+"""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+from langchain_core.documents import Document as LCDocument
+from psycopg import Connection
+
+from evaluation.cases import EvalCase, validate_against_corpus
+
+_ACTIVE_CHUNKS_SQL = """
+SELECT c.document_id, c.content, c.metadata
+  FROM chunks c
+  JOIN documents d ON d.id = c.document_id
+ WHERE c.active
+   AND d.status = 'active'
+   AND d.deleted_at IS NULL
+ ORDER BY c.document_id, c.ordinal
+"""
+
+
+def load_active_chunks(conn: Connection) -> list[LCDocument]:
+    """读出所有可检索切片，形状与 FAISS 的 LCDocument 一致（page_content + metadata）。"""
+    rows = conn.execute(_ACTIVE_CHUNKS_SQL).fetchall()
+    documents: list[LCDocument] = []
+    for row in rows:
+        metadata = dict(row["metadata"] or {})
+        # doc_id 是金标匹配的唯一依据，以列值为准，避免 metadata 缺字段或写旧值
+        metadata["doc_id"] = str(row["document_id"])
+        documents.append(
+            LCDocument(page_content=row["content"], metadata=metadata))
+    return documents
+
+
+def validate_against_pg(cases: Sequence[EvalCase], conn: Connection) -> list[str]:
+    """在 pg 语料上校验金标；数据库为空时给出可执行的修复提示。"""
+    documents = load_active_chunks(conn)
+    if not documents:
+        return [
+            "数据库里没有任何已激活切片：先执行 `uv run python -m ingest.import_gov_docs`，"
+            "再用 `uv run python -m ingest.worker --once` 跑完 embed/activate 任务"
+        ]
+    return validate_against_corpus(cases, documents)
+```
+
+**3.2 `evaluation/runner.py`**
+
+顶部 docstring 的「命令行」段落追加一行：
+
+```text
+    uv run python -m evaluation.runner --backend pg          # 对 pgvector 跑评测
+```
+
+`_build_service` 替换为：
+
+```python
+def _build_service(backend: str | None = None):
+    """构造真实的政务 RAG 服务（FAISS 需要 Ollama；pg 需要 PostgreSQL）。"""
+    from app.rag_service import RagService
+
+    return RagService(backend=backend)
+```
+
+在 `_build_service` 之后新增：
+
+```python
+def _validate_gold(cases: Sequence[EvalCase], service) -> list[str]:
+    """
+    按后端选择金标校验的数据源。
+
+    pg 模式的 `service.documents` 永远是空列表（切片在库里），若照旧校验，
+    所有用例都会被误判成「金标文档不存在」而直接退出码 2。
+    """
+    if getattr(service, "backend", "faiss") != "pg":
+        return validate_against_corpus(
+            cases, getattr(service, "documents", []) or [])
+
+    from ingest.db import connection
+    from evaluation.pg_corpus import validate_against_pg
+
+    with connection() as conn:
+        return validate_against_pg(cases, conn)
+```
+
+`run()` 的签名增加 `backend`（放在 `save_baseline` 之后，保持现有位置参数兼容）：
+
+```python
+def run(
+    cases_path: str | Path = DEFAULT_CASES,
+    mode: str = "retrieval",
+    service=None,
+    out_dir: str | Path | None = None,
+    baseline: str | Path | None = None,
+    tolerance: float = 0.03,
+    k: int = 5,
+    save_baseline: bool = False,
+    backend: str | None = None,
+) -> tuple[int, dict | None, dict | None]:
+```
+
+`run()` 内两处替换：
+
+```python
+    cases = load_cases(cases_path)
+    service = service if service is not None else _build_service(backend)
+
+    problems = _validate_gold(cases, service)
+```
+
+以及 `make_report` 的 config：
+
+```python
+        config={
+            "k": k,
+            "cases_file": str(cases_path),
+            "tolerance": tolerance,
+            "backend": getattr(service, "backend", "faiss"),
+        },
+```
+
+CLI 增加参数（放在 `--tolerance` 之后）：
+
+```python
+    parser.add_argument("--backend", default=None, choices=["faiss", "pg"],
+                        help="检索后端；不传时按 RETRIEVAL_BACKEND / INGEST_DB_URL 解析")
+```
+
+`run(...)` 调用处追加 `backend=args.backend`。
+
+**3.3 `evaluation/compare_backends.py`**
+
+```python
+"""
+FAISS → pgvector 切换门禁（设计 §13.1 / §14.1）。
+
+同一批用例、同一个嵌入模型，分别跑 FAISS 与 pg 后端，再比较指标：
+
+- `HIGHER_IS_BETTER` 指标跌幅 > `--tolerance`（默认 3%）→ 阻断；
+- pg 端出现任何越权泄露 → 阻断（安全项零容忍，不给容差）；
+- 用例数缩水 → 阻断（避免「少跑几条让指标变好看」）。
+
+退出码：0 通过；1 有回归；2 金标与语料对不上（无法比较）。
+
+命令行：
+
+    uv run python -m evaluation.compare_backends
+    uv run python -m evaluation.compare_backends --cases evaluation/cases.jsonl --tolerance 0.03
+    uv run python -m evaluation.compare_backends --mode answer     # 含生成，依赖本地模型
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Sequence
+
+from evaluation import runner
+from evaluation.metrics import compare_reports
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_CASES = BASE_DIR / "evaluation" / "cases.jsonl"
+DEFAULT_OUT_DIR = BASE_DIR / "evaluation" / "reports"
+TOLERANCE = 0.03
+
+_METRIC_LABELS = {
+    "evidence_recall": "证据命中率",
+    "doc_recall": "文档召回@K",
+    "mrr": "MRR@K",
+    "citation_recall": "引用命中率",
+    "refusal_accuracy": "拒答准确率",
+    "false_refusal_rate": "误拒率",
+    "missed_refusal_rate": "漏拒率",
+    "leaks": "越权泄露",
+}
+
+
+def _assert_comparable() -> None:
+    """两个后端的嵌入模型必须一致，否则向量空间不同，指标对比没有意义。"""
+    import main as core
+    from ingest.config import get_settings
+
+    faiss_model = core.EMBED_MODEL
+    pg_model = get_settings().embed_model
+    if faiss_model != pg_model:
+        raise SystemExit(
+            f"❌ 两个后端的嵌入模型不同（FAISS={faiss_model} / pg={pg_model}），指标不可比。\n"
+            "   请把 EMBED_MODEL 与 INGEST_EMBED_MODEL 设为同一模型后重跑。"
+        )
+
+
+def judge(pg_report: dict, faiss_report: dict,
+          tolerance: float = TOLERANCE) -> dict:
+    """比较两份 runner 报告，返回 `{ok, regressions, improvements, reasons}`。"""
+    verdict = compare_reports(pg_report, faiss_report, tolerance=tolerance)
+
+    baseline_leaks = int(faiss_report.get("metrics", {}).get("leaks", 0) or 0)
+    pg_leaks = int(pg_report.get("metrics", {}).get("leaks", 0) or 0)
+    if pg_leaks > 0:
+        verdict["ok"] = False
+        if not any(item["metric"] == "leaks" for item in verdict["regressions"]):
+            verdict["regressions"].append({
+                "metric": "leaks",
+                "baseline": baseline_leaks,
+                "current": pg_leaks,
+                "delta": pg_leaks - baseline_leaks,
+            })
+
+    verdict["reasons"] = [
+        f"{item['metric']}: {item['baseline']} → {item['current']}"
+        for item in verdict["regressions"]
+    ]
+    return verdict
+
+
+def compare(
+    cases_path: str | Path = DEFAULT_CASES,
+    mode: str = "retrieval",
+    k: int = 5,
+    tolerance: float = TOLERANCE,
+    out_dir: str | Path | None = None,
+) -> tuple[int, dict | None]:
+    _assert_comparable()
+    out_dir = Path(out_dir or DEFAULT_OUT_DIR)
+
+    print("▶ 后端对比 1/2：FAISS（现有主线）")
+    faiss_code, faiss_report, _ = runner.run(
+        cases_path=cases_path, mode=mode, backend="faiss", k=k,
+        out_dir=out_dir / "faiss")
+    if faiss_report is None:
+        return faiss_code, None
+
+    print("▶ 后端对比 2/2：pgvector（摄取库）")
+    pg_code, pg_report, _ = runner.run(
+        cases_path=cases_path, mode=mode, backend="pg", k=k,
+        out_dir=out_dir / "pg")
+    if pg_report is None:
+        return pg_code, None
+
+    verdict = judge(pg_report, faiss_report, tolerance=tolerance)
+    report_path = _write_verdict(verdict, pg_report, faiss_report,
+                                 tolerance=tolerance, out_dir=out_dir)
+    if verdict["ok"]:
+        print(f"🟢 后端对比通过（跌幅 ≤ {tolerance:.0%}，零泄露）；报告：{report_path}")
+        return 0, verdict
+
+    print("⛔ 后端对比未通过：")
+    for reason in verdict["reasons"]:
+        print(f"   - {reason}")
+    print(f"   报告：{report_path}")
+    return 1, verdict
+
+
+def _fmt(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, int):
+        return str(value)
+    return f"{value * 100:.1f}%"
+
+
+def render_markdown(verdict: dict, pg_report: dict, faiss_report: dict,
+                    tolerance: float) -> str:
+    faiss_metrics = faiss_report.get("metrics", {})
+    pg_metrics = pg_report.get("metrics", {})
+    lines = [
+        "# 检索后端对比（pg vs FAISS）",
+        "",
+        f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}",
+        f"- 用例数：FAISS {faiss_metrics.get('cases', '—')} / pg {pg_metrics.get('cases', '—')}",
+        f"- 容差：{tolerance:.0%}（越大越好的指标；泄露零容忍）",
+        f"- 结论：{'✅ 通过' if verdict['ok'] else '⛔ 不通过'}",
+        "",
+        "| 指标 | FAISS | pg | Δ |",
+        "|---|---|---|---|",
+    ]
+    for metric, label in _METRIC_LABELS.items():
+        left = faiss_metrics.get(metric)
+        right = pg_metrics.get(metric)
+        if left is None and right is None:
+            continue
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            delta = right - left
+            delta_text = f"{delta:+d}" if metric == "leaks" else f"{delta:+.3f}"
+        else:
+            delta_text = "—"
+        lines.append(f"| {label} | {_fmt(left)} | {_fmt(right)} | {delta_text} |")
+
+    if verdict["regressions"]:
+        lines += ["", "## 回归项", ""]
+        for item in verdict["regressions"]:
+            lines.append(f"- `{item['metric']}`：{item['baseline']} → {item['current']}")
+    if verdict["improvements"]:
+        lines += ["", "## 改进项", ""]
+        for item in verdict["improvements"]:
+            lines.append(f"- `{item['metric']}`：{item['baseline']} → {item['current']}")
+    if not verdict["ok"]:
+        lines += ["", "> 未通过时不要把 `RETRIEVAL_BACKEND` 切到 `pg`；"
+                      "先定位是切分、embedding、RRF 还是拒答阈值的问题。"]
+    return "\n".join(lines) + "\n"
+
+
+def _write_verdict(verdict: dict, pg_report: dict, faiss_report: dict, *,
+                   tolerance: float, out_dir: Path) -> Path:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    json_path = out_dir / f"compare-{stamp}.json"
+    md_path = out_dir / f"compare-{stamp}.md"
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "tolerance": tolerance,
+        "verdict": verdict,
+        "faiss": faiss_report.get("metrics", {}),
+        "pg": pg_report.get("metrics", {}),
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+    md_path.write_text(render_markdown(verdict, pg_report, faiss_report, tolerance),
+                       encoding="utf-8")
+    return md_path
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    # Windows 控制台默认 GBK，中文报告摘要会 UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(description="FAISS → pgvector 切换门禁")
+    parser.add_argument("--cases", default=str(DEFAULT_CASES), help="用例 JSONL 路径")
+    parser.add_argument("--mode", default="retrieval", choices=runner.MODES,
+                        help="retrieval=只跑检索；answer=跑完整问答")
+    parser.add_argument("--k", type=int, default=5, help="Top-K，默认 5")
+    parser.add_argument("--tolerance", type=float, default=TOLERANCE,
+                        help="允许的指标跌幅，默认 0.03")
+    parser.add_argument("--out", default=None, help="对比报告目录")
+    args = parser.parse_args(argv)
+
+    code, _ = compare(cases_path=args.cases, mode=args.mode, k=args.k,
+                      tolerance=args.tolerance, out_dir=args.out)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+**3.4 `.env.example`：P0 部署默认 pg**
+
+把 Task 22 追加的 `RETRIEVAL_BACKEND=faiss` 替换为：
+
+```dotenv
+# 检索后端：pg（P0 部署默认，需同时配置 INGEST_DB_URL）| faiss（教学主线回退）
+# 切换前必须通过 `uv run python -m evaluation.compare_backends`（跌幅 ≤3% 且零泄露）。
+# 删掉本行时：配了 INGEST_DB_URL 走 pg，没配走 faiss。
+RETRIEVAL_BACKEND=pg
+```
+
+- [ ] **Step 4: 运行新测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_eval_gate.py tests/ingest/test_acceptance.py -v
+```
+
+Expected: 11 passed（`test_eval_gate.py` 9 条：load 1、validate 3、judge 4、runner 1；`test_acceptance.py` 2 条）。
+
+- [ ] **Step 5: 回归全部测试**
+
+```bash
+uv run pytest tests/test_main.py tests/test_web.py tests/test_eval.py -q
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  INGEST_REQUIRE_DB=1 uv run pytest tests/ingest -q
+```
+
+Expected: 既有 73 个测试全绿；`tests/ingest` 无 skip（`INGEST_REQUIRE_DB=1`），全部通过。
+
+- [ ] **Step 6: 实机跑门禁（切换 pg 的唯一依据）**
+
+```bash
+docker compose up -d postgres
+export INGEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag
+uv run python -m ingest.db
+uv run python -m ingest.import_gov_docs
+uv run python -m ingest.worker --once
+
+EMBED_MODEL=bge-m3 INGEST_EMBED_MODEL=bge-m3 \
+  uv run python -m evaluation.compare_backends --tolerance 0.03
+```
+
+Expected: 导入 4 份、worker 处理完 embed/activate；对比退出码 0，报告
+`evaluation/reports/compare-<时间>.md` 中每项指标跌幅 ≤3%、`leaks=0`。
+
+若退出码为 1：**保持 `RETRIEVAL_BACKEND=faiss`**，按报告逐项定位（先看 `failures` 是切分导致证据断裂，还是 RRF/阈值导致排序变化），修完重跑，禁止带回归切换。
+
+- [ ] **Step 7: P0 验收清单（设计 §13.2 对照）**
+
+自动项（本任务测试覆盖，命令见上）：
+
+- [ ] 越权零泄露：`test_acceptance` + 门禁 `leaks=0`。
+- [ ] 未定级 / 未复核 / 已下线不可检索：`test_acceptance` 两条用例。
+- [ ] 回源定位：`test_acceptance` 校验本部门 200、跨部门 404。
+- [ ] 现有 73 个测试 + 新增测试全绿。
+
+手工项（需真实 Ollama / 浏览器，结果记入验收单）：
+
+```bash
+# 50 MB 上传：413 且不阻塞问答
+uv run python - <<'PY'
+import httpx
+c = httpx.Client(base_url="http://127.0.0.1:8000")
+c.post("/api/login", json={"username": "wang", "password": "demo-2026"}).raise_for_status()
+big = b"PK\x03\x04" + b"\0" * (52 * 1024 * 1024)
+r = c.post("/api/documents", files={"file": ("big.xlsx", big)},
+           data={"classification": "1"})
+print(r.status_code, r.json())
+PY
+# 另一个终端同时提问，记录首字时延；再以 INGEST_QUEUE_MAX=0 重启服务，
+# 上传应返回 429 queue_full。
+```
+
+```bash
+# 1000 份小型 xlsx 的批量吞吐（2 个 worker 进程 + 单卡）
+uv run python - <<'PY'
+from pathlib import Path
+from openpyxl import Workbook
+from ingest.config import get_settings
+from ingest.db import connection
+from ingest.upload_service import save_upload
+
+out = Path("data/bench"); out.mkdir(parents=True, exist_ok=True)
+settings = get_settings()
+with connection() as conn:
+    for i in range(1000):
+        path = out / f"doc-{i:04d}.xlsx"
+        if not path.exists():
+            wb = Workbook(); ws = wb.active
+            ws.append(["部门", "金额"]); ws.append(["综合处", i])
+            wb.save(path)
+        with path.open("rb") as fh:
+            save_upload(conn, fh, path.name, None, created_by="bench",
+                        dept="财务处", classification=1, settings=settings)
+print("已入队 1000 份")
+PY
+# 启动两个 worker：
+#   uv run python -m ingest.worker --worker-id w1
+#   uv run python -m ingest.worker --worker-id w2
+# 定期查询直到全部 active，记录总耗时（目标 <24h）：
+#   SELECT count(*) FILTER (WHERE status='active') AS active,
+#          count(*) FILTER (WHERE status<>'active') AS pending FROM documents;
+```
+
+- [ ] 离线冷启动：断开外网（或 `unshare -n` / 防火墙阻断），从空库执行
+  `python -m ingest.db` → 启动服务 → 上传一份 xlsx → 复核 → 问答 → 回源，
+  期间不得出现任何外联请求（`ss -tunp` 或主机防火墙日志核对）。
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add evaluation/pg_corpus.py evaluation/compare_backends.py evaluation/runner.py \
+  .env.example tests/ingest/test_eval_gate.py tests/ingest/test_acceptance.py
+git commit -m "feat(ingest): 评测门禁与 P0 全链路验收"
 ```
 
 ---

@@ -41,3 +41,10 @@ evaluation/reports/
 # Frontend build artifacts
 node_modules/
 frontend/dist/
+
+# Local verification screenshots and agent tool artifacts
+.wb_*.png
+.qoder_*.png
+app/static/.wb_*
+frontend/.wb_*
+frontend/test/.md_bundle.cjs

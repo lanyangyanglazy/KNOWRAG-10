@@ -369,6 +369,32 @@ class RagService:
             })
         return list(seen.values())
 
+    def chunk_detail(self, user: User, chunk_id: str) -> dict | None:
+        """
+        按 chunk_id 取切片原文，供前端「查看原文」使用。
+
+        权限判定复用检索侧的 can_view（同一套密级/部门规则），且判定在前：
+        不可见切片一律返回 None，不区分「不存在」与「无权查看」，
+        避免接口成为枚举密级归属的旁路。
+        """
+        for doc in self.documents:
+            md = doc.metadata
+            if md.get("chunk_id") != chunk_id:
+                continue
+            if not can_view(user, md):
+                return None
+            return {
+                "chunk_id": chunk_id,
+                "doc_id": md.get("doc_id", ""),
+                "title": md.get("title", ""),
+                "dept": md.get("dept", ""),
+                "classification": md.get("classification", ""),
+                "effective_date": md.get("effective_date", ""),
+                "source": md.get("source", ""),
+                "text": doc.page_content,
+            }
+        return None
+
     # ---- 检索 ----
 
     def retrieve(self, user: User, query: str) -> RetrievalResult:
@@ -428,6 +454,18 @@ class RagService:
 
     def clear_history(self, username: str) -> None:
         self._history.pop(username, None)
+
+    def restore_history(self, username: str, turns: list[tuple[str, str]]) -> None:
+        """
+        回填历史轮次（前端本地历史恢复后调用）。
+
+        turns 为 [(question, answer), ...]，按时间顺序补齐。
+        补写后仍受 history_turns 预算裁剪，不会把上下文撑爆。
+        """
+        for question, answer in turns:
+            if not question or not answer:
+                continue
+            self._remember(username, question, answer)
 
     def _remember(self, username: str, question: str, answer: str) -> None:
         turns = self._history.setdefault(username, [])
