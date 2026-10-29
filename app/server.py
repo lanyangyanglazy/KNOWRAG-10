@@ -592,8 +592,12 @@ if (DIST_DIR / "assets").exists():
 
 
 from app.routers import documents as documents_api
+from app.routers import review as review_api
+from app.routers import templates as templates_api
 
 app.include_router(documents_api.router)
+app.include_router(review_api.router)
+app.include_router(templates_api.router)
 
 
 if __name__ == "__main__":
