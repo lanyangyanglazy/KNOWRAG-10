@@ -1,17 +1,37 @@
+import pytest
+
 from ingest import config
+from ingest.ir import Table
 from ingest.parsers.header_rules import HeaderCandidate
 from ingest.parsers.regions import Region
 from ingest.parsers.table_build import build_table, rebuild_table
 from ingest.parsers.xlsx_reader import Cell, SheetGrid
 
 
-def grid(rows):
+def grid(rows, merges=None):
     return SheetGrid(
         name="S", hidden=False,
         rows=[[Cell(text=str(v)) if v not in (None, "") else Cell() for v in row]
               for row in rows],
-        merges=[],
+        merges=merges or [],
     )
+
+
+_COLUMNS_3 = [{"key": "c1", "name": "部门"}, {"key": "c2", "name": "Q1"},
+              {"key": "c3", "name": "Q2"}]
+
+
+def _table_for_rebuild():
+    sheet = grid([
+        ["2025年预算", "", ""],
+        ["部门", "Q1", "Q2"],
+        ["综合处", "120", "130"],
+        ["合计", "120", "130"],
+    ])
+    table, _ = build_table(
+        sheet, Region(1, 4, 1, 3, 1.0), HeaderCandidate(2, 1, 0.9, {}, ()),
+        table_key="t1", settings=config.get_settings())
+    return table
 
 
 def test_builds_columns_types_units_and_footer():
@@ -134,4 +154,95 @@ def test_rebuild_recomputes_repeated_header_rows():
         settings=config.get_settings())
     assert rebuilt.header_rows == [1, 2, 3]
     assert rebuilt.repeated_header_rows == []
+    assert "repeated_header" not in rebuilt.flags
     assert rebuilt.data_rows() == [["人事处", "98"]]
+
+
+def test_two_level_repeated_header_block_is_excluded():
+    # Minor 2：两行表头的重复块必须整体剔除；只比对最后一行会把父级行
+    # （"预算"）留在数据视图里，且不能影响其余行的绝对行号。
+    rows = [
+        ["预算", "", ""],          # 1 表头（父级，合并展开）
+        ["部门", "Q1", "Q2"],      # 2 表头（叶子）
+        ["综合处", "120", "130"],  # 3 数据
+        ["预算", "", ""],          # 4 重复块
+        ["部门", "Q1", "Q2"],      # 5 重复块
+        ["人事处", "98", "101"],   # 6 数据
+        ["合计", "218", "231"],    # 7 表尾
+    ]
+    table, warnings = build_table(
+        grid(rows), Region(1, 7, 1, 3, 1.0), HeaderCandidate(1, 2, 0.9, {}, ()),
+        table_key="t1", settings=config.get_settings())
+    assert table.header_rows == [1, 2]
+    assert table.repeated_header_rows == [4, 5]
+    assert table.footer_rows == [7]
+    assert table.rows[1:3] == [["预算", "", ""], ["部门", "Q1", "Q2"]]
+    assert table.data_rows() == [["综合处", "120", "130"], ["人事处", "98", "101"]]
+    assert table.footer_values() == [["合计", "218", "231"]]
+    # 周围行与表尾的绝对行号编号不变
+    assert table.full_grid() == rows
+    data_start = table.data_start_row
+    assert all(table.rows[i] == rows[data_start - 1 + i]
+               for i in range(len(table.rows)))
+    assert any(w.code == "repeated_header" for w in warnings)
+
+
+def test_rebuild_rejects_non_contiguous_header_rows():
+    # Important 1：[2, 4] 会让 data_start 与 rows[0] 错位，必须显式拒绝。
+    with pytest.raises(ValueError, match="连续"):
+        rebuild_table(_table_for_rebuild(), [2, 4], _COLUMNS_3,
+                      settings=config.get_settings())
+
+
+def test_rebuild_rejects_header_rows_out_of_range():
+    with pytest.raises(ValueError, match="超出"):
+        rebuild_table(_table_for_rebuild(), [5], _COLUMNS_3,
+                      settings=config.get_settings())
+
+
+def test_rebuild_rejects_column_count_mismatch():
+    with pytest.raises(ValueError, match="列数"):
+        rebuild_table(_table_for_rebuild(), [2], _COLUMNS_3[:2],
+                      settings=config.get_settings())
+
+
+def test_rebuild_twice_reslices_pre_rows():
+    # 改表头前进一格再退回来：pre_rows/header_values/rows 必须按绝对行号重切。
+    table = _table_for_rebuild()
+    forward, _ = rebuild_table(table, [2, 3], _COLUMNS_3,
+                               settings=config.get_settings())
+    assert forward.pre_rows == [["2025年预算", "", ""]]
+    assert forward.header_values == [["部门", "Q1", "Q2"], ["综合处", "120", "130"]]
+    assert forward.rows == [["合计", "120", "130"]]
+    backward, _ = rebuild_table(forward, [2], _COLUMNS_3,
+                                settings=config.get_settings())
+    assert backward.pre_rows == [["2025年预算", "", ""]]
+    assert backward.header_values == [["部门", "Q1", "Q2"]]
+    assert backward.rows == [["综合处", "120", "130"], ["合计", "120", "130"]]
+    assert backward.footer_rows == [4]
+    assert backward.footer_values() == [["合计", "120", "130"]]
+    assert backward.full_grid() == table.full_grid()
+    assert backward.source == "human"
+    assert backward.confidence == 1.0
+    # 走完整校验构建的表可以原样往返（model_copy 版本不满足该契约）
+    assert Table.model_validate(backward.model_dump()) == backward
+
+
+def test_rebuild_flags_drop_stale_header_codes():
+    # Minor 1：人工改表头后，旧的自动表头状态码不再成立；其余 flag 保留。
+    sheet = grid([["1", "120"], ["2", "98"]], merges=["A1:B1"])
+    table, _ = build_table(
+        sheet, Region(1, 2, 1, 2, 1.0), None,
+        table_key="t1", settings=config.get_settings())
+    assert "table_no_header" in table.flags
+    assert "merged_cells" in table.flags
+    rebuilt, _ = rebuild_table(
+        table, [1],
+        [{"key": "c1", "name": "序号"}, {"key": "c2", "name": "数量"}],
+        settings=config.get_settings())
+    assert "human_confirmed" in rebuilt.flags
+    assert "merged_cells" in rebuilt.flags
+    assert "table_no_header" not in rebuilt.flags
+    assert "repeated_header" not in rebuilt.flags
+    assert rebuilt.header_rows == [1]
+    assert rebuilt.data_rows() == [["2", "98"]]

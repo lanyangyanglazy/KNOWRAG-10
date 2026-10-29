@@ -14,15 +14,32 @@ from ingest.parsers.header_llm import try_llm_header
 from ingest.parsers.header_rules import (
     HeaderCandidate, compose_header_names, detect_header,
 )
-from ingest.parsers.regions import split_regions
+from ingest.parsers.regions import Region, split_regions
 from ingest.parsers.table_build import build_table
 from ingest.parsers.templates import (
     build_signature, match_template, template_columns,
 )
-from ingest.parsers.xlsx_reader import read_workbook
+from ingest.parsers.xlsx_reader import SheetGrid, read_workbook
 from ingest.sniff import sha256_file
 
 _MAX_LLM_HEADER_CALLS = 3
+# 模板兜底扫描窗口：规则候选只保留 top 3，纯数字表头（如 2024|2025）甚至
+# 不产生候选，模板命中不能受候选生成限制。
+_MAX_TEMPLATE_SCAN_ROWS = 40
+_MAX_TEMPLATE_DEPTH = 3
+
+
+def _usable_templates(templates: list[dict], ncols: int) -> list[dict]:
+    """只保留列数与区域宽度一致的模板；坏模板不能进入 build_table。"""
+    return [t for t in templates if len(template_columns(t)) == ncols]
+
+
+def _template_at(sheet: SheetGrid, region: Region, start_row: int, depth: int,
+                 templates: list[dict]) -> dict | None:
+    candidate = HeaderCandidate(start_row, depth, 0.0, {}, (), "template")
+    names = compose_header_names(sheet, region, start_row, depth)
+    signature = build_signature(sheet.name, region, candidate, names)
+    return match_template(signature, templates)
 
 
 class XlsxParser:
@@ -65,18 +82,36 @@ class XlsxParser:
 
                 # 模板优先（设计 §8.5）：人工确认过的版式比启发式分数更可信，
                 # 命中即用；不能等规则“拒绝”了才回头看模板，否则规则一旦接受
-                # 别的行，模板就永远不生效。
+                # 别的行，模板就永远不生效。列数不符的模板直接跳过。
+                templates = _usable_templates(self.templates, region.ncols)
                 for cand in decision.candidates:
-                    names = compose_header_names(
-                        sheet, region, cand.start_row, cand.depth)
-                    signature = build_signature(sheet.name, region, cand, names)
-                    template = match_template(signature, self.templates)
+                    template = _template_at(
+                        sheet, region, cand.start_row, cand.depth, templates)
                     if template:
                         header = HeaderCandidate(
                             cand.start_row, cand.depth, 0.95,
                             dict(cand.features), (), "template")
                         forced_columns = template_columns(template)
                         break
+
+                # 候选为空（纯数字表头）或被 top 3 挤掉时，按区域顶部 40 行 ×
+                # 深度 1..3 兜底扫描模板，先命中者胜。
+                if header is None and templates:
+                    last_row = min(region.end_row - 1,
+                                   region.start_row + _MAX_TEMPLATE_SCAN_ROWS - 1)
+                    for start_row in range(region.start_row, last_row + 1):
+                        max_depth = min(_MAX_TEMPLATE_DEPTH,
+                                        region.end_row - start_row)
+                        for depth in range(1, max_depth + 1):
+                            template = _template_at(
+                                sheet, region, start_row, depth, templates)
+                            if template:
+                                header = HeaderCandidate(
+                                    start_row, depth, 0.95, {}, (), "template")
+                                forced_columns = template_columns(template)
+                                break
+                        if header is not None:
+                            break
 
                 if header is None and decision.accepted:
                     header = decision.candidate

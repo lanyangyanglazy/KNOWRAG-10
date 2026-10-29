@@ -70,24 +70,31 @@ def _detect_footer_rows(sheet: SheetGrid, region: Region,
     return footers
 
 
-def _header_signature(header_values: list[list[str]]) -> set[str]:
-    if not header_values:
-        return set()
-    return {_norm(v) for v in header_values[-1] if _norm(v)}
+def _header_signature(header_values: list[list[str]]) -> list[set[str]]:
+    """逐行表头的非空归一化单元格集合，按行顺序组成整块签名。
+
+    重复表头是多行表头整体重复，只比对最后一行会把父级行留在数据视图里。
+    """
+    return [{_norm(v) for v in row if _norm(v)} for row in header_values]
 
 
-def _repeated_header_rows(rows: list[list[str]], signature: set[str],
+def _repeated_header_rows(rows: list[list[str]], signature: list[set[str]],
                           data_start: int, *, excluded: set[int]) -> list[int]:
-    """按非空归一化单元格集合匹配重复表头；footer 行优先，不再标重复。"""
-    if not signature:
+    """按完整表头块（逐行集合、顺序）匹配连续重复行；footer 优先，不再标重复。"""
+    depth = len(signature)
+    if depth == 0 or not any(signature):
         return []
+    row_sets = [{_norm(v) for v in row if _norm(v)} for row in rows]
     marked: list[int] = []
-    for offset, row in enumerate(rows):
-        absolute = data_start + offset
-        if absolute in excluded:
-            continue
-        if {_norm(v) for v in row if _norm(v)} == signature:
-            marked.append(absolute)
+    offset = 0
+    while offset + depth <= len(rows):
+        window = range(data_start + offset, data_start + offset + depth)
+        if not any(r in excluded for r in window) and all(
+                row_sets[offset + i] == signature[i] for i in range(depth)):
+            marked.extend(window)
+            offset += depth
+        else:
+            offset += 1
     return marked
 
 
@@ -202,10 +209,17 @@ def rebuild_table(table: Table, new_header_rows: list[int],
     warnings: list[Warning] = []
     if not new_header_rows or new_header_rows != sorted(set(new_header_rows)):
         raise ValueError("new_header_rows 必须非空、递增且不重复")
-    grid = table.full_grid()
     start = new_header_rows[0]
-    offset = start - table.range_start_row
     depth = len(new_header_rows)
+    # Table 的 rows[i] ↔ data_start_row + i 契约要求表头连续；非连续行号会让
+    # data_start 与切出的数据行错位，因此必须显式拒绝（model_copy 不跑校验器）。
+    if new_header_rows != list(range(start, start + depth)):
+        raise ValueError("new_header_rows 必须是连续行号")
+    if len(columns) != len(table.columns):
+        raise ValueError(
+            f"columns 数量（{len(columns)}）必须等于表格列数（{len(table.columns)}）")
+    grid = table.full_grid()
+    offset = start - table.range_start_row
     if offset < 0 or offset + depth > len(grid):
         raise ValueError("表头行超出表格范围")
     header_values = [list(row) for row in grid[offset:offset + depth]]
@@ -213,7 +227,7 @@ def rebuild_table(table: Table, new_header_rows: list[int],
     rows = [list(row) for row in grid[offset + depth:]]
     data_start = start + depth
     footer_rows = [r for r in table.footer_rows if r >= data_start]
-    # 旧标记可能已落进新表头范围，必须按新表头最后一行在 rows 上重算
+    # 旧标记可能已落进新表头范围，必须按新表头块在 rows 上重算
     repeated_rows = _repeated_header_rows(
         rows, _header_signature(header_values), data_start,
         excluded=set(footer_rows))
@@ -222,12 +236,16 @@ def rebuild_table(table: Table, new_header_rows: list[int],
             code="repeated_header",
             detail=f"新表头下正文中仍有重复表头行 {repeated_rows}"))
     new_columns = _columns_from_config(columns)
-    flags = set(table.flags) | {"human_confirmed"}
+    # 自动检测得到的三个表头状态码已不代表人工确认后的结果，先全部摘掉；
+    # 重复表头按重算结果加回，其余代码（merged_cells/truncated 等）保留。
+    flags = set(table.flags) - {"table_no_header", "ambiguous_header", "repeated_header"}
     if repeated_rows:
         flags.add("repeated_header")
-    # 注意：model_copy 不跑校验器，pre_rows/repeated_header_rows 必须显式重算，
-    # 否则第二次改表头会基于错的 full_grid 或带着失效的重复行标记。
-    rebuilt = table.model_copy(update={
+    flags.add("human_confirmed")
+    # 用 model_validate 重建以跑完整校验器（model_copy 会跳过 Table._check），
+    # 保证 rows/header_rows/pre_rows 的绝对行号契约始终成立。
+    rebuilt = Table.model_validate({
+        **table.model_dump(),
         "header_rows": new_header_rows,
         "header_values": header_values,
         "pre_rows": pre_rows,
@@ -238,6 +256,5 @@ def rebuild_table(table: Table, new_header_rows: list[int],
         "confidence": 1.0,
         "source": "human",
         "flags": sorted(flags),
-        "candidates": table.candidates,
     })
     return rebuilt, warnings

@@ -115,3 +115,15 @@ def test_rejects_duplicate_block_ids():
             {"block_id": "b1", "type": "paragraph", "text": "a", "path": []},
             {"block_id": "b1", "type": "paragraph", "text": "b", "path": []},
         ])
+
+
+@pytest.mark.parametrize(("rows", "message"), [
+    ([6, 5], "递增且不重复"),   # 未排序
+    ([5, 5], "递增且不重复"),   # 重复
+    ([8], "数据区"),            # 超出数据区（data_start_row=5, rows=3）
+    ([7], "表头/表尾"),         # 与 footer_rows 重叠
+])
+def test_rejects_invalid_repeated_header_rows(rows, message):
+    with pytest.raises(ValidationError, match=message):
+        _model(blocks=[{"block_id": "b1", "type": "table",
+                        "table": _table(repeated_header_rows=rows)}])

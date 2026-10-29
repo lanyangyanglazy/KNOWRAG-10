@@ -119,3 +119,61 @@ def test_llm_header_not_called_when_disabled(tmp_path):
     settings = Settings(db_url="", upload_dir=tmp_path)
     XlsxParser(llm=llm, settings=settings).parse(path)
     assert llm.calls == 0
+
+
+def test_template_hit_without_rule_candidates(tmp_path):
+    # Minor 3：纯数字表头（2024|2025）不产生规则候选，模板仍须命中。
+    path = build_xlsx(tmp_path / "years.xlsx", [
+        ["2024", "2025"],
+        [120, 130],
+        [98, 101],
+    ])
+    template = {
+        "id": "t-year", "name": "年度模板", "scope_dept": None,
+        "signature": {
+            "ncols": 2, "header_depth": 1, "relative_header_row": 0,
+            "columns_norm": ["2024", "2025"],
+            "sheet_pattern": None, "sheet_name": "Sheet1",
+        },
+        "config": {"columns": [
+            {"key": "c1", "name": "2024年", "dtype": "number"},
+            {"key": "c2", "name": "2025年", "dtype": "number"},
+        ]},
+    }
+    model = XlsxParser(templates=[template]).parse(path)
+    table = model.tables()[0]
+    assert table.source == "template"
+    assert table.confidence == 0.95
+    assert table.header_rows == [1]
+    assert [c.name for c in table.columns] == ["2024年", "2025年"]
+    assert not any(w.code == "ambiguous_header" for w in model.warnings)
+
+
+def test_template_width_mismatch_falls_back_to_rules(tmp_path):
+    # Minor 3：模板 config 列数与区域不符时不得强塞给 build_table，
+    # 否则表会因列数校验失败被 parse_partial 丢掉；应退回规则列。
+    path = build_xlsx(tmp_path / "a.xlsx", [
+        ["序号", "部门", "金额"],
+        [1, "综合处", 120],
+        [2, "人事处", 98],
+        [3, "财务处", 150],
+    ], bold_rows=(1,))
+    template = {
+        "id": "bad", "name": "坏模板", "scope_dept": None,
+        "signature": {
+            "ncols": 3, "header_depth": 1, "relative_header_row": 0,
+            "columns_norm": ["序号", "部门", "金额"],
+            "sheet_pattern": None, "sheet_name": "Sheet1",
+        },
+        "config": {"columns": [
+            {"key": "c1", "name": "序号", "dtype": "number"},
+            {"key": "c2", "name": "部门", "dtype": "string"},
+        ]},
+    }
+    model = XlsxParser(templates=[template]).parse(path)
+    assert len(model.tables()) == 1
+    table = model.tables()[0]
+    assert table.source == "heuristic"
+    assert len(table.columns) == 3
+    assert [c.name for c in table.columns] == ["序号", "部门", "金额"]
+    assert not any(w.code == "parse_partial" for w in model.warnings)
