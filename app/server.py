@@ -272,6 +272,16 @@ class HistorySeedPayload(BaseModel):
 
 app = FastAPI(title="政务知识问答（试点原型）", version="0.1.0")
 
+from ingest.errors import IngestError
+
+
+@app.exception_handler(IngestError)
+async def _ingest_error_handler(request: Request, exc: IngestError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"code": exc.code, "detail": str(exc), **exc.detail},
+    )
+
 
 @app.get("/")
 def index() -> FileResponse:
@@ -579,6 +589,11 @@ def chat(
 # 否则 StaticFiles 会在启动时因目录缺失而报错。API 路由（/api/*）已在上方注册，不受影响。
 if (DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="dist-assets")
+
+
+from app.routers import documents as documents_api
+
+app.include_router(documents_api.router)
 
 
 if __name__ == "__main__":

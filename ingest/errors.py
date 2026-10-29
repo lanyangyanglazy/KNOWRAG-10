@@ -38,5 +38,17 @@ class ModelUnavailable(IngestError):
     code, http_status = "model_unavailable", 503
 
 
+class NotFound(IngestError):
+    code, http_status = "not_found", 404
+
+
+class Forbidden(IngestError):
+    code, http_status = "forbidden", 403
+
+
+class DocumentInactive(IngestError):
+    code, http_status = "document_inactive", 409
+
+
 class ParseError(Exception):
     """解析器内部失败；由 worker 转成 failed + parse_warning。"""
