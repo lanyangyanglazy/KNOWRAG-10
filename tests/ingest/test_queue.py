@@ -104,3 +104,108 @@ def test_heartbeat_and_depth(conn):
     assert (datetime.now(timezone.utc) - row["locked_at"]).total_seconds() < 10
     complete(conn, job["id"])
     assert queue_depth(conn) == 0
+
+
+def test_fail_fences_on_worker_ownership(conn):
+    job_id = enqueue(conn, "parse", {})
+    job = claim(conn, "w1")
+    assert job["id"] == job_id
+
+    # 非所有者调用 fail：返回 lost，任务保持 running 且锁仍归 w1
+    assert fail(conn, job_id, "late", worker_id="w2") == "lost"
+    row = conn.execute(
+        "SELECT status, locked_by, last_error FROM jobs WHERE id=%s", (job_id,)
+    ).fetchone()
+    assert row["status"] == "running"
+    assert row["locked_by"] == "w1"
+    assert row["last_error"] is None
+
+    # 所有者调用 fail 才生效
+    assert fail(conn, job_id, "boom", worker_id="w1") == "queued"
+
+    # 不存在的 job_id 返回 lost 而不是抛 TypeError（带不带 worker_id 一致）
+    assert fail(conn, 999_999_999, "missing", worker_id="w1") == "lost"
+    assert fail(conn, 999_999_999, "missing") == "lost"
+
+
+def test_complete_fences_on_worker_ownership(conn):
+    job_id = enqueue(conn, "parse", {})
+    first = claim(conn, "w1")
+    assert first["id"] == job_id
+
+    # w1 心跳丢失，任务被回收并由 w2 重新认领
+    conn.execute("UPDATE jobs SET locked_at = now() - interval '20 minutes' WHERE id=%s",
+                 (job_id,))
+    conn.commit()
+    assert reap_stale(conn, timeout_seconds=600) == 1
+    second = claim(conn, "w2")
+    assert second["id"] == job_id
+
+    # w1 迟到的 complete 不得把 w2 手上的任务置为 done
+    complete(conn, job_id, worker_id="w1")
+    row = conn.execute("SELECT status, locked_by FROM jobs WHERE id=%s", (job_id,)).fetchone()
+    assert row["status"] == "running"
+    assert row["locked_by"] == "w2"
+
+    # 真正的所有者可以完成
+    complete(conn, job_id, worker_id="w2")
+    row = conn.execute("SELECT status FROM jobs WHERE id=%s", (job_id,)).fetchone()
+    assert row["status"] == "done"
+
+
+def test_reap_stale_marks_exhausted_attempts_failed(conn):
+    job_id = enqueue(conn, "parse", {}, max_attempts=0)
+    job = claim(conn, "w1")
+    assert job["attempts"] == 1
+    conn.execute("UPDATE jobs SET locked_at = now() - interval '20 minutes' WHERE id=%s",
+                 (job_id,))
+    conn.commit()
+
+    # attempts(1) > max_attempts(0)：回收直接落 failed，不再重放
+    assert reap_stale(conn, timeout_seconds=600) == 1
+    row = conn.execute(
+        "SELECT status, finished_at, last_error, locked_by, locked_at FROM jobs WHERE id=%s",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["finished_at"] is not None
+    assert row["last_error"] is not None
+    assert "stale" in row["last_error"].lower() or "timeout" in row["last_error"].lower()
+    assert row["locked_by"] is None
+    assert row["locked_at"] is None
+
+
+def test_run_job_skips_dead_letter_when_ownership_lost(conn):
+    job_id = enqueue(conn, "parse", {}, max_attempts=0)
+    claim(conn, "w1")
+    dead = []
+
+    def boom(conn, payload):
+        raise RuntimeError("bad")
+
+    # w2 拿着同一 job 字典执行：fail 返回 lost，不触发死信钩子，任务仍归 w1
+    assert run_job(conn, {"id": job_id, "kind": "parse", "payload": {}}, {"parse": boom},
+                   "w2", {"parse": lambda c, j: dead.append(j["id"])}) is False
+    assert dead == []
+    row = conn.execute("SELECT status, locked_by FROM jobs WHERE id=%s", (job_id,)).fetchone()
+    assert row["status"] == "running"
+    assert row["locked_by"] == "w1"
+
+
+def test_claim_skips_rows_locked_by_other_transaction(conn, db_url):
+    enqueue(conn, "parse", {})
+
+    # 另一事务持有唯一 queued 行的行锁：claim 必须跳过而不是阻塞
+    with psycopg.connect(db_url, row_factory=dict_row) as other:
+        other.execute("BEGIN")
+        locked = other.execute(
+            "SELECT id FROM jobs WHERE status='queued' FOR UPDATE"
+        ).fetchall()
+        assert len(locked) == 1
+        assert claim(conn, "w1") is None
+        other.rollback()
+
+    # 对方释放后即可认领
+    claimed = claim(conn, "w1")
+    assert claimed is not None
+    assert claimed["attempts"] == 1
