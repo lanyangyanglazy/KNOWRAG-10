@@ -4923,9 +4923,17 @@ git commit -m "feat(ingest): 解析流水线、复核项生成与失败转人工
 
 - [ ] **Step 1: 写失败测试**
 
-`tests/ingest/conftest.py` 追加（保留现有 fixture）：
+`tests/ingest/conftest.py`：顶部补导入，并追加 `clean_db`、`api`、`fetch_all`（Task 15/16 复用）：
 
 ```python
+from fastapi.testclient import TestClient
+
+from ingest.config import get_settings
+from ingest.db import reset_pool_for_tests
+
+PASSWORD = "test-pass-123"
+
+
 @pytest.fixture()
 def clean_db(migrated):
     """给 API 测试用：不依赖 conn fixture，也能保证每个用例从空库开始。"""
@@ -4933,6 +4941,33 @@ def clean_db(migrated):
         conn.execute(TRUNCATE_SQL)
         conn.commit()
     return migrated
+
+
+@pytest.fixture()
+def api(clean_db, tmp_path, monkeypatch):
+    """返回 (make_client, db_url)；make_client(username) 登录并返回 TestClient。"""
+    monkeypatch.setenv("INGEST_DB_URL", clean_db)
+    monkeypatch.setenv("INGEST_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("DEMO_PASSWORD", PASSWORD)
+    get_settings.cache_clear()
+    reset_pool_for_tests()
+    from app import server
+
+    def make(username: str = "wang") -> TestClient:
+        client = TestClient(server.app)
+        resp = client.post("/api/login",
+                           json={"username": username, "password": PASSWORD})
+        assert resp.status_code == 200, resp.text
+        return client
+
+    yield make, clean_db
+    reset_pool_for_tests()
+    get_settings.cache_clear()
+
+
+def fetch_all(db_url: str, sql: str, params: tuple = ()) -> list[dict]:
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        return conn.execute(sql, params).fetchall()
 ```
 
 `tests/ingest/test_documents_api.py`：
@@ -4941,46 +4976,15 @@ def clean_db(migrated):
 from __future__ import annotations
 
 import psycopg
-import pytest
-from fastapi.testclient import TestClient
 from psycopg.rows import dict_row
 
 from ingest import repository as repo
 from ingest.config import get_settings
-from ingest.db import reset_pool_for_tests
 from tests.ingest.builders import build_xlsx
-
-PASSWORD = "test-pass-123"
-
-
-def login(client: TestClient, username: str) -> TestClient:
-    resp = client.post("/api/login", json={"username": username, "password": PASSWORD})
-    assert resp.status_code == 200, resp.text
-    return client
+from tests.ingest.conftest import fetch_all
 
 
-@pytest.fixture()
-def app_client(clean_db, tmp_path, monkeypatch):
-    monkeypatch.setenv("INGEST_DB_URL", clean_db)
-    monkeypatch.setenv("INGEST_UPLOAD_DIR", str(tmp_path / "uploads"))
-    monkeypatch.setenv("DEMO_PASSWORD", PASSWORD)
-    get_settings.cache_clear()
-    reset_pool_for_tests()
-    from app import server
-
-    client = TestClient(server.app)
-    login(client, "wang")
-    yield client, clean_db
-    reset_pool_for_tests()
-    get_settings.cache_clear()
-
-
-def fetch_all(db_url: str, sql: str, params: tuple = ()) -> list[dict]:
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
-        return conn.execute(sql, params).fetchall()
-
-
-def upload(client: TestClient, path, **form):
+def upload(client, path, **form):
     return client.post(
         "/api/documents",
         files={"file": (path.name, path.read_bytes())},
@@ -4988,8 +4992,9 @@ def upload(client: TestClient, path, **form):
     )
 
 
-def test_upload_creates_document_version_and_parse_job(app_client, tmp_path):
-    client, db_url = app_client
+def test_upload_creates_document_version_and_parse_job(api, tmp_path):
+    make, db_url = api
+    client = make("wang")
     xlsx = build_xlsx(tmp_path / "预算.xlsx", [["部门", "金额"], ["综合处", 10]])
 
     resp = upload(client, xlsx, title="2025预算", classification=1,
@@ -5017,8 +5022,9 @@ def test_upload_creates_document_version_and_parse_job(app_client, tmp_path):
     assert jobs[0]["payload"]["version_id"] == str(versions[0]["id"])
 
 
-def test_rejects_unsupported_type_and_oversize(app_client, tmp_path, monkeypatch):
-    client, db_url = app_client
+def test_rejects_unsupported_type_and_oversize(api, tmp_path, monkeypatch):
+    make, db_url = api
+    client = make("wang")
     bad = client.post("/api/documents", files={"file": ("a.exe", b"MZ")})
     assert bad.status_code == 400
     assert bad.json()["code"] == "unsupported_type"
@@ -5032,8 +5038,9 @@ def test_rejects_unsupported_type_and_oversize(app_client, tmp_path, monkeypatch
     assert fetch_all(db_url, "SELECT count(*) AS n FROM documents")[0]["n"] == 0
 
 
-def test_queue_full_returns_429(app_client, tmp_path, monkeypatch):
-    client, _ = app_client
+def test_queue_full_returns_429(api, tmp_path, monkeypatch):
+    make, _ = api
+    client = make("wang")
     monkeypatch.setenv("INGEST_QUEUE_MAX", "0")
     get_settings.cache_clear()
     xlsx = build_xlsx(tmp_path / "a.xlsx", [["部门", "金额"], ["综合处", 1]])
@@ -5042,8 +5049,9 @@ def test_queue_full_returns_429(app_client, tmp_path, monkeypatch):
     assert resp.json()["code"] == "queue_full"
 
 
-def test_duplicate_content_and_new_version(app_client, tmp_path):
-    client, db_url = app_client
+def test_duplicate_content_and_new_version(api, tmp_path):
+    make, db_url = api
+    client = make("wang")
     xlsx = build_xlsx(tmp_path / "预算.xlsx", [["部门", "金额"], ["综合处", 10]])
     first = upload(client, xlsx)
     assert first.status_code == 202
@@ -5061,11 +5069,10 @@ def test_duplicate_content_and_new_version(app_client, tmp_path):
     assert [v["version_no"] for v in versions] == [1, 2]
 
 
-def test_department_and_classification_permissions(app_client, tmp_path):
-    from app import server
-
-    client, _ = app_client
-    zhang = login(TestClient(server.app), "zhang")
+def test_department_and_classification_permissions(api, tmp_path):
+    make, _ = api
+    client = make("wang")
+    zhang = make("zhang")
     xlsx = build_xlsx(tmp_path / "预算.xlsx", [["部门", "金额"], ["综合处", 10]])
 
     too_secret = upload(zhang, xlsx, classification=2)
@@ -5075,7 +5082,7 @@ def test_department_and_classification_permissions(app_client, tmp_path):
     assert other_dept.status_code == 403
 
 
-def test_list_and_detail_hide_other_departments(app_client, tmp_path, monkeypatch):
+def test_list_and_detail_hide_other_departments(api, tmp_path, monkeypatch):
     from dataclasses import replace
 
     from app.users import DEMO_USERS
@@ -5084,7 +5091,8 @@ def test_list_and_detail_hide_other_departments(app_client, tmp_path, monkeypatc
     # 这里临时摘掉 wang 的 admin，验证普通上传者的过滤。
     monkeypatch.setitem(DEMO_USERS, "wang",
                         replace(DEMO_USERS["wang"], roles=("uploader", "reviewer")))
-    client, db_url = app_client
+    make, db_url = api
+    client = make("wang")
     xlsx = build_xlsx(tmp_path / "预算.xlsx", [["部门", "金额"], ["综合处", 10]])
     upload(client, xlsx, title="2025预算", classification=1)
 
@@ -5105,8 +5113,9 @@ def test_list_and_detail_hide_other_departments(app_client, tmp_path, monkeypatc
     assert detail.json()["versions"][0]["version_no"] == 1
 
 
-def test_deactivate_and_soft_delete(app_client, tmp_path):
-    client, db_url = app_client
+def test_deactivate_and_soft_delete(api, tmp_path):
+    make, db_url = api
+    client = make("wang")
     xlsx = build_xlsx(tmp_path / "预算.xlsx", [["部门", "金额"], ["综合处", 10]])
     body = upload(client, xlsx, classification=1).json()
     doc_id, version_id = body["document_id"], body["version_id"]
@@ -5137,10 +5146,9 @@ def test_deactivate_and_soft_delete(app_client, tmp_path):
     assert purge[0]["payload"]["document_id"] == doc_id
 
 
-def test_delete_requires_admin(app_client, tmp_path):
-    from app import server
-
-    client, db_url = app_client
+def test_delete_requires_admin(api, tmp_path):
+    make, db_url = api
+    client = make("wang")
     xlsx = build_xlsx(tmp_path / "预算.xlsx", [["部门", "金额"], ["综合处", 10]])
     doc_id = upload(client, xlsx).json()["document_id"]
 
@@ -5664,6 +5672,1071 @@ git add app/deps.py app/users.py app/server.py app/routers/__init__.py \
   app/routers/documents.py ingest/errors.py ingest/upload_service.py \
   ingest/activation.py tests/ingest/conftest.py tests/ingest/test_documents_api.py
 git commit -m "feat(api): 文档上传、列表、详情、下线与软删除"
+```
+
+---
+
+### Task 15: 复核 API（结构确认、秘密级双人、waive、模板）
+
+**Files:**
+- Create: `app/routers/review.py`、`app/routers/templates.py`、`ingest/review_service.py`、`tests/ingest/test_review_api.py`
+- Modify: `app/server.py`（挂载两个 router）
+
+**Interfaces:**
+- Consumes: `ingest.repository`、`ingest.ir.DocModel`、`ingest.parsers.table_build.rebuild_table`、`ingest.parsers.templates.normalize_header_name`、`ingest.queue.enqueue`、`ingest.storage.FileStore`、`app.deps`。
+- Produces:
+  - `ingest.review_service.load_version_for_review(conn, version_id, user, *, write=False) -> tuple[dict, dict]`（version, document）。
+  - `ingest.review_service.summary(conn, version_id, user) -> dict`。
+  - `ingest.review_service.confirm(conn, version_id, payload, *, user, settings=None) -> dict`。
+  - `ingest.review_service.approve(conn, version_id, *, user) -> dict`。
+  - `ingest.review_service.waive(conn, version_id, *, reason, item_id=None, user) -> dict`。
+  - `ingest.review_service.save_template(conn, version_id, *, table_key, name, scope_dept, user) -> dict`。
+  - HTTP：`GET /api/versions/{id}/review`、`GET /api/versions/{id}/preview`、`POST /api/versions/{id}/confirm`、`POST /api/versions/{id}/approve`、`POST /api/versions/{id}/waive`、`GET|POST /api/templates`。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_review_api.py`：
+
+```python
+from __future__ import annotations
+
+import psycopg
+from psycopg.rows import dict_row
+
+from ingest import repository as repo
+from ingest.ir import Block, Column, DocMeta, DocModel, ParserInfo, Table, Warning
+from tests.ingest.conftest import fetch_all
+
+
+def build_ir() -> DocModel:
+    table = Table(
+        table_key="t1", sheet="2025预算", range="A1:B4",
+        header_rows=[2], header_values=[["部门", "预算"]],
+        pre_rows=[["2025年部门预算表", ""]],
+        columns=[Column(key="c1", name="部门"), Column(key="c2", name="预算")],
+        rows=[["综合处", "100"], ["人事处", "90"]],
+        confidence=0.6, source="heuristic",
+        candidates=[{"start_row": 2, "depth": 1, "confidence": 0.6}],
+        flags=["merged_cells"],
+    )
+    return DocModel(
+        parser=ParserInfo(name="xlsx", version="0.1.0"),
+        meta=DocMeta(title="2025年部门预算表", source_filename="预算.xlsx",
+                     sha256="b" * 64),
+        blocks=[Block(block_id="b1", type="table", table=table)],
+        warnings=[Warning("merged_cells", None, "1 个合并区间")],
+    )
+
+
+def seed(db_url: str, *, classification: int | None = 1,
+         structure: bool = True) -> tuple[str, str]:
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        doc = repo.create_document(conn, title="2025年部门预算表", dept="财务处",
+                                   classification=classification,
+                                   effective_date=None, created_by="wang")
+        version = repo.create_version(
+            conn, document_id=doc["id"], version_no=1, sha256="b" * 64,
+            filename="预算.xlsx", mime="application/octet-stream", size_bytes=10,
+            storage_path="bb/" + "b" * 64, parser="xlsx", parser_version="0.1.0")
+        repo.set_version_status(conn, version["id"], "needs_review", ir=build_ir(),
+                                warnings=[{"code": "merged_cells", "detail": "1 个合并区间"}])
+        if structure:
+            repo.ensure_review_item(conn, version["id"], "structure",
+                                    {"reason": "structure", "tables": []})
+        if classification is None:
+            repo.ensure_review_item(conn, version["id"], "classification",
+                                    {"reason": "unclassified"})
+        elif classification == 2:
+            repo.ensure_review_item(conn, version["id"], "classification",
+                                    {"reason": "secret_two_person"})
+        conn.commit()
+        return doc["id"], version["id"]
+
+
+def test_review_summary_and_preview(api):
+    make, db_url = api
+    doc_id, version_id = seed(db_url)
+    client = make("wang")
+
+    summary = client.get(f"/api/versions/{version_id}/review")
+    assert summary.status_code == 200, summary.text
+    body = summary.json()
+    assert body["document"]["id"] == doc_id
+    assert body["tables"][0]["table_key"] == "t1"
+    assert body["tables"][0]["header_rows"] == [2]
+    assert [c["name"] for c in body["tables"][0]["columns"]] == ["部门", "预算"]
+    assert len(body["open_items"]) == 1
+
+    preview = client.get(f"/api/versions/{version_id}/preview")
+    assert preview.status_code == 200
+    assert preview.json()["kind"] == "xlsx"
+    assert preview.json()["tables"][0]["grid"][0][0] == "2025年部门预算表"
+
+
+def test_confirm_rebuilds_header_and_enqueues_embed(api):
+    make, db_url = api
+    _, version_id = seed(db_url)
+    client = make("wang")
+
+    resp = client.post(f"/api/versions/{version_id}/confirm", json={
+        "tables": [{
+            "table_key": "t1",
+            "header_rows": [1, 2],
+            "columns": [{"key": "c1", "name": "部门"}, {"key": "c2", "name": "预算"}],
+        }],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "embedding"
+
+    version = fetch_all(db_url, "SELECT status, ir FROM doc_versions")[0]
+    assert version["status"] == "embedding"
+    table = version["ir"]["blocks"][0]["table"]
+    assert table["header_rows"] == [1, 2]
+    assert table["header_values"] == [["2025年部门预算表", ""], ["部门", "预算"]]
+    assert table["rows"] == [["综合处", "100"], ["人事处", "90"]]
+    assert table["source"] == "human" and table["confidence"] == 1.0
+    assert fetch_all(db_url, "SELECT status FROM review_items")[0]["status"] == "resolved"
+    assert [j["kind"] for j in fetch_all(db_url, "SELECT kind FROM jobs")] == ["embed"]
+
+
+def test_confirm_sets_unclassified_document_level(api):
+    make, db_url = api
+    _, version_id = seed(db_url, classification=None, structure=False)
+    client = make("wang")
+
+    missing = client.post(f"/api/versions/{version_id}/confirm", json={})
+    assert missing.status_code == 422
+
+    resp = client.post(f"/api/versions/{version_id}/confirm",
+                       json={"meta": {"classification": 1}})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "embedding"
+    assert fetch_all(db_url, "SELECT classification FROM documents")[0]["classification"] == 1
+    assert fetch_all(db_url, "SELECT status FROM review_items")[0]["status"] == "resolved"
+
+
+def test_secret_needs_two_distinct_approvers(api):
+    make, db_url = api
+    _, version_id = seed(db_url, classification=2, structure=False)
+    wang = make("wang")
+
+    first = wang.post(f"/api/versions/{version_id}/confirm",
+                      json={"meta": {"classification": 2}})
+    assert first.status_code == 200
+    assert first.json()["status"] == "needs_review"
+    assert first.json()["pending_approvals"] == 1
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs")[0]["n"] == 0
+
+    same_user = wang.post(f"/api/versions/{version_id}/approve",
+                          json={"decision": "approve"})
+    assert same_user.status_code == 403
+
+    chen = make("chen")
+    second = chen.post(f"/api/versions/{version_id}/approve",
+                       json={"decision": "approve"})
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "embedding"
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs WHERE kind='embed'")[0]["n"] == 1
+
+
+def test_waive_requires_reason_and_secret_cannot_waive(api):
+    make, db_url = api
+    _, version_id = seed(db_url)
+    client = make("wang")
+
+    missing = client.post(f"/api/versions/{version_id}/waive", json={})
+    assert missing.status_code == 400
+
+    ok = client.post(f"/api/versions/{version_id}/waive",
+                     json={"reason": "版式特殊，已人工逐行核对"})
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "embedding"
+    assert fetch_all(db_url, "SELECT status FROM review_items")[0]["status"] == "waived"
+
+    _, secret_version = seed(db_url, classification=2, structure=False)
+    denied = client.post(f"/api/versions/{secret_version}/waive",
+                         json={"reason": "想跳过"})
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "forbidden"
+
+
+def test_template_create_list_and_scope(api):
+    make, db_url = api
+    _, version_id = seed(db_url)
+    client = make("wang")
+
+    created = client.post("/api/templates", json={
+        "version_id": version_id, "table_key": "t1", "name": "部门预算表模板",
+    })
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["scope_dept"] == "财务处"
+    assert body["signature"]["ncols"] == 2
+    assert body["signature"]["header_depth"] == 1
+    assert body["signature"]["relative_header_row"] == 1
+    assert body["signature"]["columns_norm"] == ["部门", "预算"]
+    assert body["config"]["header_rows"] == [2]
+
+    listing = client.get("/api/templates").json()["items"]
+    assert len(listing) == 1
+
+    li = make("li")
+    assert li.get("/api/templates").json()["items"] == []
+
+
+def test_review_requires_same_department_or_admin(api):
+    make, db_url = api
+    _, version_id = seed(db_url)
+
+    li = make("li")
+    assert li.get(f"/api/versions/{version_id}/review").status_code == 404
+
+    chen = make("chen")
+    assert chen.get(f"/api/versions/{version_id}/review").status_code == 200
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_review_api.py -v
+```
+
+Expected: FAIL，`No module named 'ingest.review_service'`。
+
+- [ ] **Step 3: 写实现**
+
+`ingest/review_service.py`：
+
+```python
+from __future__ import annotations
+
+import re
+
+from psycopg import Connection
+from psycopg.types.json import Jsonb
+
+from app.users import User
+from ingest import repository as repo
+from ingest.config import Settings, get_settings
+from ingest.errors import Forbidden, NotFound, ReviewRequired
+from ingest.ir import DocModel, Table
+from ingest.parsers.table_build import rebuild_table
+from ingest.parsers.templates import normalize_header_name
+from ingest.queue import enqueue
+
+
+def load_version_for_review(conn: Connection, version_id: str, user: User, *,
+                            write: bool = False) -> tuple[dict, dict]:
+    version = repo.get_version(conn, version_id)
+    if version is None:
+        raise NotFound("版本不存在")
+    doc = repo.get_document(conn, version["document_id"])
+    if doc is None or doc["deleted_at"] is not None:
+        raise NotFound("文档不存在")
+    if not {"reviewer", "admin"} & set(user.roles):
+        raise Forbidden("无复核权限")
+    if "admin" not in user.roles and doc["dept"] != user.dept:
+        raise NotFound("版本不存在")
+    if write and version["status"] not in ("needs_review", "failed"):
+        raise ReviewRequired(f"版本状态为 {version['status']}，不可复核")
+    return version, doc
+
+
+def _ir_of(version: dict) -> DocModel:
+    if not version["ir"]:
+        raise ReviewRequired("版本没有解析结果")
+    return DocModel.model_validate(version["ir"])
+
+
+def summary(conn: Connection, version_id: str, user: User) -> dict:
+    version, doc = load_version_for_review(conn, version_id, user)
+    ir = DocModel.model_validate(version["ir"]) if version["ir"] else None
+    tables = []
+    if ir is not None:
+        for table in ir.tables():
+            tables.append({
+                "table_key": table.table_key, "sheet": table.sheet,
+                "range": table.range, "header_rows": table.header_rows,
+                "header_values": table.header_values,
+                "columns": [c.model_dump() for c in table.columns],
+                "footer_rows": table.footer_rows, "confidence": table.confidence,
+                "source": table.source, "flags": table.flags,
+                "candidates": table.candidates[:3],
+                "grid": table.full_grid()[:30],
+            })
+    text = [b.text for b in (ir.blocks if ir else [])
+            if b.type in ("heading", "paragraph") and b.text]
+    return {
+        "version_id": version_id, "status": version["status"],
+        "document": doc, "parser": version["parser"],
+        "warnings": version["warnings"], "tables": tables,
+        "text_preview": text[:50],
+        "open_items": repo.list_open_review_items(conn, version_id),
+    }
+
+
+def _apply_table_patches(ir: DocModel, tables: list, settings: Settings) -> None:
+    patches = {patch.table_key: patch for patch in tables}
+    for block in ir.blocks:
+        table = block.table
+        if table is None or table.table_key not in patches:
+            continue
+        patch = patches[table.table_key]
+        rebuilt, _ = rebuild_table(
+            table, patch.header_rows,
+            [c.model_dump() for c in patch.columns], settings=settings,
+        )
+        if patch.footer_rows:
+            rebuilt = rebuilt.model_copy(
+                update={"footer_rows": sorted(set(patch.footer_rows))})
+        block.table = rebuilt
+
+
+def _resolve_open(conn: Connection, version_id: str, kinds: set[str],
+                  user: User) -> None:
+    for item in repo.list_open_review_items(conn, version_id):
+        if item["kind"] in kinds:
+            repo.resolve_review_item(conn, item["id"], resolved_by=user.username)
+
+
+def _start_embedding(conn: Connection, version_id: str, ir: DocModel,
+                     warnings: list, user: User) -> None:
+    repo.set_version_status(conn, version_id, "embedding", ir=ir, warnings=warnings)
+    enqueue(conn, "embed", {"version_id": version_id}, priority=50)
+
+
+def confirm(conn: Connection, version_id: str, payload, *, user: User,
+            settings: Settings | None = None) -> dict:
+    settings = settings or get_settings()
+    version, doc = load_version_for_review(conn, version_id, user, write=True)
+    ir = _ir_of(version)
+    _apply_table_patches(ir, payload.tables, settings)
+    ir = DocModel.model_validate(ir.model_dump(mode="json"))
+
+    updates: dict = {}
+    meta = payload.meta
+    if meta.title:
+        updates["title"] = meta.title
+    if meta.dept:
+        if "admin" not in user.roles and meta.dept != user.dept:
+            raise Forbidden("只能复核本部门文档")
+        updates["dept"] = meta.dept
+    if meta.classification is not None:
+        if meta.classification > user.max_level:
+            raise Forbidden("密级超过你的权限")
+        updates["classification"] = meta.classification
+    if meta.effective_date:
+        updates["effective_date"] = meta.effective_date
+    if updates:
+        repo.set_document_meta(conn, doc["id"], **updates)
+    doc = repo.get_document(conn, doc["id"])
+    if doc["classification"] is None:
+        raise ReviewRequired("必须先设置密级才能激活")
+
+    _resolve_open(conn, version_id, {"structure", "parse_warning"}, user)
+
+    if payload.apply_template and payload.tables:
+        table = payload.tables[0]
+        save_template(conn, version_id, table_key=table.table_key,
+                      name=f"{doc['title']}-{table.table_key}",
+                      scope_dept=doc["dept"], user=user, _commit=False)
+
+    if doc["classification"] == 2:
+        items = [i for i in repo.list_open_review_items(conn, version_id)
+                 if i["kind"] == "classification"]
+        item_id = items[0]["id"] if items else repo.ensure_review_item(
+            conn, version_id, "classification", {"reason": "secret_two_person"})
+        repo.add_approval(conn, item_id, user.username)
+        approvals = repo.count_approvals(conn, item_id)
+        if approvals < 2:
+            repo.set_version_status(conn, version_id, "needs_review", ir=ir,
+                                    warnings=version["warnings"])
+            conn.commit()
+            return {"version_id": version_id, "status": "needs_review",
+                    "pending_approvals": approvals, "open_items": 1}
+        repo.resolve_review_item(conn, item_id, resolved_by=user.username)
+    else:
+        _resolve_open(conn, version_id, {"classification"}, user)
+
+    items = repo.list_open_review_items(conn, version_id)
+    if items:
+        repo.set_version_status(conn, version_id, "needs_review", ir=ir,
+                                warnings=version["warnings"])
+        conn.commit()
+        return {"version_id": version_id, "status": "needs_review",
+                "pending_approvals": 0, "open_items": len(items)}
+    _start_embedding(conn, version_id, ir, version["warnings"], user)
+    return {"version_id": version_id, "status": "embedding",
+            "pending_approvals": 0, "open_items": 0}
+
+
+def approve(conn: Connection, version_id: str, *, user: User) -> dict:
+    version, doc = load_version_for_review(conn, version_id, user, write=True)
+    if doc["classification"] != 2:
+        raise ReviewRequired("只有秘密级需要二次确认")
+    if user.max_level < 2:
+        raise Forbidden("无秘密级确认权限")
+    items = [i for i in repo.list_open_review_items(conn, version_id)
+             if i["kind"] == "classification"]
+    if not items:
+        raise ReviewRequired("没有待确认的密级复核项")
+    item_id = items[0]["id"]
+    if not repo.add_approval(conn, item_id, user.username):
+        raise Forbidden("同一用户不能重复确认")
+    approvals = repo.count_approvals(conn, item_id)
+    if approvals < 2:
+        conn.commit()
+        return {"version_id": version_id, "status": "needs_review",
+                "pending_approvals": approvals}
+    repo.resolve_review_item(conn, item_id, resolved_by=user.username)
+
+    remaining = repo.list_open_review_items(conn, version_id)
+    if remaining:
+        conn.commit()
+        return {"version_id": version_id, "status": "needs_review",
+                "pending_approvals": approvals, "open_items": len(remaining)}
+    ir = _ir_of(version)
+    _start_embedding(conn, version_id, ir, version["warnings"], user)
+    return {"version_id": version_id, "status": "embedding",
+            "pending_approvals": approvals, "open_items": 0}
+
+
+def waive(conn: Connection, version_id: str, *, reason: str,
+          item_id: int | None = None, user: User) -> dict:
+    if not reason.strip():
+        raise ReviewRequired("waive 必须填写理由")
+    version, doc = load_version_for_review(conn, version_id, user, write=True)
+    if doc["classification"] == 2:
+        raise Forbidden("秘密级不可 waive")
+    items = repo.list_open_review_items(conn, version_id)
+    targets = [i for i in items if item_id is None or i["id"] == item_id]
+    if not targets:
+        raise NotFound("复核项不存在")
+    for item in targets:
+        if item["kind"] == "classification":
+            raise ReviewRequired("密级复核不可 waive")
+        repo.resolve_review_item(conn, item["id"], status="waived",
+                                 resolved_by=user.username, note=reason)
+    remaining = repo.list_open_review_items(conn, version_id)
+    if remaining:
+        conn.commit()
+        return {"version_id": version_id, "status": "needs_review",
+                "open_items": len(remaining)}
+    ir = _ir_of(version)
+    _start_embedding(conn, version_id, ir, version["warnings"], user)
+    return {"version_id": version_id, "status": "embedding", "open_items": 0}
+
+
+def _signature_of(table: Table) -> dict:
+    return {
+        "ncols": len(table.columns),
+        "header_depth": len(table.header_rows),
+        "relative_header_row": (table.header_rows[0] - table.range_start_row
+                                if table.header_rows else 0),
+        "columns_norm": [normalize_header_name(c.name) for c in table.columns],
+        "sheet_pattern": f"^{re.escape(table.sheet)}$" if table.sheet else None,
+    }
+
+
+def save_template(conn: Connection, version_id: str, *, table_key: str,
+                  name: str, scope_dept: str | None, user: User,
+                  _commit: bool = True) -> dict:
+    version, doc = load_version_for_review(conn, version_id, user)
+    if "admin" not in user.roles:
+        if scope_dept and scope_dept != user.dept:
+            raise Forbidden("只有管理员可以创建跨部门模板")
+        scope_dept = user.dept
+    ir = _ir_of(version)
+    table = next((t for t in ir.tables() if t.table_key == table_key), None)
+    if table is None:
+        raise NotFound("表格不存在")
+    config = {
+        "header_rows": table.header_rows,
+        "columns": [c.model_dump() for c in table.columns],
+        "footer_rows": table.footer_rows,
+    }
+    row = conn.execute(
+        """INSERT INTO layout_templates (name, scope_dept, signature, config, created_by)
+           VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+        (name, scope_dept, Jsonb(_signature_of(table)), Jsonb(config), user.username),
+    ).fetchone()
+    if _commit:
+        conn.commit()
+    return dict(row)
+```
+
+`app/routers/review.py`：
+
+```python
+from __future__ import annotations
+
+from datetime import date
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from psycopg import Connection
+from pydantic import BaseModel, Field
+
+from app.deps import audit_event, current_user, get_db
+from app.users import User
+from ingest.config import get_settings
+from ingest.errors import NotFound
+from ingest.review_service import (
+    approve, confirm, load_version_for_review, summary, waive,
+)
+from ingest.storage import FileStore
+
+router = APIRouter(prefix="/api/versions", tags=["review"])
+
+
+class ColumnPatch(BaseModel):
+    key: str | None = None
+    name: str
+    dtype: Literal["string", "number", "date", "bool"] = "string"
+    unit: str | None = None
+
+
+class TablePatch(BaseModel):
+    table_key: str
+    header_rows: list[int]
+    columns: list[ColumnPatch]
+    footer_rows: list[int] = Field(default_factory=list)
+
+
+class MetaPatch(BaseModel):
+    title: str | None = None
+    dept: str | None = None
+    classification: int | None = Field(None, ge=0, le=2)
+    effective_date: date | None = None
+
+
+class ConfirmPayload(BaseModel):
+    tables: list[TablePatch] = Field(default_factory=list)
+    meta: MetaPatch = Field(default_factory=MetaPatch)
+    apply_template: bool = False
+
+
+class ApprovePayload(BaseModel):
+    decision: Literal["approve"] = "approve"
+
+
+class WaivePayload(BaseModel):
+    reason: str = ""
+    review_item_id: int | None = None
+
+
+@router.get("/{version_id}/review")
+def review_summary(version_id: str, user: User = Depends(current_user),
+                   conn: Connection = Depends(get_db)) -> dict:
+    return summary(conn, version_id, user)
+
+
+@router.get("/{version_id}/preview")
+def preview(version_id: str, page: int | None = Query(None, ge=1),
+            user: User = Depends(current_user),
+            conn: Connection = Depends(get_db)):
+    version, _ = load_version_for_review(conn, version_id, user)
+    if version["parser"] == "pdf" and page:
+        import fitz
+
+        settings = get_settings()
+        path = FileStore(settings.upload_dir).resolve(version["storage_path"])
+        if not path.exists():
+            raise NotFound("原件不存在")
+        with fitz.open(path) as pdf:
+            if page > len(pdf):
+                raise HTTPException(status_code=404, detail="页码超出范围")
+            pix = pdf[page - 1].get_pixmap(dpi=120)
+            return Response(content=pix.tobytes("png"), media_type="image/png")
+    data = summary(conn, version_id, user)
+    return {"kind": version["parser"], "text": data["text_preview"],
+            "tables": [{"table_key": t["table_key"], "sheet": t["sheet"],
+                        "range": t["range"], "grid": t["grid"]}
+                       for t in data["tables"]]}
+
+
+@router.post("/{version_id}/confirm")
+def confirm_version(version_id: str, payload: ConfirmPayload, request: Request,
+                    user: User = Depends(current_user),
+                    conn: Connection = Depends(get_db)) -> dict:
+    result = confirm(conn, version_id, payload, user=user)
+    audit_event(request, user, "review_submit", version_id=version_id,
+                detail={"status": result["status"],
+                        "pending_approvals": result.get("pending_approvals", 0)})
+    return result
+
+
+@router.post("/{version_id}/approve")
+def approve_version(version_id: str, payload: ApprovePayload, request: Request,
+                    user: User = Depends(current_user),
+                    conn: Connection = Depends(get_db)) -> dict:
+    result = approve(conn, version_id, user=user)
+    audit_event(request, user, "review_approve", version_id=version_id,
+                detail={"status": result["status"]})
+    return result
+
+
+@router.post("/{version_id}/waive")
+def waive_version(version_id: str, payload: WaivePayload, request: Request,
+                  user: User = Depends(current_user),
+                  conn: Connection = Depends(get_db)) -> dict:
+    if not payload.reason.strip():
+        raise HTTPException(status_code=400, detail="waive 必须填写理由")
+    result = waive(conn, version_id, reason=payload.reason,
+                   item_id=payload.review_item_id, user=user)
+    audit_event(request, user, "review_waive", version_id=version_id,
+                detail={"reason": payload.reason, "item_id": payload.review_item_id})
+    return result
+```
+
+`app/routers/templates.py`：
+
+```python
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Request
+from psycopg import Connection
+from pydantic import BaseModel
+
+from app.deps import audit_event, current_user, get_db, require_roles
+from app.users import User
+from ingest.review_service import save_template
+from ingest import repository as repo
+
+router = APIRouter(prefix="/api/templates", tags=["templates"])
+
+
+class TemplatePayload(BaseModel):
+    version_id: str
+    table_key: str
+    name: str
+    scope_dept: str | None = None
+
+
+@router.get("")
+def list_templates(user: User = Depends(current_user),
+                   conn: Connection = Depends(get_db)) -> dict:
+    if "admin" in user.roles:
+        rows = conn.execute(
+            "SELECT * FROM layout_templates ORDER BY updated_at DESC").fetchall()
+    else:
+        rows = repo.list_templates(conn, user.dept)
+    return {"items": [dict(row) for row in rows]}
+
+
+@router.post("", status_code=201)
+def create_template(payload: TemplatePayload, request: Request,
+                    user: User = Depends(current_user),
+                    conn: Connection = Depends(get_db)) -> dict:
+    require_roles(user, "reviewer", "admin")
+    row = save_template(conn, payload.version_id, table_key=payload.table_key,
+                        name=payload.name, scope_dept=payload.scope_dept, user=user)
+    audit_event(request, user, "template_create", version_id=payload.version_id,
+                detail={"table_key": payload.table_key, "name": payload.name})
+    return row
+```
+
+`app/server.py` 末尾追加：
+
+```python
+from app.routers import review as review_api, templates as templates_api
+
+app.include_router(review_api.router)
+app.include_router(templates_api.router)
+```
+
+> `save_template` 在 `confirm(apply_template=True)` 里以 `_commit=False` 调用，模板写入与版本状态在同一事务中提交。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_review_api.py -v
+```
+
+Expected: 7 passed。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/routers/review.py app/routers/templates.py app/server.py \
+  ingest/review_service.py tests/ingest/test_review_api.py
+git commit -m "feat(api): 复核台接口、秘密级双人确认与版式模板"
+```
+
+---
+
+### Task 16: 任务查询、健康检查、引用回源
+
+**Files:**
+- Create: `app/routers/jobs.py`、`app/routers/source.py`、`tests/ingest/test_jobs_source_api.py`
+- Modify: `app/server.py`（`/api/health` 增加 DB/队列/模型字段；挂载两个 router）
+
+**Interfaces:**
+- Consumes: `ingest.repository`、`ingest.db.connection`、`ingest.queue.queue_depth`、`app.users.can_view`。
+- Produces:
+  - HTTP：`GET /api/jobs/{id}`、`GET /api/jobs/{id}/events`（SSE，事件 `job.progress` / `job.done` / `job.failed`）、`GET /api/chunks/{chunk_id}/source`；`/api/health` 增补 `db`、`queue_depth`、`embed_model`。
+  - `chunk_id` 必须匹配 `^[0-9a-f-]{36}@v\d+#\d+$`；回源前重查文档可见性、版本与切片 `active`、`documents.status='active'`。
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/ingest/test_jobs_source_api.py`：
+
+```python
+from __future__ import annotations
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from ingest import repository as repo
+from ingest.queue import enqueue
+from tests.ingest.conftest import fetch_all
+
+
+def seed_version(db_url: str, *, dept: str = "财务处",
+                 classification: int | None = 1) -> tuple[str, str]:
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        doc = repo.create_document(conn, title="预算", dept=dept,
+                                   classification=classification,
+                                   effective_date=None, created_by="wang")
+        version = repo.create_version(
+            conn, document_id=doc["id"], version_no=2, sha256="c" * 64,
+            filename="预算.xlsx", mime="application/octet-stream", size_bytes=10,
+            storage_path="cc/" + "c" * 64, parser="xlsx", parser_version="0.1.0")
+        conn.commit()
+        return doc["id"], version["id"]
+
+
+def seed_chunk(db_url: str, doc_id: str, version_id: str, *,
+               classification: int = 1, active: bool = True) -> str:
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        conn.execute(
+            """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type, content,
+                   content_tokens, embed_model, dept, classification, metadata,
+                   chunk_hash, active)
+               VALUES (%s, %s, 7, 'table_rows', '第 3-4 行：综合处 100',
+                       '第 3-4 行 综合处 100', 'bge-m3', '财务处', %s, %s, %s, %s)""",
+            (doc_id, version_id, classification,
+             {"chunk_type": "table_rows", "sheet": "2025预算",
+              "cell_range": "A3:B4", "row_range": "3-4"},
+             "d" * 64, active),
+        )
+        conn.execute("UPDATE documents SET status='active', current_version_id=%s WHERE id=%s",
+                     (version_id, doc_id))
+        conn.commit()
+    return f"{doc_id}@v2#7"
+
+
+def test_job_status_and_sse(api):
+    make, db_url = api
+    _, version_id = seed_version(db_url)
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        job_id = enqueue(conn, "parse", {"version_id": version_id}, priority=50)
+    client = make("wang")
+
+    status = client.get(f"/api/jobs/{job_id}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "queued"
+
+    events = client.get(f"/api/jobs/{job_id}/events")
+    assert events.status_code == 200
+    assert "job.progress" in events.text
+    assert '"status": "queued"' in events.text
+
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        conn.execute("UPDATE jobs SET status='done', finished_at=now() WHERE id=%s", (job_id,))
+        conn.commit()
+    done = client.get(f"/api/jobs/{job_id}/events")
+    assert "event: job.done" in done.text
+
+
+def test_job_visibility_is_department_scoped(api):
+    make, db_url = api
+    _, version_id = seed_version(db_url)
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        job_id = enqueue(conn, "parse", {"version_id": version_id}, priority=50)
+
+    li = make("li")
+    assert li.get(f"/api/jobs/{job_id}").status_code == 404
+    chen = make("chen")
+    assert chen.get(f"/api/jobs/{job_id}").status_code == 200
+
+
+def test_chunk_source_returns_locator_and_rechecks_acl(api):
+    make, db_url = api
+    doc_id, version_id = seed_version(db_url)
+    chunk_id = seed_chunk(db_url, doc_id, version_id)
+
+    wang = make("wang")
+    resp = wang.get(f"/api/chunks/{chunk_id}/source")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["locator"]["sheet"] == "2025预算"
+    assert body["locator"]["cell_range"] == "A3:B4"
+    assert body["filename"] == "预算.xlsx"
+
+    zhang = make("zhang")  # 综合处：内部级不可见
+    assert zhang.get(f"/api/chunks/{chunk_id}/source").status_code == 404
+    assert wang.get("/api/chunks/not-a-chunk-id/source").status_code == 404
+
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        conn.execute("UPDATE chunks SET active=false")
+        conn.commit()
+    assert wang.get(f"/api/chunks/{chunk_id}/source").status_code == 404
+
+
+def test_public_chunk_is_visible_cross_department(api):
+    make, db_url = api
+    doc_id, version_id = seed_version(db_url, classification=0)
+    chunk_id = seed_chunk(db_url, doc_id, version_id, classification=0)
+
+    zhang = make("zhang")
+    assert zhang.get(f"/api/chunks/{chunk_id}/source").status_code == 200
+
+
+def test_health_reports_db_and_queue(api, monkeypatch):
+    make, db_url = api
+    client = make("wang")
+    from app import server
+
+    class _Service:
+        def stats(self):
+            return {"docs": 0, "chunks": 0}
+
+    monkeypatch.setattr(server, "_service", _Service())
+    monkeypatch.setattr(server, "_service_error", None)
+    resp = client.get("/api/health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["db"] == "ok"
+    assert body["queue_depth"] == 0
+    assert body["embed_model"]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_jobs_source_api.py -v
+```
+
+Expected: FAIL，`No module named 'app.routers.jobs'`。
+
+- [ ] **Step 3: 写实现**
+
+`app/routers/jobs.py`：
+
+```python
+from __future__ import annotations
+
+import json
+import time
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from psycopg import Connection
+
+from app.deps import current_user, get_db
+from app.users import User
+from ingest import repository as repo
+
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+def _job_document(conn: Connection, job: dict) -> dict | None:
+    payload = job["payload"] or {}
+    if payload.get("document_id"):
+        return repo.get_document(conn, payload["document_id"])
+    if payload.get("version_id"):
+        version = repo.get_version(conn, payload["version_id"])
+        if version is not None:
+            return repo.get_document(conn, version["document_id"])
+    return None
+
+
+def _can_watch(conn: Connection, job: dict, user: User) -> bool:
+    if "admin" in user.roles:
+        return True
+    doc = _job_document(conn, job)
+    return doc is not None and doc["dept"] == user.dept
+
+
+def _load_job(conn: Connection, job_id: int, user: User) -> dict:
+    job = conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
+    if job is None or not _can_watch(conn, job, user):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return job
+
+
+@router.get("/{job_id}")
+def job_status(job_id: int, user: User = Depends(current_user),
+               conn: Connection = Depends(get_db)) -> dict:
+    return dict(_load_job(conn, job_id, user))
+
+
+def _event(name: str, data: dict) -> str:
+    return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.get("/{job_id}/events")
+def job_events(job_id: int, user: User = Depends(current_user),
+               conn: Connection = Depends(get_db)) -> StreamingResponse:
+    _load_job(conn, job_id, user)
+
+    def stream():
+        from ingest.db import connection
+
+        last = None
+        for _ in range(600):  # 最多 10 分钟，超时由前端重连
+            with connection() as c:
+                job = c.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
+            if job is None:
+                yield _event("job.failed", {"job_id": job_id, "status": "missing"})
+                return
+            state = job["status"]
+            if state != last:
+                name = {"done": "job.done", "failed": "job.failed"}.get(
+                    state, "job.progress")
+                yield _event(name, {
+                    "job_id": job_id, "kind": job["kind"], "status": state,
+                    "attempts": job["attempts"], "last_error": job["last_error"],
+                })
+                last = state
+            if state in ("done", "failed"):
+                return
+            time.sleep(1.0)
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+```
+
+`app/routers/source.py`：
+
+```python
+from __future__ import annotations
+
+import re
+
+from fastapi import APIRouter, Depends, HTTPException
+from psycopg import Connection
+
+from app.deps import current_user, get_db
+from app.users import User, can_view
+from ingest import repository as repo
+
+router = APIRouter(prefix="/api/chunks", tags=["source"])
+
+CHUNK_ID = re.compile(r"^(?P<doc>[0-9a-f-]{36})@v(?P<ver>\d+)#(?P<ord>\d+)$")
+_LOCATOR_FIELDS = ("chunk_type", "sheet", "cell_range", "row_range",
+                   "page", "bbox", "heading_path", "block_id")
+
+
+@router.get("/{chunk_id}/source")
+def chunk_source(chunk_id: str, user: User = Depends(current_user),
+                 conn: Connection = Depends(get_db)) -> dict:
+    match = CHUNK_ID.match(chunk_id)
+    if match is None:
+        raise HTTPException(status_code=404, detail="切片不存在")
+    doc = repo.get_document(conn, match["doc"])
+    if doc is None or doc["deleted_at"] is not None or doc["status"] != "active":
+        raise HTTPException(status_code=404, detail="切片不存在")
+    if not can_view(user, {"classification_level": doc["classification"],
+                           "dept": doc["dept"]}):
+        raise HTTPException(status_code=404, detail="切片不存在")
+    version = conn.execute(
+        "SELECT * FROM doc_versions WHERE document_id=%s AND version_no=%s",
+        (doc["id"], int(match["ver"])),
+    ).fetchone()
+    if version is None:
+        raise HTTPException(status_code=404, detail="切片不存在")
+    chunk = conn.execute(
+        "SELECT * FROM chunks WHERE version_id=%s AND ordinal=%s",
+        (version["id"], int(match["ord"])),
+    ).fetchone()
+    if chunk is None or not chunk["active"]:
+        raise HTTPException(status_code=404, detail="切片不存在")
+    metadata = chunk["metadata"] or {}
+    locator = {key: metadata[key] for key in _LOCATOR_FIELDS
+               if metadata.get(key) is not None}
+    return {"chunk_id": chunk_id, "document_id": doc["id"],
+            "version_id": version["id"], "filename": version["filename"],
+            "content": chunk["content"], "locator": locator}
+```
+
+`app/server.py`：`health()` 替换为：
+
+```python
+@app.get("/api/health")
+def health():
+    if _service is None:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False,
+                     "error": _service_error or "服务未初始化（语料/索引尚未加载）"},
+        )
+    stats = _service.stats()
+    payload = {
+        "ok": True, "docs": stats["docs"], "chunks": stats["chunks"],
+        "max_distance": max_distance(),
+    }
+    try:
+        from ingest.config import get_settings
+
+        settings = get_settings()
+        if settings.db_url:
+            from ingest.db import connection
+            from ingest.queue import queue_depth
+
+            with connection() as conn:
+                conn.execute("SELECT 1")
+                payload["queue_depth"] = queue_depth(conn)
+            payload["db"] = "ok"
+            payload["embed_model"] = os.getenv("EMBED_MODEL", "bge-m3")
+    except Exception as exc:  # noqa: BLE001 - 探针要把依赖故障暴露为 503
+        payload["ok"] = False
+        payload["db"] = f"error: {type(exc).__name__}"
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+```
+
+文件末尾继续挂载：
+
+```python
+from app.routers import jobs as jobs_api, source as source_api
+
+app.include_router(jobs_api.router)
+app.include_router(source_api.router)
+```
+
+> 回源不复用管理台可见性：必须严格走 `can_view`（管理员也不越部门），因为引用会直接展示正文。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+INGEST_TEST_DB_URL=postgresql://rag:rag@127.0.0.1:5433/rag_test \
+  uv run pytest tests/ingest/test_jobs_source_api.py -v
+```
+
+Expected: 5 passed。
+
+- [ ] **Step 5: 回归现有测试**
+
+```bash
+uv run pytest tests/test_web.py -q
+```
+
+Expected: 既有测试全绿（FAISS 模式下 `/api/health` 不探测 DB）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add app/routers/jobs.py app/routers/source.py app/server.py \
+  tests/ingest/test_jobs_source_api.py
+git commit -m "feat(api): 任务 SSE、健康检查与引用回源"
 ```
 
 ---

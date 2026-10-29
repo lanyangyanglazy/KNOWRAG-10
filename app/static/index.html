@@ -1264,6 +1264,7 @@
         } else if (ev.type === "error") {
           view.card.classList.add("is-error");
           view.content.classList.remove("pending");
+          if (renderer) renderer.cancel();
           view.content.textContent = ev.message;
           view.meta.textContent = `请求异常 · ${nowTime()}`;
           $("stream-status").textContent = "回答失败";
@@ -1285,6 +1286,7 @@
     } catch (err) {
       view.content.classList.remove("pending");
       cancelled = true;
+      if (renderer) { if (answer) renderer.flush(); else renderer.cancel(); }
       if (err.name === "AbortError") {
         if (!answer && !gotToken) view.content.textContent = "已取消本次提问。";
         view.meta.textContent = `已停止生成 · ${nowTime()}`;
