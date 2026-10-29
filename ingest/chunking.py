@@ -56,6 +56,18 @@ def _prefix(title: str, path: list[str]) -> str:
     return " > ".join(parts)[:PREFIX_MAX]
 
 
+def _row_runs(numbers: list[int]) -> str:
+    """把升序绝对行号压成紧凑连续区间，如 `22-31、100-109`。"""
+    spans: list[tuple[int, int]] = []
+    for number in numbers:
+        if spans and number == spans[-1][1] + 1:
+            spans[-1] = (spans[-1][0], number)
+        else:
+            spans.append((number, number))
+    return "、".join(f"{low}-{high}" if low != high else str(low)
+                    for low, high in spans)
+
+
 def _split_body(text: str, limit: int, overlap: int) -> list[str]:
     text = text.strip()
     if not text:
@@ -71,7 +83,8 @@ def _split_body(text: str, limit: int, overlap: int) -> list[str]:
     pieces = [piece.strip() for piece in splitter.split_text(text) if piece.strip()]
     merged: list[str] = []
     for piece in pieces:
-        if merged and len(piece) < MIN_CHUNK_CHARS:
+        if (merged and len(piece) < MIN_CHUNK_CHARS
+                and len(merged[-1]) + 1 + len(piece) <= limit):
             merged[-1] = f"{merged[-1]}\n{piece}"
         else:
             merged.append(piece)
@@ -117,7 +130,10 @@ class _Builder:
 
     def emit_text(self, body: str, path: list[str]) -> None:
         prefix = _prefix(self.title, path)
-        limit = max(60, self.settings.chunk_size - len(prefix) - 1 - MIN_CHUNK_CHARS)
+        chunk_size = self.settings.chunk_size
+        if chunk_size < len(prefix) + 2:
+            prefix = prefix[:max(0, chunk_size - 2)]
+        limit = max(1, chunk_size - len(prefix) - 1)
         for piece in _split_body(body, limit, self.settings.chunk_overlap):
             self.add("text", f"{prefix}\n{piece}", {
                 "heading_path": list(path),
@@ -131,20 +147,23 @@ class _Builder:
                 "bbox": None,
             })
 
-    def emit_table(self, table: Table, path: list[str], block_id: str) -> None:
+    def emit_table(self, table: Table, path: list[str], block_id: str,
+                   lead: str = "") -> None:
         prefix = _prefix(self.title, path)
         pairs = self._data_pairs(table)
-        self.add("table_summary", self._summary(table, prefix, pairs),
+        self.add("table_summary", self._summary(table, prefix, pairs, lead),
                  self._table_meta(table, path, block_id))
         if not pairs:
             return
         selected = self._select_pairs(pairs)
-        sampled = len(selected) < len(pairs)
+        sampled = ({row for row, _ in selected}
+                   != {row for row, _ in pairs})
         for group in self._column_groups(table):
             for window in self._windows(selected):
+                runs = _row_runs([row for row, _ in window])
                 metadata = self._table_meta(table, path, block_id)
                 metadata.update({
-                    "row_range": f"{window[0][0]}-{window[-1][0]}",
+                    "row_range": runs,
                     "col_group": group["label"],
                 })
                 if sampled:
@@ -154,7 +173,7 @@ class _Builder:
                        if index < len(row)):
                     metadata["truncated"] = True
                 self.add("table_rows",
-                         self._window_content(table, prefix, group, window),
+                         self._window_content(table, prefix, group, window, runs),
                          metadata)
 
     def _table_meta(self, table: Table, path: list[str], block_id: str) -> dict:
@@ -172,20 +191,24 @@ class _Builder:
 
     def _data_pairs(self, table: Table) -> list[tuple[int, list[str]]]:
         start = table.data_start_row
-        footer = set(table.footer_rows)
+        excluded = set(table.footer_rows) | set(table.repeated_header_rows)
         return [(start + offset, row) for offset, row in enumerate(table.rows)
-                if start + offset not in footer]
+                if start + offset not in excluded]
 
     def _select_pairs(self, pairs: list[tuple[int, list[str]]]) -> list[tuple[int, list[str]]]:
         if len(pairs) <= self.settings.max_rows_per_table:
             return pairs
+        if len(pairs) <= SAMPLE_HEAD + SAMPLE_TAIL:
+            return pairs
         head = pairs[:SAMPLE_HEAD]
         tail = pairs[-SAMPLE_TAIL:]
         middle = pairs[SAMPLE_HEAD:len(pairs) - SAMPLE_TAIL]
-        if not middle:
-            return head + tail
         step = max(1, len(middle) // SAMPLE_MIDDLE)
-        return head + middle[::step][:SAMPLE_MIDDLE] + tail
+        chosen = (
+            {row for row, _ in head}
+            | {row for row, _ in middle[::step][:SAMPLE_MIDDLE]}
+            | {row for row, _ in tail})
+        return [pair for pair in pairs if pair[0] in chosen]
 
     def _windows(self, pairs: list[tuple[int, list[str]]]):
         size = max(1, self.settings.table_rows_per_chunk)
@@ -208,27 +231,30 @@ class _Builder:
         return groups
 
     def _summary(self, table: Table, prefix: str,
-                 pairs: list[tuple[int, list[str]]]) -> str:
+                 pairs: list[tuple[int, list[str]]], lead: str = "") -> str:
         sheet = table.sheet or "工作表"
-        lines = [
-            prefix,
+        lines = [prefix]
+        if lead.strip():
+            lines.append(lead.strip())
+        lines.append(
             f"文档《{self.title}》工作表「{sheet}」区域 {table.range}，"
-            f"共 {len(pairs)} 行 × {len(table.columns)} 列。",
-            "列：" + " | ".join(_column_label(column) for column in table.columns),
-        ]
+            f"共 {len(pairs)} 行 × {len(table.columns)} 列。")
+        lines.append("列：" + " | ".join(
+            _column_label(column) for column in table.columns))
         footer = table.footer_values()
         if footer:
             lines.append(f"合计：{' | '.join(footer[0])}（第 {table.footer_rows[0]} 行）")
         return "\n".join(lines)
 
     def _window_content(self, table: Table, prefix: str, group: dict,
-                        window: list[tuple[int, list[str]]]) -> str:
+                        window: list[tuple[int, list[str]]],
+                        runs: str) -> str:
         indexes = group["indexes"]
         labels = [_column_label(table.columns[index]) for index in indexes]
         lines = [
             prefix,
             "列：" + " | ".join(labels),
-            f"第 {window[0][0]}–{window[-1][0]} 行：",
+            f"第 {runs} 行：",
         ]
         for _, row in window:
             cells = [row[index][:CELL_MAX] if index < len(row) else ""
@@ -279,12 +305,10 @@ def chunk_document(ir: DocModel, *, doc_id: str, version_no: int, title: str,
                 buffer.append(block.text)
         elif block.type == "table" and block.table is not None:
             flush()
-            if carry:
-                builder.emit_text(carry, section_path)
-                carry = ""
             builder.emit_table(block.table, block.path or section_path,
-                               block.block_id)
+                               block.block_id, carry)
+            carry = ""
     flush()
-    if carry and len(carry) >= MIN_CHUNK_CHARS:
+    if carry.strip():
         builder.emit_text(carry, section_path)
     return builder.drafts
