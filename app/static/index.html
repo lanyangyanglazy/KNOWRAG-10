@@ -551,7 +551,6 @@
   <div class="statusbar">
     <div class="statusbar-inner">
       <nav class="breadcrumb" aria-label="当前位置">首页 <span aria-hidden="true">/</span> 知识问答</nav>
-      <p class="system-status" id="env-info"></p>
     </div>
   </div>
 
@@ -1049,8 +1048,6 @@
     $("rail-level").innerHTML = badge(user.max_classification);
     $("mobile-identity").textContent =
       `${user.display_name} · ${user.dept} · 最高密级 ${user.max_classification} · 可见文档 ${docs.length} 篇`;
-    $("env-info").textContent =
-      `模型 ${stats.llm_model}　｜　索引 ${stats.docs} 篇 / ${stats.chunks} 切片　｜　拒答阈值 ${stats.max_distance}`;
     $("doc-count").textContent = `${docs.length} 篇`;
     $("doc-list").innerHTML = docs.length
       ? docs.map((d) => `

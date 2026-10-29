@@ -381,10 +381,14 @@ def logout(request: Request, response: Response) -> dict:
 @app.get("/api/me")
 def me(user: User = Depends(current_user)) -> dict:
     service = get_service()
+    raw = service.stats()
+    # 交付合规：不向终端用户下发密级分布、拒答阈值、模型选型与全量索引规模。
+    # 这些属运维/安全内部指标，暴露会泄露知识库边界并便于绕过拒答策略。
+    stats = {k: raw[k] for k in ("load_issues",) if k in raw}
     return {
         "user": user.to_dict(),
         "visible_docs": service.visible_docs(user),
-        "stats": service.stats(),
+        "stats": stats,
     }
 
 
@@ -412,7 +416,6 @@ def health():
         "chunks": stats["chunks"],
         "skipped_docs": len(issues),
         "skipped_files": [item["file"] for item in issues],
-        "max_distance": max_distance(),
     }
 
 

@@ -80,7 +80,7 @@ export default function App() {
     );
   }
 
-  if (!user || !stats) {
+  if (!user) {
     return <LoginView onLogin={handleLogin} message={loginMessage} />;
   }
 
@@ -88,7 +88,7 @@ export default function App() {
     <ChatView
       user={user}
       docs={docs}
-      stats={stats}
+      stats={stats ?? undefined}
       onLogout={handleLogout}
       onSessionExpired={handleSessionExpired}
     />

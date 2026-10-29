@@ -13,7 +13,7 @@ export function ChatView({
 }: {
   user: FullUser;
   docs: VisibleDoc[];
-  stats: Stats;
+  stats?: Stats;
   onLogout: () => void;
   onSessionExpired: () => void;
 }) {
@@ -67,7 +67,11 @@ export function ChatView({
           <nav className="breadcrumb" aria-label="当前位置">
             首页 <span aria-hidden="true">/</span> 知识问答
           </nav>
-          <p className="system-status">{`模型 ${stats.llm_model}　｜　索引 ${stats.docs} 篇 / ${stats.chunks} 切片　｜　拒答阈值 ${stats.max_distance}`}</p>
+          {import.meta.env.DEV && (
+            <p className="system-status">
+              开发调试模式 · 内部运行指标已在交付版脱敏（load_issues: {stats?.load_issues?.length ?? 0}）
+            </p>
+          )}
         </div>
       </div>
 

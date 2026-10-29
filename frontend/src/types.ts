@@ -21,11 +21,13 @@ export interface VisibleDoc {
 }
 
 export interface Stats {
-  llm_model: string;
-  embed_model: string;
-  docs: number;
-  chunks: number;
-  max_distance: number;
+  llm_model?: string;
+  embed_model?: string;
+  docs?: number;
+  chunks?: number;
+  max_distance?: number;
+  // 仅此字段会下发给终端用户（语料加载异常提示），其余指标已在交付版脱敏
+  load_issues?: unknown[];
 }
 
 export interface Citation {
