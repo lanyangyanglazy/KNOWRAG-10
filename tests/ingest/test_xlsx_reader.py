@@ -6,6 +6,7 @@ from openpyxl import Workbook
 
 from ingest.config import get_settings
 from ingest.parsers.xlsx_reader import has_pivot_tables, read_workbook
+from tests.ingest.builders import build_xlsx
 
 
 def test_reads_display_values_styles_and_flags(tmp_path):
@@ -82,6 +83,35 @@ def test_truncates_at_cell_limit(tmp_path):
     settings = replace(get_settings(), max_cells_per_sheet=10)
     grid = read_workbook(path, settings)
     assert grid.sheets[0].nrows * grid.sheets[0].ncols <= 10
+    assert any(w["code"] == "truncated" for w in grid.warnings)
+
+
+def test_truncation_keeps_columns_and_cuts_rows(tmp_path):
+    # 50000 行 × 10 列这类“高表”：优先截行保列，丢列会破坏 Table/切片语义
+    path = build_xlsx(tmp_path / "tall.xlsx",
+                      [[f"{r}-{c}" for c in range(1, 11)] for r in range(1, 301)])
+
+    settings = replace(get_settings(), max_cells_per_sheet=1000)
+    grid = read_workbook(path, settings)
+
+    sheet = grid.sheets[0]
+    assert sheet.ncols == 10
+    assert sheet.nrows == 100
+    assert sheet.cell(100, 10).text == "100-10"
+    assert any(w["code"] == "truncated" for w in grid.warnings)
+
+
+def test_truncation_cuts_columns_only_when_one_row_exceeds_budget(tmp_path):
+    # 单行就超预算（10 列 > 8 格）时才允许截列
+    path = build_xlsx(tmp_path / "wide.xlsx",
+                      [[f"{c}" for c in range(1, 11)]])
+
+    settings = replace(get_settings(), max_cells_per_sheet=8)
+    grid = read_workbook(path, settings)
+
+    sheet = grid.sheets[0]
+    assert sheet.nrows == 1
+    assert sheet.ncols == 8
     assert any(w["code"] == "truncated" for w in grid.warnings)
 
 

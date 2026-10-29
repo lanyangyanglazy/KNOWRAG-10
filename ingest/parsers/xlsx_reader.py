@@ -157,8 +157,12 @@ def read_workbook(path: Path, settings: Settings | None = None) -> WorkbookGrid:
                              "detail": f"{ws.title} 超过单元格上限，已跳过"})
             break
         if max_row * max_col > limit:
-            max_col = max(1, min(max_col, limit // max_row))
-            max_row = max(1, min(max_row, limit // max_col))
+            # 优先保列：行可以少读（Task 18 按行窗口切片），列一旦丢掉，
+            # 表结构（Task 9 的 Table）就不可逆地缺字段，所以先截行。
+            max_row = max(1, limit // max_col)
+            if max_row * max_col > limit:
+                # 单行都放不下时才截列（防御分支）
+                max_col = max(1, limit // max_row)
             warnings.append({"code": "truncated",
                              "detail": f"{ws.title} 超过单元格上限，已截断"})
         remaining_cells -= max_row * max_col
