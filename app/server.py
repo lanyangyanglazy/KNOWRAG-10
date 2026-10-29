@@ -292,6 +292,17 @@ def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+# 只为摄取前端暴露这两个本地资源，不挂 StaticFiles，避免把 index.html 与未来文件一并暴露
+@app.get("/static/ingest.js", include_in_schema=False)
+def ingest_js() -> FileResponse:
+    return FileResponse(STATIC_DIR / "ingest.js", media_type="application/javascript")
+
+
+@app.get("/static/ingest.css", include_in_schema=False)
+def ingest_css() -> FileResponse:
+    return FileResponse(STATIC_DIR / "ingest.css", media_type="text/css")
+
+
 @app.get("/api/users")
 def list_users() -> dict:
     """

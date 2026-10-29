@@ -1,0 +1,97 @@
+.ingest-main {
+  flex: 1; overflow: auto; padding: 20px 24px 40px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.ingest-grid {
+  display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  gap: 16px; align-items: start;
+}
+.ingest-panel {
+  background: #fff; border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px 18px;
+}
+.ingest-panel-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-bottom: 10px;
+}
+.ingest-h2 {
+  margin: 0; font-family: var(--serif); font-size: 16px;
+  font-weight: 600; letter-spacing: 1px; color: var(--blue-deep);
+}
+.ingest-form { display: flex; flex-direction: column; gap: 10px; }
+.ingest-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.ingest-field input, .ingest-field select {
+  height: 34px; padding: 0 8px; border: 1px solid var(--line-strong);
+  border-radius: var(--radius); background: #fff; color: var(--text);
+}
+.ingest-field input[type="file"] { height: auto; padding: 6px 8px; }
+.ingest-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ingest-progress { width: 100%; height: 6px; }
+.ingest-hint { margin: 0; font-size: 12px; color: var(--muted); }
+.ingest-table-wrap {
+  overflow: auto; max-height: 380px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+}
+.ingest-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ingest-table th, .ingest-table td {
+  border-bottom: 1px solid var(--line); padding: 6px 8px;
+  text-align: left; vertical-align: top;
+}
+.ingest-table thead th {
+  position: sticky; top: 0; z-index: 1; background: #f5f7fa; white-space: nowrap;
+}
+.ingest-title-cell { font-weight: 600; }
+.ingest-row-actions { display: flex; gap: 10px; white-space: nowrap; }
+.ingest-review-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+}
+.ingest-review-title {
+  margin: 0 0 4px; font-family: var(--serif); font-size: 18px; color: var(--blue-deep);
+}
+.ingest-open-items { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: var(--amber); }
+.ingest-table-card {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 10px 12px; margin-top: 12px;
+}
+.ingest-table-card-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.ingest-flag {
+  font-size: 11px; color: var(--amber); background: var(--amber-bg);
+  border: 1px solid #dfc98f; border-radius: 999px; padding: 1px 8px;
+}
+.ingest-candidates { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.ingest-candidate { font-size: 11px; }
+.ingest-grid-table tbody tr { cursor: pointer; }
+.ingest-grid-table tbody tr:hover { background: var(--blue-50); }
+.ingest-grid-table tbody tr.is-header { background: #eef4fb; }
+.ingest-pick { width: 28px; }
+.ingest-review-form {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px; margin-top: 14px;
+}
+.ingest-waive { display: inline-flex; align-items: center; gap: 8px; }
+.ingest-waive input {
+  height: 30px; padding: 0 8px; border: 1px solid var(--line-strong);
+  border-radius: var(--radius); background: #fff;
+}
+.ingest-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.ingest-source-locator { margin: 6px 0; font-size: 13px; color: var(--blue-deep); }
+.ingest-source-content {
+  margin: 8px 0 0; padding: 10px 12px; max-height: 320px; overflow: auto;
+  background: #f7f9fb; border: 1px solid var(--line); border-radius: var(--radius);
+  font-family: var(--sans); font-size: 12.5px; line-height: 1.7; white-space: pre-wrap;
+}
+.ingest-alert {
+  padding: 10px 12px; border: 1px solid #e0b2ae; border-radius: var(--radius);
+  background: var(--red-bg); color: var(--red); font-size: 13px;
+}
+.ingest-alert.ok { border-color: #a9cfae; background: var(--green-bg); color: var(--green); }
+.cite-item[data-chunk-id]:not([data-chunk-id=""]) { cursor: pointer; }
+.cite-item[data-chunk-id]:not([data-chunk-id=""]) .cite-meta::after {
+  content: " · 查看原文"; color: var(--blue);
+}
+@media (max-width: 960px) {
+  .ingest-grid { grid-template-columns: 1fr; }
+  .ingest-main { padding: 14px; }
+}
