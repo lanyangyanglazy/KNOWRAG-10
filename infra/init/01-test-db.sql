@@ -1,0 +1,1 @@
+CREATE DATABASE rag_test;

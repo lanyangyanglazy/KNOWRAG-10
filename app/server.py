@@ -21,7 +21,6 @@ import os
 import secrets
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
@@ -32,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
+from app import audit as _audit
 from app.rag_service import BASE_DIR, RagService, core, max_distance
 from app.users import DEMO_USERS, User, authenticate, get_user
 
@@ -42,10 +42,7 @@ SESSION_MAX_AGE = 8 * 3600  # 8 小时（服务端同样校验，不再只依赖
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # React 生产构建产物（frontend/dist）。存在时由本服务直接托管，否则回退到单文件原型页面。
 DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-AUDIT_FILE = BASE_DIR / "logs" / "audit.jsonl"
-
-# 审计落盘后是否 fsync：政务场景要求「写入即可靠」，默认开启；高吞吐场景可用 AUDIT_FSYNC=0 关闭。
-AUDIT_FSYNC = os.getenv("AUDIT_FSYNC", "1").strip().lower() not in {"0", "false", "no"}
+AUDIT_FILE = _audit.AUDIT_FILE
 
 # 反向代理后取 X-Forwarded-For 需要显式开启，否则客户端可伪造来源 IP。
 TRUST_PROXY = os.getenv("TRUST_PROXY", "0").strip().lower() in {"1", "true", "yes"}
@@ -111,9 +108,6 @@ def get_service() -> RagService:
 # ---------- 审计 ----------
 
 
-_AUDIT_LOCK = threading.Lock()
-
-
 def audit_ready(audit_file: Path | None = None) -> tuple[bool, str]:
     """
     审计可用性预检（fail-closed 用）。
@@ -132,26 +126,8 @@ def audit_ready(audit_file: Path | None = None) -> tuple[bool, str]:
 
 
 def write_audit(record: dict, audit_file: Path | None = None) -> None:
-    """
-    追加一行 JSON 审计日志。
-
-    - 时间带本机时区偏移（原实现是 naive 本地时间，跨时区/容器 UTC 下无法对齐业务时间）；
-    - 进程内加锁，避免多线程并发写入时行内交错；
-    - 默认 fsync，保证进程崩溃/断电后已返回的问答仍有审计。
-
-    等保 2.0 要求审计记录不可删除、留存 ≥ 6 个月（网络安全法第 21 条）。
-    本原型只做「写入」；留存、归档、防篡改、独立加密存储属于 P1。
-    """
-    target = Path(audit_file or AUDIT_FILE)
-    payload = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), **record}
-    line = json.dumps(payload, ensure_ascii=False) + "\n"
-    with _AUDIT_LOCK:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            if AUDIT_FSYNC:
-                os.fsync(f.fileno())
+    """兼容包装：审计实现已抽到 app/audit.py，供 API 与 worker 共用。"""
+    _audit.write_audit(record, audit_file or AUDIT_FILE)
 
 
 def _safe_audit(record: dict) -> None:

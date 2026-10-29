@@ -20,6 +20,15 @@ dependencies = [
     "pyyaml>=6.0.3",
     "rank-bm25>=0.2",
     "uvicorn>=0.54.0",
+    "filetype>=1.2",
+    "openpyxl>=3.1.5",
+    "pgvector>=0.3.6",
+    "psycopg[binary,pool]>=3.2",
+    "pydantic>=2.9",
+    "pymupdf>=1.26",
+    "pdfplumber>=0.11.4",
+    "python-docx>=1.1.2",
+    "python-multipart>=0.0.20",
 ]
 
 [dependency-groups]
@@ -32,3 +41,6 @@ dev = [
 # 让测试可以直接 import main / app（仓库根目录加入 sys.path）
 pythonpath = ["."]
 testpaths = ["tests"]
+# tests/ 无 __init__.py 且 tests/ingest 是包：开启后按命名空间包解析，
+# 避免 pytest 把 tests/ 插到 sys.path 首位、让 tests/ingest 顶替顶层 ingest 源包。
+consider_namespace_packages = true
