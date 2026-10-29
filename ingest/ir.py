@@ -63,8 +63,12 @@ class Table(_Strict):
     def _check(self):
         if not _A1_RANGE.match(self.range):
             raise ValueError(f"非法单元格区域: {self.range}")
-        if self.header_rows != sorted(set(self.header_rows)):
-            raise ValueError("header_rows 必须严格递增且不重复")
+        # full_grid() 的下标必须能按绝对行号映射（range 首行 + i），因此表头行必须连续；
+        # 该检查同时覆盖递增与去重，否则 data_start_row 与 full_grid 会错位。
+        if self.header_rows and self.header_rows != list(
+            range(self.header_rows[0], self.header_rows[0] + len(self.header_rows))
+        ):
+            raise ValueError("header_rows 必须是从起始行开始的连续行号")
         if len(self.header_values) != len(self.header_rows):
             raise ValueError("header_values 行数必须等于 header_rows 行数")
         expected_pre = (

@@ -53,13 +53,48 @@ def test_table_helpers():
     assert table.data_start_row == 5
     assert table.data_rows() == [["综合处", "120"], ["人事处", "98"]]
     assert table.footer_values() == [["合计", "218"]]
-    assert table.full_grid()[0] == ["", "Q1"]
+    assert table.full_grid() == [
+        ["", "Q1"],          # row 3
+        ["部门", "预算"],    # row 4
+        ["综合处", "120"],   # row 5
+        ["人事处", "98"],    # row 6
+        ["合计", "218"],     # row 7
+    ]
+
+
+def test_full_grid_maps_absolute_rows_with_pre_rows():
+    table = _model(blocks=[{"block_id": "b1", "type": "table", "table": _table(
+        header_rows=[4],
+        header_values=[["部门", "预算"]],
+        pre_rows=[["2025年部门预算", ""]],
+        rows=[["综合处", "120"], ["合计", "120"]],
+        footer_rows=[6],
+    )}]).tables()[0]
+    grid = table.full_grid()
+    start = table.range_start_row
+    assert table.data_start_row == 5
+    # full_grid() 的每个下标必须对应 range 内的绝对行号 start + i。
+    assert len(grid) == 4
+    assert [{start + i: row} for i, row in enumerate(grid)] == [
+        {3: ["2025年部门预算", ""]},
+        {4: ["部门", "预算"]},
+        {5: ["综合处", "120"]},
+        {6: ["合计", "120"]},
+    ]
+    assert table.data_rows() == [["综合处", "120"]]
+    assert table.footer_values() == [["合计", "120"]]
 
 
 def test_rejects_unsorted_header_rows():
     with pytest.raises(ValidationError):
         _model(blocks=[{"block_id": "b1", "type": "table",
                         "table": _table(header_rows=[4, 3])}])
+
+
+def test_rejects_non_contiguous_header_rows():
+    with pytest.raises(ValidationError, match="header_rows"):
+        _model(blocks=[{"block_id": "b1", "type": "table",
+                        "table": _table(header_rows=[3, 5])}])
 
 
 def test_rejects_row_width_mismatch():
