@@ -51,6 +51,10 @@ class Table(_Strict):
     columns: list[Column]
     rows: list[list[str]]
     footer_rows: list[int] = Field(default_factory=list)
+    # 正文中重复出现的表头行（绝对行号）。这些行仍保留在 rows 里，保证
+    # rows[i] ↔ data_start_row + i 的绝对行号映射不被破坏；data_rows()
+    # 在数据视图里剔除它们，footer/full_grid 因此仍与原始表格对齐。
+    repeated_header_rows: list[int] = Field(default_factory=list)
     merge_ranges: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     source: Literal["heuristic", "llm", "template", "human"]
@@ -90,6 +94,16 @@ class Table(_Strict):
                 raise ValueError("pre_rows 每行列数必须等于 columns 数")
         if set(self.header_rows) & set(self.footer_rows):
             raise ValueError("footer_rows 不能与 header_rows 重叠")
+        if self.repeated_header_rows:
+            if self.repeated_header_rows != sorted(set(self.repeated_header_rows)):
+                raise ValueError("repeated_header_rows 必须递增且不重复")
+            data_end = self.data_start_row + len(self.rows) - 1
+            if (self.repeated_header_rows[0] < self.data_start_row
+                    or self.repeated_header_rows[-1] > data_end):
+                raise ValueError("repeated_header_rows 必须落在数据区内")
+            if set(self.repeated_header_rows) & (
+                    set(self.header_rows) | set(self.footer_rows)):
+                raise ValueError("repeated_header_rows 不能与表头/表尾行重叠")
         return self
 
     @property
@@ -102,7 +116,8 @@ class Table(_Strict):
 
     def data_rows(self) -> list[list[str]]:
         start = self.data_start_row
-        return [row for i, row in enumerate(self.rows) if start + i not in self.footer_rows]
+        excluded = set(self.footer_rows) | set(self.repeated_header_rows)
+        return [row for i, row in enumerate(self.rows) if start + i not in excluded]
 
     def footer_values(self) -> list[list[str]]:
         start = self.data_start_row
