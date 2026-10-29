@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import os
+import sys
 import threading
 import time
 from typing import Callable
@@ -69,3 +72,63 @@ def run_forever(handlers: dict[str, Handler], *, worker_id: str,
                 run_job(conn, job, handlers, worker_id, dead_letter_hooks)
         finally:
             stop.set()
+
+
+def run_once(handlers: dict[str, Handler], *, worker_id: str,
+             dead_letter_hooks: dict[str, Hook] | None = None,
+             max_jobs: int = 1000) -> int:
+    """
+    消费到「此刻没有可领取的任务」为止，返回处理条数。
+
+    只领取 `run_after <= now()` 的任务：退避中的失败任务不会被 `--once` 强行提前执行，
+    这是验收时「跑完一轮」与「把失败任务立刻重跑」的区别。
+    """
+    processed = 0
+    while processed < max_jobs:
+        with connection() as conn:
+            reap_stale(conn)
+            job = claim(conn, worker_id)
+        if job is None:
+            return processed
+        stop = _start_heartbeat(job["id"], worker_id)
+        try:
+            with connection() as conn:
+                run_job(conn, job, handlers, worker_id, dead_letter_hooks)
+        finally:
+            stop.set()
+        processed += 1
+    return processed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="摄取任务 worker（一进程一循环）")
+    parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
+    parser.add_argument("--poll", type=float, default=1.0)
+    parser.add_argument("--once", action="store_true",
+                        help="队列暂时为空就退出（验收/排障用）")
+    args = parser.parse_args(argv)
+
+    # Windows 控制台默认 GBK，中文启动日志会 UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+    # 延迟导入：pipeline 会拉起解析器与嵌入依赖，参数写错时不必加载它们
+    from ingest import pipeline
+
+    if args.once:
+        count = run_once(pipeline.HANDLERS, worker_id=args.worker_id,
+                         dead_letter_hooks=pipeline.DEAD_LETTER_HOOKS)
+        print(f"worker {args.worker_id} 处理 {count} 个任务后退出")
+        return 0
+
+    print(f"worker {args.worker_id} 已启动（poll={args.poll}s）")
+    run_forever(pipeline.HANDLERS, worker_id=args.worker_id,
+                poll_seconds=args.poll,
+                dead_letter_hooks=pipeline.DEAD_LETTER_HOOKS)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -52,3 +52,28 @@ def connection() -> Iterator[Connection]:
 def migrate(conn: Connection) -> None:
     conn.execute(SCHEMA_FILE.read_text(encoding="utf-8"))
     conn.commit()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python -m ingest.db：部署第一步，幂等应用 schema。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="初始化/升级摄取库 schema（幂等）")
+    parser.parse_args(argv)
+
+    # Windows 控制台默认 GBK，中文成功提示会 UnicodeEncodeError
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+    with connection() as conn:
+        migrate(conn)
+    print("schema 已应用")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
