@@ -2,7 +2,7 @@ import zipfile
 from dataclasses import replace
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 import pytest
 from docx import Document
 
