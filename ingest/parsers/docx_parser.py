@@ -5,12 +5,13 @@
 只在 ``header_llm_enabled``（HEADER_LLM=always）时调用。Word 没有工作表名，
 模板签名的 ``sheet_name`` 固定为 None。
 
-``.doc`` 先经 LibreOffice 转成 docx 再复用同一套解析；转换失败抛
-``ParseError``，由 worker 记为 failed。
+``.doc`` 先经 LibreOffice 转成 docx 再复用同一套解析；转换失败或转换产物
+无法读取时抛 ``ParseError``，由 worker 记为 failed。
 """
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 
 from docx import Document
@@ -53,9 +54,32 @@ def _iter_blocks(doc):
             yield DocxTable(child, doc)
 
 
+def _in_textbox(element) -> bool:
+    """元素是否位于 VML 文本框内；文本框内容由调用方单独收集，避免重复。"""
+    parent = element.getparent()
+    while parent is not None:
+        if parent.tag == qn("w:txbxContent"):
+            return True
+        parent = parent.getparent()
+    return False
+
+
 def _paragraph_text(paragraph: Paragraph) -> str:
-    """段落正文 + VML 文本框文字（文本框在段落 XML 里是嵌套的 w:txbxContent）。"""
+    """段落正文 + 修订插入文字 + VML 文本框文字。
+
+    ``paragraph.text`` 只拼接直接子级 ``w:r``/``w:hyperlink``，``w:ins`` 里的
+    run 不在其中。设计 §7.2 要求接受修订并取插入后文本，因此这里补收
+    ``w:ins`` 下的 ``w:t``；已删除文本在 ``w:delText`` 里，保持排除。
+    文本框在段落 XML 里是嵌套的 ``w:txbxContent``，单独收集。
+    """
     parts = [paragraph.text.strip()]
+    inserted = "".join(
+        t.text for ins in paragraph._p.iter(qn("w:ins"))
+        for t in ins.iter(qn("w:t"))
+        if t.text and not _in_textbox(t)
+    ).strip()
+    if inserted and inserted not in parts:
+        parts.append(inserted)
     for textbox in paragraph._p.iter(qn("w:txbxContent")):
         texts = [t.text for t in textbox.iter(qn("w:t")) if t.text]
         joined = "".join(texts).strip()
@@ -80,19 +104,32 @@ def _heading_level(paragraph: Paragraph, text: str) -> int | None:
     return None
 
 
-def _table_grid(table: DocxTable) -> SheetGrid:
-    """Word 表格 → 与 XLSX 读取层同构的网格（1-based 闭区间，合并区已展开）。"""
+def _table_grid(table: DocxTable,
+                settings: Settings) -> tuple[SheetGrid, bool]:
+    """Word 表格 → 与 XLSX 读取层同构的网格（1-based 闭区间，合并区已展开）。
+
+    ``table.cell(r, c)`` 每次访问都会重建 ``Table._cells``（整表 O(n·m)），
+    逐格调用会把 n×m 的遍历放大成 O((n·m)²)。这里只取一次布局列表并按行
+    优先切片，且所有 ``_Cell`` 引用保持存活，合并区归组才能拿到稳定的 ``_tc``。
+    超过 ``max_cells_per_sheet`` 时只截行不截列（列是表结构，见 Task 5 裁决）。
+    """
     nrows = len(table.rows)
     ncols = len(table.columns)
-    cells = [[table.cell(r, c) for c in range(ncols)] for r in range(nrows)]
+    layout = table._cells
+    max_rows = (max(1, settings.max_cells_per_sheet // ncols)
+                if ncols else nrows)
+    truncated = nrows > max_rows
+    kept_rows = min(nrows, max_rows)
+    cells = [layout[r * ncols:(r + 1) * ncols] for r in range(kept_rows)]
     # 先缓存 _tc 引用再取 id：lxml 只保证代理存活期间同一节点对应同一代理，
     # 每次都用临时 cell 取 id 会让合并格算出不同 key，merge 区间就丢了。
     # python-docx 会把合并区展开到网格的每个位置（vMerge/gridSpan），
-    # 因此同一 tc 覆盖的格子在这里会收敛成同一个 box。
+    # 因此同一 tc 覆盖的格子在这里会收敛成同一个 box（截断边界处的合并区
+    # 只保留落在保留行内的部分）。
     anchors = [[cell._tc for cell in row] for row in cells]
     rows = [[Cell(text=cell.text) for cell in row] for row in cells]
     bounds: dict[int, list[int]] = {}
-    for r in range(nrows):
+    for r in range(kept_rows):
         for c in range(ncols):
             key = id(anchors[r][c])
             box = bounds.get(key)
@@ -106,7 +143,7 @@ def _table_grid(table: DocxTable) -> SheetGrid:
         for (r0, c0, r1, c1) in bounds.values() if (r0, c0) != (r1, c1)
     ]
     return SheetGrid(name="", hidden=False, rows=rows, merges=merges,
-                     styles_available=False)
+                     styles_available=False), truncated
 
 
 def _usable_templates(templates: list[dict], ncols: int) -> list[dict]:
@@ -134,7 +171,12 @@ def _header_footer_date(document) -> str | None:
     if not match:
         return None
     year, month, day = match.groups()
-    return f"{year}-{int(month):02d}-{int(day):02d}"
+    iso = f"{year}-{int(month):02d}-{int(day):02d}"
+    try:
+        date.fromisoformat(iso)
+    except ValueError:  # 如 2026-13-45：正则能匹配但不是合法日期
+        return None
+    return iso
 
 
 class DocxParser:
@@ -220,7 +262,11 @@ class DocxParser:
                 continue
 
             table_no += 1
-            grid = _table_grid(item)
+            grid, truncated = _table_grid(item, self.settings)
+            if truncated:
+                warnings.append(Warning(
+                    code="truncated",
+                    detail=f"table t{table_no} 超过单元格上限，已截断"))
             if grid.nrows < 2 or grid.ncols < 2:
                 continue
             region = Region(start_row=1, end_row=grid.nrows,
@@ -280,9 +326,9 @@ class DocParser:
 
     def __init__(self, templates: list[dict] | None = None, llm=None,
                  settings: Settings | None = None):
+        # 设置只由内层 DocxParser 持有，避免两处副本出现分叉
         self._inner = DocxParser(
             templates=templates, llm=llm, settings=settings)
-        self.settings = settings or get_settings()
 
     def supports(self, sniff) -> bool:
         return sniff.kind == "doc"
@@ -292,7 +338,10 @@ class DocParser:
             converted = convert_document(path, "docx", timeout=120)
         except ConversionError as exc:
             raise ParseError(str(exc)) from exc
-        model = self._inner.parse(converted)
+        try:
+            model = self._inner.parse(converted)
+        except Exception as exc:  # 转换产物损坏等 python-docx 失败也归为解析失败
+            raise ParseError(str(exc)) from exc
         return model.model_copy(update={
             "parser": ParserInfo(name=self.name, version=self.version),
             "meta": model.meta.model_copy(update={
