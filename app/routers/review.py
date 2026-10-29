@@ -91,8 +91,15 @@ def confirm_version(version_id: str, payload: ConfirmPayload, request: Request,
                     conn: Connection = Depends(get_db)) -> dict:
     result = confirm(conn, version_id, payload, user=user)
     audit_event(request, user, "review_submit", version_id=version_id,
+                doc_id=result["document_id"],
+                classification=result["classification"],
                 detail={"status": result["status"],
                         "pending_approvals": result.get("pending_approvals", 0)})
+    if payload.apply_template:
+        audit_event(request, user, "template_apply", version_id=version_id,
+                    doc_id=result["document_id"],
+                    classification=result["classification"],
+                    detail={"table_keys": [t.table_key for t in payload.tables]})
     return result
 
 
@@ -102,7 +109,10 @@ def approve_version(version_id: str, payload: ApprovePayload, request: Request,
                     conn: Connection = Depends(get_db)) -> dict:
     result = approve(conn, version_id, user=user)
     audit_event(request, user, "review_approve", version_id=version_id,
-                detail={"status": result["status"]})
+                doc_id=result["document_id"],
+                classification=result["classification"],
+                detail={"status": result["status"],
+                        "pending_approvals": result.get("pending_approvals", 0)})
     return result
 
 
@@ -115,5 +125,7 @@ def waive_version(version_id: str, payload: WaivePayload, request: Request,
     result = waive(conn, version_id, reason=payload.reason,
                    item_id=payload.review_item_id, user=user)
     audit_event(request, user, "review_waive", version_id=version_id,
+                doc_id=result["document_id"],
+                classification=result["classification"],
                 detail={"reason": payload.reason, "item_id": payload.review_item_id})
     return result

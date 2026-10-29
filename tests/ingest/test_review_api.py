@@ -117,6 +117,40 @@ def test_confirm_sets_unclassified_document_level(api):
     assert fetch_all(db_url, "SELECT status FROM review_items")[0]["status"] == "resolved"
 
 
+def test_unknown_table_key_returns_422(api):
+    make, db_url = api
+    _, version_id = seed(db_url)
+    client = make("wang")
+
+    resp = client.post(f"/api/versions/{version_id}/confirm", json={
+        "tables": [{
+            "table_key": "nope",
+            "header_rows": [2],
+            "columns": [{"key": "c1", "name": "部门"}, {"key": "c2", "name": "预算"}],
+        }],
+    })
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "review_required"
+    assert fetch_all(db_url, "SELECT status FROM doc_versions")[0]["status"] == "needs_review"
+
+
+def test_footer_overlap_header_rejected(api):
+    make, db_url = api
+    _, version_id = seed(db_url)
+    client = make("wang")
+
+    resp = client.post(f"/api/versions/{version_id}/confirm", json={
+        "tables": [{
+            "table_key": "t1",
+            "header_rows": [2],
+            "columns": [{"key": "c1", "name": "部门"}, {"key": "c2", "name": "预算"}],
+            "footer_rows": [2],
+        }],
+    })
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "review_required"
+
+
 def test_secret_needs_two_distinct_approvers(api):
     make, db_url = api
     _, version_id = seed(db_url, classification=2, structure=False)
@@ -139,6 +173,45 @@ def test_secret_needs_two_distinct_approvers(api):
     assert second.status_code == 200, second.text
     assert second.json()["status"] == "embedding"
     assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs WHERE kind='embed'")[0]["n"] == 1
+
+
+def test_secret_downgrade_requires_two_approvers(api):
+    make, db_url = api
+    _, version_id = seed(db_url, classification=2, structure=False)
+    wang = make("wang")
+
+    first = wang.post(f"/api/versions/{version_id}/confirm",
+                      json={"meta": {"classification": 2}})
+    assert first.status_code == 200
+    assert first.json()["status"] == "needs_review"
+    assert first.json()["pending_approvals"] == 1
+
+    # 同一人降密：不得新增选票，也不能因为密级已变为 1 就跳过双人确认入队。
+    second = wang.post(f"/api/versions/{version_id}/confirm",
+                       json={"meta": {"classification": 1}})
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "needs_review"
+    assert second.json()["pending_approvals"] == 1
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs")[0]["n"] == 0
+
+    # 降密已落库后 previous 不可见，同一人再 confirm 仍必须停在 pending，
+    # 不能借「已不是秘密级」的分支直接解决密级复核项。
+    repeat = wang.post(f"/api/versions/{version_id}/confirm",
+                       json={"meta": {"classification": 1}})
+    assert repeat.status_code == 200, repeat.text
+    assert repeat.json()["status"] == "needs_review"
+    assert repeat.json()["pending_approvals"] == 1
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs")[0]["n"] == 0
+
+    chen = make("chen")
+    final = chen.post(f"/api/versions/{version_id}/confirm",
+                      json={"meta": {"classification": 1}})
+    assert final.status_code == 200, final.text
+    assert final.json()["status"] == "embedding"
+    assert fetch_all(db_url, "SELECT classification FROM documents")[0][
+        "classification"] == 1
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs WHERE kind='embed'")[0][
+        "n"] == 1
 
 
 def test_waive_requires_reason_and_secret_cannot_waive(api):
@@ -184,6 +257,20 @@ def test_template_create_list_and_scope(api):
 
     li = make("li")
     assert li.get("/api/templates").json()["items"] == []
+
+
+def test_template_cross_department_forbidden(api):
+    make, db_url = api
+    _, version_id = seed(db_url, dept="人事处")
+    li = make("li")
+
+    resp = li.post("/api/templates", json={
+        "version_id": version_id, "table_key": "t1", "name": "跨部门模板",
+        "scope_dept": "财务处",
+    })
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "forbidden"
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM layout_templates")[0]["n"] == 0
 
 
 def test_review_requires_same_department_or_admin(api):
@@ -241,3 +328,31 @@ def test_review_mutations_write_audit(api, tmp_path, monkeypatch):
     actions = {event.get("action") for event in lines}
     assert {"review_submit", "review_waive", "template_create",
             "review_approve"} <= actions
+
+
+def test_apply_template_is_audited(api, tmp_path, monkeypatch):
+    from app import server
+
+    make, db_url = api
+    audit_file = tmp_path / "template-apply-audit.jsonl"
+    monkeypatch.setattr(server, "AUDIT_FILE", audit_file)
+    _, version_id = seed(db_url)
+    client = make("wang")
+
+    resp = client.post(f"/api/versions/{version_id}/confirm", json={
+        "tables": [{
+            "table_key": "t1",
+            "header_rows": [2],
+            "columns": [{"key": "c1", "name": "部门"}, {"key": "c2", "name": "预算"}],
+        }],
+        "apply_template": True,
+    })
+    assert resp.status_code == 200, resp.text
+
+    lines = [json.loads(line) for line in
+             audit_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    applied = [event for event in lines if event.get("action") == "template_apply"]
+    assert len(applied) == 1
+    assert isinstance(applied[0]["version_id"], str)
+    assert applied[0]["version_id"] == version_id
+    assert applied[0]["detail"]["table_keys"] == ["t1"]

@@ -20,6 +20,15 @@ def load_version_for_review(conn: Connection, version_id: str, user: User, *,
     version = repo.get_version(conn, version_id)
     if version is None:
         raise NotFound("版本不存在")
+    if write:
+        # 复核写操作必须按版本串行：先锁定版本行，再基于锁定后的状态做判定，
+        # 否则并发 confirm/approve 会各自读到旧的 needs_review 状态。
+        locked = conn.execute(
+            "SELECT * FROM doc_versions WHERE id=%s FOR UPDATE", (version_id,)
+        ).fetchone()
+        if locked is None:
+            raise NotFound("版本不存在")
+        version = dict(locked)
     doc = repo.get_document(conn, version["document_id"])
     if doc is None or doc["deleted_at"] is not None:
         raise NotFound("文档不存在")
@@ -71,6 +80,10 @@ def summary(conn: Connection, version_id: str, user: User) -> dict:
 
 def _apply_table_patches(ir: DocModel, tables: list, settings: Settings) -> None:
     patches = {patch.table_key: patch for patch in tables}
+    known_keys = {table.table_key for table in ir.tables()}
+    unknown = [key for key in patches if key not in known_keys]
+    if unknown:
+        raise ReviewRequired(f"表格不存在: {unknown[0]}")
     for block in ir.blocks:
         table = block.table
         if table is None or table.table_key not in patches:
@@ -91,8 +104,16 @@ def _apply_table_patches(ir: DocModel, tables: list, settings: Settings) -> None
         except ValueError as exc:
             raise ReviewRequired(f"表格重切失败：{exc}") from exc
         if patch.footer_rows:
-            rebuilt = rebuilt.model_copy(
-                update={"footer_rows": sorted(set(patch.footer_rows))})
+            data_end = rebuilt.data_start_row + len(rebuilt.rows) - 1
+            for row in patch.footer_rows:
+                if (row < rebuilt.data_start_row or row > data_end
+                        or row in rebuilt.header_rows):
+                    raise ReviewRequired("footer_rows 必须落在数据区")
+            # 走完整校验重建，不用 model_copy 绕过 footer/表头重叠等约束检查。
+            rebuilt = Table.model_validate({
+                **rebuilt.model_dump(),
+                "footer_rows": sorted(set(patch.footer_rows)),
+            })
         block.table = rebuilt
 
 
@@ -113,6 +134,9 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
             settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     version, doc = load_version_for_review(conn, version_id, user, write=True)
+    # 必须先记录复核前的密级：本次 payload 可能把秘密级改为低密级，
+    # 改后再看 doc 就丢了「这是降密」这一事实，从而绕过双人确认。
+    previous = doc["classification"]
     ir = _ir_of(version)
     _apply_table_patches(ir, payload.tables, settings)
     ir = DocModel.model_validate(ir.model_dump(mode="json"))
@@ -148,11 +172,24 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
                       name=f"{doc['title']}-{table.table_key}",
                       scope_dept=doc["dept"], user=user, _commit=False)
 
-    if doc["classification"] == 2:
-        items = [i for i in repo.list_open_review_items(conn, version_id)
-                 if i["kind"] == "classification"]
-        item_id = items[0]["id"] if items else repo.ensure_review_item(
-            conn, version_id, "classification", {"reason": "secret_two_person"})
+    open_classification = [i for i in repo.list_open_review_items(conn, version_id)
+                           if i["kind"] == "classification"]
+    # 降密已写入文档后 previous 不再可见；只要秘密级复核项还挂着未完成的双人票，
+    # 就必须继续走双人分支，避免同一人再 confirm 一次就被放行。
+    secret_pending = any(
+        (item["payload"] or {}).get("reason") in ("secret_two_person", "secret_downgrade")
+        or repo.count_approvals(conn, item["id"]) > 0
+        for item in open_classification
+    )
+    if doc["classification"] == 2 or (
+            previous == 2 and doc["classification"] < 2) or secret_pending:
+        # 秘密级，或从秘密级降密：都要求两名不同用户确认，防止单人降密绕过。
+        reason = ("secret_two_person" if doc["classification"] == 2
+                  else "secret_downgrade")
+        item_id = (open_classification[0]["id"] if open_classification
+                   else repo.ensure_review_item(
+                       conn, version_id, "classification", {"reason": reason}))
+        # add_approval 对同一用户重复确认不插入新票，pending 以实际票数为准。
         repo.add_approval(conn, item_id, user.username)
         approvals = repo.count_approvals(conn, item_id)
         if approvals < 2:
@@ -160,7 +197,10 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
                                     warnings=version["warnings"])
             conn.commit()
             return {"version_id": version_id, "status": "needs_review",
-                    "pending_approvals": approvals, "open_items": 1}
+                    "pending_approvals": approvals,
+                    "open_items": len(repo.list_open_review_items(conn, version_id)),
+                    "document_id": str(doc["id"]),
+                    "classification": doc["classification"]}
         repo.resolve_review_item(conn, item_id, resolved_by=user.username)
     else:
         _resolve_open(conn, version_id, {"classification"}, user)
@@ -171,10 +211,14 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
                                 warnings=version["warnings"])
         conn.commit()
         return {"version_id": version_id, "status": "needs_review",
-                "pending_approvals": 0, "open_items": len(items)}
+                "pending_approvals": 0, "open_items": len(items),
+                "document_id": str(doc["id"]),
+                "classification": doc["classification"]}
     _start_embedding(conn, version_id, ir, version["warnings"], user)
     return {"version_id": version_id, "status": "embedding",
-            "pending_approvals": 0, "open_items": 0}
+            "pending_approvals": 0, "open_items": 0,
+            "document_id": str(doc["id"]),
+            "classification": doc["classification"]}
 
 
 def approve(conn: Connection, version_id: str, *, user: User) -> dict:
@@ -194,18 +238,24 @@ def approve(conn: Connection, version_id: str, *, user: User) -> dict:
     if approvals < 2:
         conn.commit()
         return {"version_id": version_id, "status": "needs_review",
-                "pending_approvals": approvals}
+                "pending_approvals": approvals,
+                "document_id": str(doc["id"]),
+                "classification": doc["classification"]}
     repo.resolve_review_item(conn, item_id, resolved_by=user.username)
 
     remaining = repo.list_open_review_items(conn, version_id)
     if remaining:
         conn.commit()
         return {"version_id": version_id, "status": "needs_review",
-                "pending_approvals": approvals, "open_items": len(remaining)}
+                "pending_approvals": approvals, "open_items": len(remaining),
+                "document_id": str(doc["id"]),
+                "classification": doc["classification"]}
     ir = _ir_of(version)
     _start_embedding(conn, version_id, ir, version["warnings"], user)
     return {"version_id": version_id, "status": "embedding",
-            "pending_approvals": approvals, "open_items": 0}
+            "pending_approvals": approvals, "open_items": 0,
+            "document_id": str(doc["id"]),
+            "classification": doc["classification"]}
 
 
 def waive(conn: Connection, version_id: str, *, reason: str,
@@ -229,10 +279,14 @@ def waive(conn: Connection, version_id: str, *, reason: str,
     if remaining:
         conn.commit()
         return {"version_id": version_id, "status": "needs_review",
-                "open_items": len(remaining)}
+                "open_items": len(remaining),
+                "document_id": str(doc["id"]),
+                "classification": doc["classification"]}
     ir = _ir_of(version)
     _start_embedding(conn, version_id, ir, version["warnings"], user)
-    return {"version_id": version_id, "status": "embedding", "open_items": 0}
+    return {"version_id": version_id, "status": "embedding", "open_items": 0,
+            "document_id": str(doc["id"]),
+            "classification": doc["classification"]}
 
 
 def _signature_of(table: Table) -> dict:
