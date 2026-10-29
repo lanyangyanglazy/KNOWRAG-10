@@ -32,7 +32,8 @@ _NUMBER_RE = re.compile(r"^[+-]?[\d,]+(\.\d+)?%?$")
 _MAX_SCAN_ROWS = 20
 _MAX_HEADER_DEPTH = 3
 _MAX_CELL_CHARS = 40
-# 扩展表头深度时，下一行数字占比超过该值即视为数据行，不再吞进表头
+# 扩展表头深度时，下一行数字占比超过该值即视为数据行，不再吞进表头；
+# 但命中 KEYWORDS 的行（如“部门 | 2024 | 2025”这类年份/月份标签）不受此限
 _MAX_EXTENSION_NUMERIC_RATIO = 0.5
 
 
@@ -132,12 +133,18 @@ def _looks_like_title(sheet: SheetGrid, region: Region, row: int) -> bool:
 
 
 def _is_header_like_row(sheet: SheetGrid, region: Region, row: int) -> bool:
-    """扩展表头深度时用：整行非空且以文字为主，才可能仍是表头。"""
+    """扩展表头深度时用：整行非空且不像数据行，才可能仍是表头。
+
+    数字占比高的行通常是数据行；但年份/月份等数字型表头标签合法，
+    因此命中 KEYWORDS 的行仍按表头处理（例如 ``部门 | 2024 | 2025``）。
+    """
     texts = [sheet.cell(row, c).text.strip()
              for c in range(region.start_col, region.end_col + 1)]
     nonempty = [t for t in texts if t]
     if not nonempty:
         return False
+    if any(any(k in t for k in KEYWORDS) for t in nonempty):
+        return True
     return _ratio([_is_number(t) for t in nonempty]) <= _MAX_EXTENSION_NUMERIC_RATIO
 
 

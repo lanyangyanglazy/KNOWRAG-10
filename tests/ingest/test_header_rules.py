@@ -9,8 +9,8 @@ def grid(rows: list[list], bold_rows: tuple[int, ...] = ()) -> SheetGrid:
     padded = [list(r) + [""] * (width - len(r)) for r in rows]
     return SheetGrid(
         name="S", hidden=False,
-        rows=[[Cell(text=str(v)) if v not in (None, "") else Cell(
-            bold=(r + 1) in bold_rows) for v in row]
+        rows=[[Cell(text=str(v) if v not in (None, "") else "",
+                    bold=(r + 1) in bold_rows) for v in row]
             for r, row in enumerate(padded)],
         merges=[],
     )
@@ -90,3 +90,31 @@ def test_header_above_data_is_penalized():
     ], bold_rows=(2,))
     scored = hr.score_candidate(sheet, Region(1, 3, 1, 3, 1.0), 2, 1)
     assert "data_above" in scored.penalties
+
+
+def test_numeric_year_row_extends_two_row_header():
+    # 年份标签是合法的数字型表头：继续行 66.7% 数字，但含关键词“部门”
+    sheet = grid([
+        ["", "预算", "预算"],
+        ["部门", "2024", "2025"],
+        ["综合处", "120", "130"],
+    ], bold_rows=(1, 2))
+    decision = hr.detect_header(sheet, Region(1, 3, 1, 3, 1.0), config.get_settings())
+    assert decision.accepted is True
+    assert decision.candidate.start_row == 1
+    assert decision.candidate.depth == 2
+    assert decision.candidate.confidence >= 0.75
+
+
+def test_numeric_month_row_with_keyword_extends_two_row_header():
+    # 月份标签同理：继续行后两列全是数字，靠关键词“部门”豁免
+    sheet = grid([
+        ["", "支出", "支出"],
+        ["部门", "1", "2"],
+        ["综合处", "120", "130"],
+        ["人事处", "98", "101"],
+    ], bold_rows=(1, 2))
+    decision = hr.detect_header(sheet, Region(1, 4, 1, 3, 1.0), config.get_settings())
+    assert decision.accepted is True
+    assert decision.candidate.start_row == 1
+    assert decision.candidate.depth == 2
