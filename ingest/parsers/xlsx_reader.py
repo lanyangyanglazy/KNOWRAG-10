@@ -131,9 +131,13 @@ def has_pivot_tables(path: Path) -> bool:
 
 def read_workbook(path: Path, settings: Settings | None = None) -> WorkbookGrid:
     s = settings or get_settings()
-    # 两遍读取：data_only 拿缓存值（展示文本），默认模式拿公式原文
-    wb_values = load_workbook(path, data_only=True)
-    wb_formulas = load_workbook(path, data_only=False)
+    # 两遍读取：data_only 拿缓存值（展示文本），默认模式拿公式原文。
+    # 传文件对象而不是路径：内容寻址存储的原件没有扩展名，openpyxl 按扩展名
+    # 判断格式会抛 InvalidFileException；文件对象则按 zip 头识别 xlsx。
+    with Path(path).open("rb") as fh:
+        wb_values = load_workbook(fh, data_only=True)
+    with Path(path).open("rb") as fh:
+        wb_formulas = load_workbook(fh, data_only=False)
     warnings: list[dict] = []
     if has_pivot_tables(path):
         warnings.append({"code": "pivot_values_only",

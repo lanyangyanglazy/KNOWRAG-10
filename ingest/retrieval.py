@@ -95,9 +95,12 @@ def _hit(row: dict, *, distance: float | None = None,
     metadata = row["metadata"] or {}
     chunk_id = metadata.get("chunk_id") or (
         f"{row['document_id']}@v{row['version_no']}#{row['ordinal']}")
+    # 导入语料的切片 metadata 带源系统编号（gov-xxx），检索/引用/评测统一用它；
+    # 上传文档 metadata 的 doc_id 就是 UUID，旧切片没有该键时回退文档主键。
+    doc_id = metadata.get("doc_id") or str(row["document_id"])
     return Hit(
         db_id=int(row["db_id"]), chunk_id=chunk_id,
-        doc_id=str(row["document_id"]), version_id=str(row["version_id"]),
+        doc_id=str(doc_id), version_id=str(row["version_id"]),
         ordinal=int(row["ordinal"]), chunk_type=row["chunk_type"],
         content=row["content"], title=row["doc_title"], dept=row["dept"],
         classification=int(row["classification"]),
@@ -246,7 +249,10 @@ def retrieve(conn: Connection, user: User, query: str, *,
 
     if outcome.best_distance is None:
         outcome.reason = "no_dense_hits"
-    elif outcome.best_distance > _threshold(max_distance):
+    elif outcome.best_distance ** 2 > _threshold(max_distance):
+        # RAG_MAX_DISTANCE 按 FAISS 的 similarity_search_with_score 口径校准
+        # （平方 L2）；pgvector 的 `<->` 返回 L2 本身，先平方再比，否则同一个
+        # 阈值在 pg 端严格得多，相关文档会被误判成低相关而拒答。
         outcome.reason = "low_relevance"
     else:
         outcome.grounded = True

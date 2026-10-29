@@ -130,6 +130,7 @@ def embed_version(conn: Connection, version_id: str, *,
         title=doc["title"], dept=doc["dept"],
         classification=doc["classification"],
         source_filename=version["filename"], settings=settings,
+        origin_id=doc["origin_id"],
     )
     vectors = embed_texts(embedder, [draft.content for draft in drafts])
     active = (doc["current_version_id"] == version["id"]

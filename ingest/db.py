@@ -57,19 +57,26 @@ def migrate(conn: Connection) -> None:
 def main(argv: list[str] | None = None) -> int:
     """python -m ingest.db：部署第一步，幂等应用 schema。"""
     import argparse
+    import sys
+
+    import psycopg
+    from psycopg.rows import dict_row
 
     parser = argparse.ArgumentParser(description="初始化/升级摄取库 schema（幂等）")
     parser.parse_args(argv)
 
     # Windows 控制台默认 GBK，中文成功提示会 UnicodeEncodeError
-    import sys
-
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             reconfigure(encoding="utf-8", errors="replace")
 
-    with connection() as conn:
+    url = get_settings().db_url
+    if not url:
+        raise RuntimeError("INGEST_DB_URL 未配置")
+    # 空库冷启动必须绕过连接池：池的 configure 会 register_vector，
+    # 而 vector 类型要等本命令把 schema 建好后才存在，否则永远连不上。
+    with psycopg.connect(url, row_factory=dict_row) as conn:
         migrate(conn)
     print("schema 已应用")
     return 0

@@ -98,9 +98,11 @@ def _column_label(column) -> str:
 class _Builder:
     def __init__(self, ir: DocModel, *, doc_id: str, version_no: int, title: str,
                  dept: str, classification: int | None, source_filename: str,
-                 settings: Settings) -> None:
+                 settings: Settings, origin_id: str | None = None) -> None:
         self.ir = ir
-        self.doc_id = doc_id
+        # psycopg 返回的 UUID 不是 JSON 可序列化类型；metadata 要落 jsonb，统一转字符串
+        self.doc_id = str(doc_id)
+        self.origin_id = origin_id
         self.version_no = version_no
         self.title = title
         self.dept = dept
@@ -112,7 +114,10 @@ class _Builder:
     def add(self, chunk_type: str, content: str, metadata: dict) -> None:
         ordinal = len(self.drafts)
         meta = {
+            # chunk_id 必须保持 UUID 形态：回源路由按 UUID@v#n 解析定位
             "chunk_id": f"{self.doc_id}@v{self.version_no}#{ordinal}",
+            # doc_id 用于评测金标匹配：导入语料取源系统编号，上传文档退回 UUID
+            "doc_id": self.origin_id or self.doc_id,
             "chunk_type": chunk_type,
             "title": self.title,
             "dept": self.dept,
@@ -266,11 +271,13 @@ class _Builder:
 def chunk_document(ir: DocModel, *, doc_id: str, version_no: int, title: str,
                    dept: str, classification: int | None,
                    source_filename: str,
-                   settings: Settings | None = None) -> list[ChunkDraft]:
+                   settings: Settings | None = None,
+                   origin_id: str | None = None) -> list[ChunkDraft]:
     settings = settings or get_settings()
     builder = _Builder(ir, doc_id=doc_id, version_no=version_no, title=title,
                        dept=dept, classification=classification,
-                       source_filename=source_filename, settings=settings)
+                       source_filename=source_filename, settings=settings,
+                       origin_id=origin_id)
     stack: list[tuple[int, str]] = []
     section_path: list[str] = []
     buffer: list[str] = []

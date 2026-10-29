@@ -101,7 +101,7 @@ def import_file(conn: Connection, path: Path, *, created_by: str = "import",
         doc = repo.create_document(
             conn, title=str(meta["title"]), dept=str(meta["dept"]),
             classification=level, effective_date=effective,
-            created_by=created_by)
+            created_by=created_by, origin_id=doc_id)
         version = repo.create_version(
             conn, document_id=doc["id"], version_no=1, sha256=sha256,
             filename=path.name, mime="text/markdown",

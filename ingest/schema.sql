@@ -2,6 +2,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS documents (
   id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- 源系统编号，导入语料用于溯源与评测金标匹配
+  origin_id           text,
   title               text NOT NULL,
   dept                text NOT NULL,
   classification      smallint CHECK (classification IN (0,1,2)),
@@ -126,6 +128,9 @@ CREATE TABLE IF NOT EXISTS layout_templates (
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now()
 );
+
+-- 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的 documents 补列
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS origin_id text;
 
 CREATE INDEX IF NOT EXISTS chunks_vec_l0 ON chunks USING hnsw (embedding vector_l2_ops)
   WHERE active AND classification = 0;

@@ -10,11 +10,12 @@ _DOC_FIELDS = {"title", "dept", "classification", "effective_date"}
 
 def create_document(conn: Connection, *, title: str, dept: str,
                     classification: int | None, effective_date: date | str | None,
-                    created_by: str) -> dict:
+                    created_by: str, origin_id: str | None = None) -> dict:
     return conn.execute(
-        """INSERT INTO documents (title, dept, classification, effective_date, created_by)
-           VALUES (%s, %s, %s, %s, %s) RETURNING *""",
-        (title, dept, classification, effective_date, created_by),
+        """INSERT INTO documents
+           (title, dept, classification, effective_date, created_by, origin_id)
+           VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
+        (title, dept, classification, effective_date, created_by, origin_id),
     ).fetchone()
 
 

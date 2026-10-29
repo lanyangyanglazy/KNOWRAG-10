@@ -14,6 +14,7 @@
     uv run python -m evaluation.runner --mode answer         # 含生成
     uv run python -m evaluation.runner --baseline evaluation/baseline.json
     uv run python -m evaluation.runner --save-baseline       # 把本次结果存为基线
+    uv run python -m evaluation.runner --backend pg          # 对 pgvector 跑评测
 
 退出码：0 = 通过；1 = 相对基线回归（可直接用于 CI 门禁）；2 = 用例金标与语料对不上。
 """
@@ -350,11 +351,29 @@ def _corpus_stats(service) -> dict:
     }
 
 
-def _build_service():
-    """构造真实的政务 RAG 服务（需要 Ollama 在运行）。"""
+def _build_service(backend: str | None = None):
+    """构造真实的政务 RAG 服务（FAISS 需要 Ollama；pg 需要 PostgreSQL）。"""
     from app.rag_service import RagService
 
-    return RagService()
+    return RagService(backend=backend)
+
+
+def _validate_gold(cases: Sequence[EvalCase], service) -> list[str]:
+    """
+    按后端选择金标校验的数据源。
+
+    pg 模式的 `service.documents` 永远是空列表（切片在库里），若照旧校验，
+    所有用例都会被误判成「金标文档不存在」而直接退出码 2。
+    """
+    if getattr(service, "backend", "faiss") != "pg":
+        return validate_against_corpus(
+            cases, getattr(service, "documents", []) or [])
+
+    from ingest.db import connection
+    from evaluation.pg_corpus import validate_against_pg
+
+    with connection() as conn:
+        return validate_against_pg(cases, conn)
 
 
 def run(
@@ -366,6 +385,7 @@ def run(
     tolerance: float = 0.03,
     k: int = 5,
     save_baseline: bool = False,
+    backend: str | None = None,
 ) -> tuple[int, dict | None, dict | None]:
     """
     跑一轮评测，返回 (退出码, 报告, 基线对比)。
@@ -381,9 +401,9 @@ def run(
         raise FileNotFoundError(f"基线报告不存在: {baseline_path}")
 
     cases = load_cases(cases_path)
-    service = service if service is not None else _build_service()
+    service = service if service is not None else _build_service(backend)
 
-    problems = validate_against_corpus(cases, getattr(service, "documents", []) or [])
+    problems = _validate_gold(cases, service)
     if problems:
         print(f"❌ 用例金标与语料不一致（{len(problems)} 处），已中止：")
         for problem in problems:
@@ -396,7 +416,12 @@ def run(
         outcomes,
         mode=mode,
         corpus=_corpus_stats(service),
-        config={"k": k, "cases_file": str(cases_path), "tolerance": tolerance},
+        config={
+            "k": k,
+            "cases_file": str(cases_path),
+            "tolerance": tolerance,
+            "backend": getattr(service, "backend", "faiss"),
+        },
     )
 
     json_path, md_path = write_report(report, out_dir)
@@ -446,6 +471,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", default=None, help="报告输出目录")
     parser.add_argument("--baseline", default=None, help="基线报告 JSON，用于回归门禁")
     parser.add_argument("--tolerance", type=float, default=0.03, help="允许的指标跌幅，默认 0.03")
+    parser.add_argument("--backend", default=None, choices=["faiss", "pg"],
+                        help="检索后端；不传时按 RETRIEVAL_BACKEND / INGEST_DB_URL 解析")
     parser.add_argument("--save-baseline", action="store_true",
                         help="把本次结果另存为基线（写在报告目录上一级，默认 evaluation/baseline.json）")
     args = parser.parse_args(argv)
@@ -458,6 +485,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tolerance=args.tolerance,
         k=args.k,
         save_baseline=args.save_baseline,
+        backend=args.backend,
     )
     return code
 
