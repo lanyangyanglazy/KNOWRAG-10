@@ -98,5 +98,5 @@ def audit_event(request: Request, user: User, action: str, **fields) -> None:
         record[key] = _audit_safe(value)
     try:
         server.write_audit(record)
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 - 审计失败绝不能把已成功的操作翻成 500
         logger.error("audit.write_failed action=%s err=%s", action, exc)

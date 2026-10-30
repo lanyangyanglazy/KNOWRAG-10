@@ -4,6 +4,7 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import replace
 
+import pytest
 from psycopg.types.json import Jsonb
 
 from evaluation import compare_backends, runner
@@ -127,6 +128,32 @@ def test_gate_blocks_shrinking_case_set():
     verdict = compare_backends.judge(_report(cases=30), _report(cases=33))
     assert verdict["ok"] is False
     assert [item["metric"] for item in verdict["regressions"]] == ["cases"]
+
+
+def test_incomparable_embed_model_exits_with_code_2(monkeypatch, capsys):
+    """不可比必须以 2 退出：1 已被「有回归」占用，混用会让运维误读结论。"""
+    import main as core
+    import ingest.config as ingest_config
+
+    class _Settings:
+        embed_model = "nomic-embed-text"
+
+    monkeypatch.setattr(core, "EMBED_MODEL", "bge-m3")
+    monkeypatch.setattr(ingest_config, "get_settings", lambda: _Settings())
+
+    with pytest.raises(SystemExit) as excinfo:
+        compare_backends._assert_comparable()
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "不可比" in captured.err
+    assert not captured.out  # 诊断信息走 stderr，不能污染机器可读输出
+
+    class _Same:
+        embed_model = "bge-m3"
+
+    # 阳性对照：模型一致时不得退出，否则门禁自己也跑不起来了。
+    monkeypatch.setattr(ingest_config, "get_settings", lambda: _Same())
+    compare_backends._assert_comparable()
 
 
 def test_validate_gold_reads_pg_corpus(monkeypatch, conn):

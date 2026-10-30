@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import math
 import os
+import signal
 import sys
 import threading
-import time
 from typing import Callable
 
+import psycopg
 from psycopg import Connection
 
 from ingest.db import connection
@@ -14,6 +17,11 @@ from ingest.queue import claim, complete, fail, heartbeat, reap_stale
 
 Handler = Callable[[Connection, dict], None]
 Hook = Callable[[Connection, dict], None]
+
+logger = logging.getLogger("rag.worker")
+
+# 数据库不可用时的轮询退避上限：再长会让恢复后的首轮任务明显延迟。
+MAX_BACKOFF_SECONDS = 30.0
 
 
 def run_job(conn: Connection, job: dict, handlers: dict[str, Handler],
@@ -58,20 +66,44 @@ def _start_heartbeat(job_id: int, worker_id: str) -> threading.Event:
 
 def run_forever(handlers: dict[str, Handler], *, worker_id: str,
                 poll_seconds: float = 1.0,
-                dead_letter_hooks: dict[str, Hook] | None = None) -> None:
-    while True:
-        with connection() as conn:
-            reap_stale(conn)
-            job = claim(conn, worker_id)
-        if job is None:
-            time.sleep(poll_seconds)
-            continue
-        stop = _start_heartbeat(job["id"], worker_id)
+                dead_letter_hooks: dict[str, Hook] | None = None,
+                stop: threading.Event | None = None) -> None:
+    """常驻轮询；数据库短暂不可用时指数退避重试，收到停止信号后尽快返回。"""
+    stop = stop or threading.Event()
+    base = max(float(poll_seconds), 0.5)
+    backoff = base
+    while not stop.is_set():
         try:
             with connection() as conn:
-                run_job(conn, job, handlers, worker_id, dead_letter_hooks)
+                reap_stale(conn)
+                job = claim(conn, worker_id)
+        except psycopg.Error as exc:
+            # 不能把数据库抖动变成 worker 退出：记日志、退避，期间仍可响应停机。
+            delay = min(backoff, MAX_BACKOFF_SECONDS)
+            logger.warning("worker %s poll failed, retry in %.1fs: %s",
+                           worker_id, delay, exc)
+            stop.wait(delay)
+            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            continue
+        backoff = base
+        if job is None:
+            stop.wait(poll_seconds)
+            continue
+        beat = _start_heartbeat(job["id"], worker_id)
+        try:
+            try:
+                with connection() as conn:
+                    run_job(conn, job, handlers, worker_id, dead_letter_hooks)
+            except psycopg.Error as exc:
+                # 取任务连接成功、执行连接失败：任务会由心跳超时回收重领，
+                # 这里同样退避而不是让异常打穿主循环。
+                delay = min(backoff, MAX_BACKOFF_SECONDS)
+                logger.warning("worker %s job %s connection failed, retry in %.1fs: %s",
+                               worker_id, job["id"], delay, exc)
+                stop.wait(delay)
+                backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
         finally:
-            stop.set()
+            beat.set()
 
 
 def run_once(handlers: dict[str, Handler], *, worker_id: str,
@@ -100,6 +132,23 @@ def run_once(handlers: dict[str, Handler], *, worker_id: str,
     return processed
 
 
+def _install_stop_handlers(stop: threading.Event) -> None:
+    """SIGINT/SIGTERM 只置停止位，让主循环在 poll 等待中立即醒来退出。"""
+
+    def _request_shutdown(signum, frame):  # noqa: ARG001 - signal 回调签名固定
+        stop.set()
+
+    for name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _request_shutdown)
+        except (ValueError, OSError):
+            # 非主线程（测试/嵌入场景）或平台不支持时保持默认行为
+            continue
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="摄取任务 worker（一进程一循环）")
     parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
@@ -108,11 +157,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="队列暂时为空就退出（验收/排障用）")
     args = parser.parse_args(argv)
 
-    # Windows 控制台默认 GBK，中文启动日志会 UnicodeEncodeError
+    # Windows 控制台默认 GBK，中文启动日志与 argparse 错误提示都会 UnicodeEncodeError，
+    # 必须先规整输出编码，再做任何可能打印中文的校验。
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             reconfigure(encoding="utf-8", errors="replace")
+
+    # nan/inf/<=0 会让 sleep 抛异常或忙等，参数错误按 argparse 惯例以 2 退出
+    if not math.isfinite(args.poll) or args.poll <= 0:
+        parser.error("--poll 必须是大于 0 的有限数值")
 
     # 延迟导入：pipeline 会拉起解析器与嵌入依赖，参数写错时不必加载它们
     from ingest import pipeline
@@ -123,10 +177,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"worker {args.worker_id} 处理 {count} 个任务后退出")
         return 0
 
+    stop = threading.Event()
+    _install_stop_handlers(stop)
     print(f"worker {args.worker_id} 已启动（poll={args.poll}s）")
     run_forever(pipeline.HANDLERS, worker_id=args.worker_id,
                 poll_seconds=args.poll,
-                dead_letter_hooks=pipeline.DEAD_LETTER_HOOKS)
+                dead_letter_hooks=pipeline.DEAD_LETTER_HOOKS,
+                stop=stop)
+    print(f"worker {args.worker_id} 已停止")
     return 0
 
 

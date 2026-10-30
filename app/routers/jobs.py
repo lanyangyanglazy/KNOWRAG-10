@@ -1,8 +1,8 @@
 """任务查询与 SSE 进度。
 
-任务可见性沿用管理台口径：管理员全量可见，其余用户只能看到本部门文档的任务；
-判断文档归属时按 payload 里的 document_id / version_id 反查，避免任务列表成为
-跨部门文档标题/ID 的旁路。
+任务可见性沿用管理台口径：管理员全量可见，其余用户按设计 §10.1 的文档可见规则
+（密级非空、不超过用户上限、公开或本部门）判断；判断文档归属时按 payload 里的
+document_id / version_id 反查，避免任务列表成为跨部门/跨密级文档标题、错误信息的旁路。
 """
 
 from __future__ import annotations
@@ -39,8 +39,15 @@ def _job_document(conn: Connection, job: dict) -> dict | None:
 def _can_watch(conn: Connection, job: dict, user: User) -> bool:
     if "admin" in user.roles:
         return True
+    # 秘密级任务的 last_error 可能带原文片段：可见性必须与检索同一口径，
+    # 同部门但密级不足的用户同样按「任务不存在」处理。
     doc = _job_document(conn, job)
-    return doc is not None and doc["dept"] == user.dept
+    if doc is None or doc["deleted_at"] is not None:
+        return False
+    classif = doc["classification"]
+    if classif is None or classif > user.max_level:
+        return False
+    return classif == 0 or doc["dept"] == user.dept
 
 
 def _load_job(conn: Connection, job_id: int, user: User) -> dict:

@@ -53,10 +53,13 @@ def _assert_comparable() -> None:
     faiss_model = core.EMBED_MODEL
     pg_model = get_settings().embed_model
     if faiss_model != pg_model:
-        raise SystemExit(
+        # SystemExit("msg") 的退出码是 1，会和「有回归」撞车；先打到 stderr 再以 2 退出。
+        print(
             f"❌ 两个后端的嵌入模型不同（FAISS={faiss_model} / pg={pg_model}），指标不可比。\n"
-            "   请把 EMBED_MODEL 与 INGEST_EMBED_MODEL 设为同一模型后重跑。"
+            "   请把 EMBED_MODEL 与 INGEST_EMBED_MODEL 设为同一模型后重跑。",
+            file=sys.stderr,
         )
+        raise SystemExit(2)
 
 
 def judge(pg_report: dict, faiss_report: dict,

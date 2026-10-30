@@ -87,6 +87,60 @@ def test_job_visibility_is_department_scoped(api):
     assert chen.get(f"/api/jobs/{job_id}").status_code == 200
 
 
+def seed_job(db_url: str, *, dept: str = "综合处",
+             classification: int = 2) -> tuple[str, int]:
+    """造一个挂在部门文档上的任务，返回 (document_id, job_id)。"""
+    doc_id, version_id = seed_version(db_url, dept=dept, classification=classification)
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        return doc_id, enqueue(conn, "embed", {"version_id": str(version_id)}, priority=50)
+
+
+def test_secret_job_hidden_from_low_clearance_same_dept(api):
+    make, db_url = api
+    _, job_id = seed_job(db_url)
+
+    # zhang：综合处、max_level=1、非 admin —— 同部门但密级不足，按不存在处理。
+    zhang = make("zhang")
+    assert zhang.get(f"/api/jobs/{job_id}").status_code == 404
+    assert zhang.get(f"/api/jobs/{job_id}/events").status_code == 404
+
+    # 阳性对照：同部门、同角色的 L2 非管理员必须可见，
+    # 证明 404 来自密级不足而不是部门或角色判断。
+    from app.routers import jobs as jobs_router
+    from app.users import DEMO_USERS, User
+
+    stronger = User("liu", "刘洋", "综合处", max_level=2, role="处长",
+                    roles=("uploader", "reviewer"))
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        job = conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
+        assert jobs_router._can_watch(conn, job, stronger) is True
+        assert jobs_router._can_watch(conn, job, DEMO_USERS["zhang"]) is False
+
+
+def test_public_job_visible_cross_department(api):
+    make, db_url = api
+    _, job_id = seed_job(db_url, classification=0)
+
+    li = make("li")
+    resp = li.get(f"/api/jobs/{job_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["kind"] == "embed"
+
+
+def test_unclassified_job_hidden_from_non_admin(api):
+    make, db_url = api
+    doc_id, job_id = seed_job(db_url, classification=1)
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        # 密级缺失（NULL）必须 fail-closed：只有管理员能看。
+        conn.execute("UPDATE documents SET classification=NULL WHERE id=%s", (doc_id,))
+        conn.commit()
+
+    zhang = make("zhang")
+    assert zhang.get(f"/api/jobs/{job_id}").status_code == 404
+    chen = make("chen")
+    assert chen.get(f"/api/jobs/{job_id}").status_code == 200
+
+
 def test_job_events_does_not_hold_request_db_connection():
     # SSE 若通过 Depends(get_db) 持有请求作用域连接，该连接会一直占到流结束；
     # 加上每次轮询再借一个，几路观众就能打满小连接池。
