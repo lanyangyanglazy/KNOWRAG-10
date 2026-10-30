@@ -53,6 +53,39 @@ WEB_INDEX_META_FILE = os.path.join(WEB_INDEX_DIR, "index.meta.json")
 # 可用环境变量 RAG_MAX_DISTANCE 覆盖，换 embedding 模型后必须重新校准。
 DEFAULT_MAX_DISTANCE = 0.78
 
+# ---------- 检索后端 ----------
+
+RETRIEVAL_BACKENDS = ("faiss", "pg")
+# 未显式配置后端、也没有数据库时的兜底：教学主线与既有测试仍开箱即用。
+# 配置了 INGEST_DB_URL 就默认走 pg（见 resolve_backend），.env.example 里再显式写死 pg。
+DEFAULT_BACKEND = "faiss"
+
+_CLASSIFICATION_NAMES = {level: name for name, level in CLASSIFICATION_LEVELS.items()}
+
+
+def resolve_backend(explicit: str | None = None) -> str:
+    """
+    解析检索后端：构造参数 > RETRIEVAL_BACKEND > （配置了 INGEST_DB_URL 则 pg，否则 faiss）。
+
+    非法值直接抛错，而不是悄悄回退到 FAISS——部署时后端名写错，
+    应该启动就失败，不能等用户提问后才发现查的是另一个库。
+    """
+    raw = explicit if explicit is not None else os.getenv("RETRIEVAL_BACKEND", "")
+    value = (raw or "").strip().lower()
+    if not value:
+        value = "pg" if os.getenv("INGEST_DB_URL", "").strip() else DEFAULT_BACKEND
+    if value not in RETRIEVAL_BACKENDS:
+        raise ValueError(
+            f"RETRIEVAL_BACKEND={value!r} 非法，可选：{'/'.join(RETRIEVAL_BACKENDS)}")
+    return value
+
+
+def _default_conn_factory():
+    from ingest.db import connection
+
+    return connection()
+
+
 # 引用片段预览长度
 PREVIEW_CHARS = 120
 
@@ -333,11 +366,34 @@ class RagService:
              → 无依据：拒答（不调用 LLM）
     """
 
-    def __init__(self, llm=None, embed_model=None, history_turns: int = core.MAX_HISTORY_TURNS):
+    def __init__(self, llm=None, embed_model=None,
+                 history_turns: int = core.MAX_HISTORY_TURNS, *,
+                 backend: str | None = None, conn_factory=None,
+                 embedder=None):
+        self.backend = resolve_backend(backend)
         self.llm = llm or core.init_llm()
+        self.history_turns = history_turns
+        self._history: dict[str, list] = {}
+        self.load_issues: list[DocIssue] = []
+
+        if self.backend == "pg":
+            # pg 后端不需要语料目录、FAISS 与 LangChain embedding：
+            # 查询向量由入库同一模型（INGEST_EMBED_MODEL）生成，见 _require_embedder()。
+            self.embed_model = None
+            self.embedder = embedder
+            self.documents = []
+            self.vectorstore = None
+            self._conn_factory = conn_factory or _default_conn_factory
+            # 启动即探库：未迁移/连不上要让 get_service() 变成 503，
+            # 而不是等第一个提问在 retrieve 里抛 UndefinedTable。
+            with self._conn_factory() as conn:
+                conn.execute("SELECT 1 FROM documents LIMIT 1")
+            return
+
+        self.embedder = None
+        self._conn_factory = None
         self.embed_model = embed_model or core.init_embedding()
         # 运行时用宽松模式：单个坏文件只跳过并留痕，不让整库不可用
-        self.load_issues: list[DocIssue] = []
         self.documents = load_gov_documents(issues=self.load_issues)
         if self.load_issues:
             logger.warning(
@@ -346,17 +402,26 @@ class RagService:
                 "；".join(f"{i.path.name}（{i.reason}）" for i in self.load_issues),
             )
         self.vectorstore = build_or_load_index(self.documents, self.embed_model)
-        self.history_turns = history_turns
-        self._history: dict[str, list] = {}
 
     # ---- 权限 ----
 
     def visible_documents(self, user: User) -> list[LCDocument]:
-        """用户可见的切片集合——检索的唯一候选来源。"""
+        """
+        用户可见的切片集合——FAISS 检索的唯一候选来源。
+
+        pg 后端没有「内存切片集合」这个概念（切片可能上百万），
+        显式报错，避免调用方把空列表误判成「无可见文档」而错误拒答。
+        """
+        if self.backend == "pg":
+            raise RuntimeError(
+                "pg 后端不提供 visible_documents()，请使用 visible_docs() "
+                "或 ingest.retrieval.retrieve()")
         return [doc for doc in self.documents if can_view(user, doc.metadata)]
 
     def visible_docs(self, user: User) -> list[dict]:
         """可见文档的去重清单（前端展示「您能看到哪些文件」）。"""
+        if self.backend == "pg":
+            return self._visible_docs_pg(user)
         seen: dict[str, dict] = {}
         for doc in self.visible_documents(user):
             md = doc.metadata
@@ -368,6 +433,29 @@ class RagService:
                 "effective_date": md.get("effective_date", ""),
             })
         return list(seen.values())
+
+    def _visible_docs_pg(self, user: User) -> list[dict]:
+        with self._conn_factory() as conn:
+            rows = conn.execute(
+                """SELECT d.id, d.title, d.dept, d.classification, d.effective_date
+                     FROM documents d
+                    WHERE d.status = 'active' AND d.deleted_at IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM chunks c
+                           WHERE c.document_id = d.id AND c.active
+                             AND c.classification IS NOT NULL
+                             AND c.classification <= %s
+                             AND (c.classification = 0 OR c.dept = %s))
+                    ORDER BY d.title""",
+                (user.max_level, user.dept),
+            ).fetchall()
+        return [{
+            "doc_id": str(row["id"]),
+            "title": row["title"],
+            "dept": row["dept"],
+            "classification": _CLASSIFICATION_NAMES.get(row["classification"], "未知"),
+            "effective_date": str(row["effective_date"] or ""),
+        } for row in rows]
 
     def chunk_detail(self, user: User, chunk_id: str) -> dict | None:
         """
@@ -398,14 +486,57 @@ class RagService:
     # ---- 检索 ----
 
     def retrieve(self, user: User, query: str) -> RetrievalResult:
-        """
-        权限前置的混合检索。
+        if self.backend == "pg":
+            return self._retrieve_pg(user, query)
+        return self._retrieve_faiss(user, query)
 
-        - 稠密：FAISS filter 只放行可见切片（fetch_k 取全集大小，避免裁剪后候选不足）
-        - 稀疏：BM25 语料只包含可见切片
-        - 融合：复用 main.reciprocal_rank_fusion（按 chunk_id 去重）
-        - 判定：最佳 L2 距离超过阈值 → 无依据
-        """
+    def _retrieve_pg(self, user: User, query: str) -> RetrievalResult:
+        from ingest import retrieval
+
+        with self._conn_factory() as conn:
+            outcome = retrieval.retrieve(
+                conn, user, query, embedder=self._require_embedder(),
+                max_distance=max_distance(),
+            )
+        result = RetrievalResult(query=query)
+        result.visible_docs = outcome.visible_docs
+        result.visible_chunks = outcome.visible_chunks
+        result.best_distance = outcome.best_distance
+        result.dense_hits = outcome.dense_hits
+        result.sparse_hits = outcome.sparse_hits
+        result.grounded = outcome.grounded
+        result.reason = outcome.reason
+        result.docs = [self._to_document(hit) for hit in outcome.hits]
+        return result
+
+    def _require_embedder(self):
+        if self.embedder is None:
+            from ingest.embedding import get_embedder
+
+            self.embedder = get_embedder()
+        return self.embedder
+
+    @staticmethod
+    def _to_document(hit) -> LCDocument:
+        """把 pg 命中还原成原有切片契约，生成/引用/审计代码无需感知后端。"""
+        return LCDocument(
+            page_content=hit.content,
+            metadata={
+                "chunk_id": hit.chunk_id,
+                "doc_id": hit.doc_id,
+                "title": hit.title,
+                "dept": hit.dept,
+                "classification": _CLASSIFICATION_NAMES.get(hit.classification, "未知"),
+                "classification_level": hit.classification,
+                "effective_date": hit.effective_date,
+                "source": hit.metadata.get("source", ""),
+                "chunk_type": hit.chunk_type,
+                "expanded": hit.expanded,
+            },
+        )
+
+    def _retrieve_faiss(self, user: User, query: str) -> RetrievalResult:
+        """FAISS + 内存 BM25（现有教学主线，行为不变）。"""
         visible = self.visible_documents(user)
         result = RetrievalResult(query=query, visible_chunks=len(visible))
         result.visible_docs = len(self.visible_docs(user))
@@ -427,7 +558,8 @@ class RagService:
         tokenized = [core.tokenize(doc.page_content) for doc in visible]
         bm25 = core.BM25Okapi(tokenized) if core.BM25_AVAILABLE else None
         sparse_results = core.sparse_search(
-            bm25, [doc.page_content for doc in visible], query, visible, k=core.RETRIEVE_K
+            bm25, [doc.page_content for doc in visible], query, visible,
+            k=core.RETRIEVE_K,
         )
         result.sparse_hits = len(sparse_results)
 
@@ -543,11 +675,57 @@ class RagService:
     # ---- 状态 ----
 
     def stats(self) -> dict:
+        if self.backend == "pg":
+            return self._stats_pg()
+        return self._stats_faiss()
+
+    def _stats_pg(self) -> dict:
+        from ingest.config import get_settings
+
+        with self._conn_factory() as conn:
+            counts = conn.execute(
+                """SELECT count(*) AS chunks,
+                          count(DISTINCT c.document_id) AS docs
+                     FROM chunks c
+                     JOIN documents d ON d.id = c.document_id
+                    WHERE c.active AND d.status = 'active'
+                      AND d.deleted_at IS NULL""",
+            ).fetchone()
+            by_class = conn.execute(
+                """SELECT d.classification AS level, count(*) AS n
+                     FROM chunks c
+                     JOIN documents d ON d.id = c.document_id
+                    WHERE c.active AND d.status = 'active'
+                      AND d.deleted_at IS NULL
+                    GROUP BY d.classification""",
+            ).fetchall()
+        return {
+            "backend": "pg",
+            "docs": int(counts["docs"]),
+            "chunks": int(counts["chunks"]),
+            "chunks_by_classification": {
+                _CLASSIFICATION_NAMES.get(int(row["level"]), "未知"): int(row["n"])
+                for row in by_class
+                if row["level"] is not None
+            },
+            "load_issues": [],
+            "embed_model": get_settings().embed_model,
+            "llm_provider": core.LLM_PROVIDER,
+            "llm_model": (
+                core.DEEPSEEK_MODEL
+                if core.LLM_PROVIDER == "deepseek"
+                else core.OLLAMA_LLM_MODEL
+            ),
+            "max_distance": max_distance(),
+        }
+
+    def _stats_faiss(self) -> dict:
         by_class: dict[str, int] = {}
         for doc in self.documents:
             name = doc.metadata["classification"]
             by_class[name] = by_class.get(name, 0) + 1
         return {
+            "backend": "faiss",
             "docs": len({doc.metadata["doc_id"] for doc in self.documents}),
             "chunks": len(self.documents),
             "chunks_by_classification": by_class,

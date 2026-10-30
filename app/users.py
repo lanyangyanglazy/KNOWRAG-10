@@ -30,6 +30,7 @@ class User:
     dept: str
     max_level: int
     role: str
+    roles: tuple[str, ...] = ()
 
     @property
     def max_classification(self) -> str:
@@ -47,6 +48,7 @@ class User:
             "max_level": self.max_level,
             "max_classification": self.max_classification,
             "role": self.role,
+            "roles": list(self.roles),
         }
 
     def to_public_dict(self) -> dict:
@@ -61,10 +63,14 @@ class User:
 
 # 演示账号：两个部门、两种密级权限，方便演示「同问题不同可见范围」。
 DEMO_USERS: dict[str, User] = {
-    "zhang": User("zhang", "张伟", "综合处", max_level=1, role="工作人员"),
-    "li": User("li", "李娜", "人事处", max_level=1, role="人事专员"),
-    "wang": User("wang", "王强", "财务处", max_level=2, role="财务主管"),
-    "chen": User("chen", "陈静", "信息中心", max_level=2, role="安全管理员"),
+    "zhang": User("zhang", "张伟", "综合处", max_level=1, role="工作人员",
+                  roles=("uploader", "reviewer")),
+    "li": User("li", "李娜", "人事处", max_level=1, role="人事专员",
+               roles=("uploader", "reviewer")),
+    "wang": User("wang", "王强", "财务处", max_level=2, role="财务主管",
+                 roles=("uploader", "reviewer", "admin")),
+    "chen": User("chen", "陈静", "信息中心", max_level=2, role="安全管理员",
+                 roles=("uploader", "reviewer", "admin")),
 }
 
 

@@ -440,6 +440,7 @@
     .meta-line .meta-tools { display: none; }
   }
 </style>
+<link rel="stylesheet" href="/static/ingest.css">
 </head>
 <body>
 
@@ -543,6 +544,7 @@
           <span class="identity-name" id="me-name">—</span>
           <span class="identity-meta" id="me-meta">—</span>
         </div>
+        <button type="button" class="btn btn-outline btn-sm" id="open-ingest-btn">文档库</button>
         <button type="button" class="btn btn-outline btn-sm" id="logout-btn">退出登录</button>
       </div>
     </div>
@@ -637,6 +639,120 @@
   </div>
 </div>
 
+<!-- ==================== 文档摄取视图 ==================== -->
+<section id="ingest-view" class="app-shell hidden" aria-labelledby="ingest-title">
+  <a class="skip-link" href="#ingest-main">跳到主要内容</a>
+  <div class="gov-strip" aria-hidden="true"></div>
+
+  <header class="masthead masthead-app">
+    <div class="masthead-inner">
+      <div class="brand">
+        <div class="brand-mark brand-mark-sm" aria-hidden="true">政务</div>
+        <div class="brand-text"><h1 class="app-title" id="ingest-title">文档摄取</h1></div>
+      </div>
+      <div class="masthead-actions">
+        <div class="identity">
+          <span class="identity-name" id="ingest-me-name">—</span>
+          <span class="identity-meta" id="ingest-me-meta">—</span>
+        </div>
+        <button type="button" class="btn btn-outline btn-sm" id="back-chat-btn">返回问答</button>
+        <button type="button" class="btn btn-outline btn-sm" id="ingest-logout-btn">退出登录</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="statusbar">
+    <div class="statusbar-inner">
+      <nav class="breadcrumb" aria-label="当前位置">首页 <span aria-hidden="true">/</span> 文档摄取</nav>
+      <p class="system-status" id="ingest-status">正在加载…</p>
+    </div>
+  </div>
+
+  <main class="ingest-main" id="ingest-main">
+    <div class="ingest-alert hidden" id="ingest-alert" role="alert"></div>
+
+    <div class="ingest-grid">
+      <section class="ingest-panel" aria-labelledby="upload-title">
+        <h2 class="ingest-h2" id="upload-title">上传与解析</h2>
+        <form class="ingest-form" id="ingest-upload-form">
+          <label class="ingest-field">文件（PDF / Word / Excel / Markdown，≤50 MB）
+            <input type="file" id="ingest-file" name="file"
+                   accept=".pdf,.docx,.doc,.xlsx,.xls,.md" required>
+          </label>
+          <label class="ingest-field">密级
+            <select id="ingest-classification" name="classification">
+              <option value="0">公开</option>
+              <option value="1" selected>内部</option>
+              <option value="2">秘密</option>
+            </select>
+          </label>
+          <label class="ingest-field">生效日期
+            <input type="date" id="ingest-effective-date" name="effective_date">
+          </label>
+          <label class="ingest-field" id="ingest-version-target-wrap">追加版本到（可选）
+            <select id="ingest-version-target" name="document_id">
+              <option value="">新建文档</option>
+            </select>
+          </label>
+          <div class="ingest-actions">
+            <button type="submit" class="btn btn-primary btn-sm" id="ingest-submit">上传并解析</button>
+            <span class="ingest-hint" id="ingest-job-status"></span>
+          </div>
+          <progress class="ingest-progress hidden" id="ingest-progress" max="100" value="0"
+                    aria-label="解析进度" aria-describedby="ingest-job-status"></progress>
+        </form>
+      </section>
+
+      <section class="ingest-panel" aria-labelledby="library-title">
+        <div class="ingest-panel-head">
+          <h2 class="ingest-h2" id="library-title">文档库</h2>
+          <button type="button" class="btn btn-outline btn-sm" id="ingest-refresh-btn">刷新</button>
+        </div>
+        <div class="ingest-table-wrap">
+          <table class="ingest-table">
+            <thead>
+              <tr><th>标题</th><th>部门</th><th>密级</th><th>状态</th><th>版本</th><th>更新时间</th><th>操作</th></tr>
+            </thead>
+            <tbody id="ingest-library-body"></tbody>
+          </table>
+        </div>
+        <p class="ingest-hint" id="ingest-library-empty">暂无可见文档。</p>
+      </section>
+    </div>
+
+    <section class="ingest-panel hidden" id="ingest-review-panel" aria-labelledby="review-title">
+      <h2 class="ingest-h2" id="review-title">复核台</h2>
+      <div id="ingest-review-summary"></div>
+      <div id="ingest-review-tables"></div>
+      <div class="ingest-review-form" id="ingest-review-form">
+        <label class="ingest-field">标题
+          <input type="text" id="ingest-review-title">
+        </label>
+        <label class="ingest-field">密级
+          <select id="ingest-review-classification">
+            <option value="0">公开</option>
+            <option value="1">内部</option>
+            <option value="2">秘密</option>
+          </select>
+        </label>
+        <label class="ingest-field">生效日期
+          <input type="date" id="ingest-review-effective-date">
+        </label>
+      </div>
+      <div class="ingest-actions" id="ingest-review-actions"></div>
+    </section>
+
+    <section class="ingest-panel hidden" id="ingest-source-panel" aria-labelledby="source-title">
+      <div class="ingest-panel-head">
+        <h2 class="ingest-h2" id="source-title">引用原文</h2>
+        <button type="button" class="btn btn-outline btn-sm" id="ingest-source-close-btn">关闭</button>
+      </div>
+      <div id="ingest-source-body"></div>
+    </section>
+  </main>
+</section>
+
+<script src="/static/ingest.js" defer></script>
 <script>
 (() => {
   const LEVEL_CLASS = { "公开": "lv0", "内部": "lv1", "秘密": "lv2" };
@@ -1076,6 +1192,8 @@
 
     $("login-view").classList.add("hidden");
     $("login-alert").classList.add("hidden");
+    $("ingest-view").classList.add("hidden");
+    $("ingest-source-panel").classList.add("hidden");
     $("chat-view").classList.remove("hidden");
     // 刷新 / 重新登录后从空态开始；同步清空服务端上下文，避免出现界面不可见的历史
     try { await api("/api/history/clear", { method: "POST" }); } catch (_) {}
@@ -1085,6 +1203,8 @@
 
   function showLogin(message) {
     $("chat-view").classList.add("hidden");
+    $("ingest-view").classList.add("hidden");
+    $("ingest-source-panel").classList.add("hidden");
     $("login-view").classList.remove("hidden");
     $("messages").innerHTML = "";
     const alertEl = $("login-alert");
@@ -1161,7 +1281,7 @@
     view.citeList.innerHTML = items.map((it) => {
       const preview = cleanPreview(it.preview);
       return `
-     <div class="cite-item" data-rank="${it.rank}">
+     <div class="cite-item" data-rank="${it.rank}" data-chunk-id="${escapeHtml(it.chunk_id || "")}">
         <div class="cite-index">[${it.rank}]</div>
         <div>
           <div class="cite-title-row">

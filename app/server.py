@@ -21,7 +21,6 @@ import os
 import secrets
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
@@ -32,7 +31,8 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from app.rag_service import BASE_DIR, RagService, core, max_distance
+from app import audit as _audit
+from app.rag_service import BASE_DIR, RagService, core
 from app.users import DEMO_USERS, User, authenticate, get_user
 
 logger = logging.getLogger("rag.server")
@@ -42,10 +42,7 @@ SESSION_MAX_AGE = 8 * 3600  # 8 小时（服务端同样校验，不再只依赖
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # React 生产构建产物（frontend/dist）。存在时由本服务直接托管，否则回退到单文件原型页面。
 DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-AUDIT_FILE = BASE_DIR / "logs" / "audit.jsonl"
-
-# 审计落盘后是否 fsync：政务场景要求「写入即可靠」，默认开启；高吞吐场景可用 AUDIT_FSYNC=0 关闭。
-AUDIT_FSYNC = os.getenv("AUDIT_FSYNC", "1").strip().lower() not in {"0", "false", "no"}
+AUDIT_FILE = _audit.AUDIT_FILE
 
 # 反向代理后取 X-Forwarded-For 需要显式开启，否则客户端可伪造来源 IP。
 TRUST_PROXY = os.getenv("TRUST_PROXY", "0").strip().lower() in {"1", "true", "yes"}
@@ -103,15 +100,16 @@ def get_service() -> RagService:
                     _service_error = f"{type(exc).__name__}: {exc}"
                     raise HTTPException(
                         status_code=503,
-                        detail=f"服务初始化失败：{_service_error}。请确认 Ollama 已启动并已拉取模型。",
+                        detail=(
+                            f"服务初始化失败：{_service_error}。"
+                            "FAISS 模式请确认 Ollama 已启动并已拉取模型；"
+                            "pg 模式请确认 PostgreSQL 可连接且已执行 ingest.schema.sql。"
+                        ),
                     ) from exc
     return _service
 
 
 # ---------- 审计 ----------
-
-
-_AUDIT_LOCK = threading.Lock()
 
 
 def audit_ready(audit_file: Path | None = None) -> tuple[bool, str]:
@@ -132,26 +130,8 @@ def audit_ready(audit_file: Path | None = None) -> tuple[bool, str]:
 
 
 def write_audit(record: dict, audit_file: Path | None = None) -> None:
-    """
-    追加一行 JSON 审计日志。
-
-    - 时间带本机时区偏移（原实现是 naive 本地时间，跨时区/容器 UTC 下无法对齐业务时间）；
-    - 进程内加锁，避免多线程并发写入时行内交错；
-    - 默认 fsync，保证进程崩溃/断电后已返回的问答仍有审计。
-
-    等保 2.0 要求审计记录不可删除、留存 ≥ 6 个月（网络安全法第 21 条）。
-    本原型只做「写入」；留存、归档、防篡改、独立加密存储属于 P1。
-    """
-    target = Path(audit_file or AUDIT_FILE)
-    payload = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), **record}
-    line = json.dumps(payload, ensure_ascii=False) + "\n"
-    with _AUDIT_LOCK:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            if AUDIT_FSYNC:
-                os.fsync(f.fileno())
+    """兼容包装：审计实现已抽到 app/audit.py，供 API 与 worker 共用。"""
+    _audit.write_audit(record, audit_file or AUDIT_FILE)
 
 
 def _safe_audit(record: dict) -> None:
@@ -296,6 +276,16 @@ class HistorySeedPayload(BaseModel):
 
 app = FastAPI(title="政务知识问答（试点原型）", version="0.1.0")
 
+from ingest.errors import IngestError
+
+
+@app.exception_handler(IngestError)
+async def _ingest_error_handler(request: Request, exc: IngestError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"code": exc.code, "detail": str(exc), **exc.detail},
+    )
+
 
 @app.get("/")
 def index() -> FileResponse:
@@ -304,6 +294,17 @@ def index() -> FileResponse:
     if dist_index.exists():
         return FileResponse(dist_index)
     return FileResponse(STATIC_DIR / "index.html")
+
+
+# 只为摄取前端暴露这两个本地资源，不挂 StaticFiles，避免把 index.html 与未来文件一并暴露
+@app.get("/static/ingest.js", include_in_schema=False)
+def ingest_js() -> FileResponse:
+    return FileResponse(STATIC_DIR / "ingest.js", media_type="application/javascript")
+
+
+@app.get("/static/ingest.css", include_in_schema=False)
+def ingest_css() -> FileResponse:
+    return FileResponse(STATIC_DIR / "ingest.css", media_type="text/css")
 
 
 @app.get("/api/users")
@@ -399,24 +400,78 @@ def health():
 
     原实现无论是否初始化都返回 200 + ok=false，K8s/LB 探针会把「未就绪」
     当成「健康」，流量在冷启动或 Ollama 故障时仍然打进来。
+
+    仅当配置了 INGEST_DB_URL（pg 模式）才探测数据库与队列；FAISS 单机模式下
+    没有 DB，不能因为「连不上库」把原有部署判为不健康。
+
+    所有结果分支返回同一套键（db/queue_depth 无 DB 时为 None），消费方不必
+    按状态分支取字段；stats 缺键只降级为 None，绝不因缺键 500。
+
+    交付合规（沿用 main 的口径）：本端点免登录，绝不返回拒答阈值
+    `max_distance`、模型选型 `embed_model` 或密级分布——这些属运维/安全内部
+    指标，下发会泄露知识库边界并便于绕过拒答策略；需要时看进程启动日志与
+    worker 日志，不要把它们放回 HTTP 响应。
     """
+    from ingest.config import get_settings
+
     if _service is None:
         return JSONResponse(
             status_code=503,
             content={
                 "ok": False,
                 "error": _service_error or "服务未初始化（语料/索引尚未加载）",
+                "docs": None,
+                "chunks": None,
+                "skipped_docs": 0,
+                "skipped_files": [],
+                "db": None,
+                "queue_depth": None,
             },
         )
-    stats = _service.stats()
+    # pg 后端的 stats() 要查库：启动后数据库故障必须仍是 503，而不是 FastAPI 500。
+    try:
+        stats = _service.stats()
+    except Exception as exc:  # noqa: BLE001 - stats 在 pg 后端要查库，故障必须仍是 503
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "docs": None,
+                "chunks": None,
+                "skipped_docs": 0,
+                "skipped_files": [],
+                "db": f"error: {type(exc).__name__}",
+                "queue_depth": None,
+            },
+        )
     issues = stats.get("load_issues", [])
-    return {
+    payload = {
         "ok": True,
-        "docs": stats["docs"],
-        "chunks": stats["chunks"],
+        "docs": stats.get("docs", 0),
+        "chunks": stats.get("chunks", 0),
         "skipped_docs": len(issues),
         "skipped_files": [item["file"] for item in issues],
+        # FAISS 单机模式没有 DB：键仍保留，值为 None
+        "db": None,
+        "queue_depth": None,
     }
+
+    if get_settings().db_url:
+        try:
+            from ingest.db import connection
+            from ingest.queue import queue_depth
+
+            with connection() as conn:
+                conn.execute("SELECT 1")
+                payload["queue_depth"] = queue_depth(conn)
+            payload["db"] = "ok"
+        except Exception as exc:  # noqa: BLE001 - 探针要把依赖故障暴露为 503
+            payload["ok"] = False
+            payload["db"] = f"error: {type(exc).__name__}"
+            payload["queue_depth"] = None
+            return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 @app.post("/api/history/clear")
@@ -606,6 +661,19 @@ def chat(
 # 否则 StaticFiles 会在启动时因目录缺失而报错。API 路由（/api/*）已在上方注册，不受影响。
 if (DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="dist-assets")
+
+
+from app.routers import documents as documents_api
+from app.routers import jobs as jobs_api
+from app.routers import review as review_api
+from app.routers import source as source_api
+from app.routers import templates as templates_api
+
+app.include_router(documents_api.router)
+app.include_router(review_api.router)
+app.include_router(templates_api.router)
+app.include_router(jobs_api.router)
+app.include_router(source_api.router)
 
 
 if __name__ == "__main__":
