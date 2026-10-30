@@ -94,7 +94,10 @@ def confirm_version(version_id: str, payload: ConfirmPayload, request: Request,
                 doc_id=result["document_id"],
                 classification=result["classification"],
                 detail={"status": result["status"],
-                        "pending_approvals": result.get("pending_approvals", 0)})
+                        "pending_approvals": result.get("pending_approvals", 0),
+                        # 改密级必须留 before/after（设计 §10.1/§10.4）
+                        "previous_classification": result.get("previous_classification"),
+                        "reclassified": result.get("reclassified")})
     # 与 confirm() 的保存条件一致：没有表格补丁时不会保存模板，不能写假的审计事件；
     # 实际只为 tables[0] 存模板，审计也只记录这一张表的 key。
     if payload.apply_template and payload.tables:
@@ -114,7 +117,9 @@ def approve_version(version_id: str, payload: ApprovePayload, request: Request,
                 doc_id=result["document_id"],
                 classification=result["classification"],
                 detail={"status": result["status"],
-                        "pending_approvals": result.get("pending_approvals", 0)})
+                        "pending_approvals": result.get("pending_approvals", 0),
+                        "previous_classification": result.get("previous_classification"),
+                        "reclassified": result.get("reclassified")})
     return result
 
 

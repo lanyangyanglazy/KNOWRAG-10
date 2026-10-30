@@ -238,3 +238,56 @@ def test_neighbor_expansion_respects_acl(conn):
 
     assert [h.ordinal for h in outcome.hits] == [1, 0]
     assert [h.expanded for h in outcome.hits] == [False, True]
+
+
+def test_document_level_acl_filters_stale_chunk_snapshot(conn):
+    """切片快照落后于文档行时以文档行为准（防御纵深）。
+
+    复核改密会同步更新切片，但历史库/异常路径可能留下不一致快照；
+    检索不能只信 chunks.classification。
+    """
+    user = _user()
+    doc, version = _doc(conn, classification=2)
+    _add_chunk(conn, doc, version, 0, "预算 秘密", _vec(0), classification=1)
+
+    outcome = retrieval.retrieve(conn, user, "预算", embedder=BoomEmbedder())
+
+    assert outcome.visible_chunks == 0
+    assert outcome.visible_docs == 0
+    assert outcome.reason == "no_visible_docs"
+    assert outcome.hits == []
+
+
+def test_set_document_visibility_updates_every_version(conn):
+    """改密级/部门必须单事务覆盖该文档全部版本切片（设计 §10.1）。"""
+    doc, first = _doc(conn, classification=1)
+    _add_chunk(conn, doc, first, 0, "旧版本片段", _vec(0))
+    second = repo.create_version(
+        conn, document_id=doc["id"], version_no=2,
+        sha256=uuid.uuid4().hex + uuid.uuid4().hex,
+        filename="a.xlsx", mime="application/vnd.ms-excel", size_bytes=10,
+        storage_path=f"aa/{uuid.uuid4().hex}", parser="xlsx",
+        parser_version="0.1.0", status="ready")
+    _add_chunk(conn, doc, second, 0, "新版本片段", _vec(1), classification=None)
+
+    before = repo.get_document(conn, doc["id"])
+    changes = repo.set_document_visibility(conn, doc["id"], classification=2,
+                                           dept="人事处")
+    conn.commit()
+
+    assert changes == {"classification": {"from": 1, "to": 2},
+                       "dept": {"from": "综合处", "to": "人事处"}}
+    rows = conn.execute(
+        "SELECT version_id, classification, dept FROM chunks ORDER BY ordinal"
+    ).fetchall()
+    assert [row["classification"] for row in rows] == [2, 2]
+    assert {row["dept"] for row in rows} == {"人事处"}
+    assert before["classification"] == 1
+
+    # 提密后原密级用户立即检索不到；密级足够且同部门的用户仍可
+    assert retrieval.retrieve(conn, _user(), "片段",
+                              embedder=BoomEmbedder()).reason == "no_visible_docs"
+    outcome = retrieval.retrieve(
+        conn, _user(dept="人事处", max_level=2), "片段",
+        embedder=FakeEmbedder(_vec(0)))
+    assert outcome.grounded is True

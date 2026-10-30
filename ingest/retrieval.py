@@ -35,6 +35,9 @@ AND d.status = 'active' AND d.deleted_at IS NULL
 AND c.classification IS NOT NULL
 AND c.classification <= %s
 AND (c.classification = 0 OR c.dept = %s)
+AND d.classification IS NOT NULL
+AND d.classification <= %s
+AND (d.classification = 0 OR d.dept = %s)
 """
 
 
@@ -115,7 +118,7 @@ def _visible_counts(conn: Connection, user: User) -> tuple[int, int]:
               FROM chunks c
               JOIN documents d ON d.id = c.document_id
              WHERE {_ACL}""",
-        (user.max_level, user.dept),
+        (user.max_level, user.dept, user.max_level, user.dept),
     ).fetchone()
     return int(row["chunks"]), int(row["docs"])
 
@@ -124,11 +127,13 @@ def _dense(conn: Connection, user: User, vector: list[float],
            settings: Settings) -> list[Hit]:
     merged: dict[int, Hit] = {}
     for level in range(0, user.max_level + 1):
-        # 公开级不限部门；内部/秘密级只查本部门，命中各自的 partial HNSW 索引
-        dept_sql = "" if level == 0 else " AND c.dept = %s"
-        params: list = [Vector(vector), level]
+        # 公开级不限部门；内部/秘密级只查本部门，命中各自的 partial HNSW 索引。
+        # c.classification=%s 必须保留以命中索引；另外用 d.classification 兜底，
+        # 防止切片快照与文档行不一致时越权（防御纵深）。
+        dept_sql = "" if level == 0 else " AND c.dept = %s AND d.dept = %s"
+        params: list = [Vector(vector), level, level]
         if level:
-            params.append(user.dept)
+            params.extend([user.dept, user.dept])
         params.append(settings.dense_top)
         rows = conn.execute(
             f"""SELECT c.id AS db_id, c.document_id, c.version_id, c.ordinal,
@@ -141,7 +146,8 @@ def _dense(conn: Connection, user: User, vector: list[float],
                   JOIN doc_versions v ON v.id = c.version_id
                  WHERE c.active
                    AND d.status = 'active' AND d.deleted_at IS NULL
-                   AND c.classification = %s{dept_sql}
+                   AND c.classification = %s
+                   AND d.classification = %s{dept_sql}
                    AND c.embedding IS NOT NULL
                  ORDER BY distance
                  LIMIT %s""",
@@ -165,7 +171,8 @@ def _sparse(conn: Connection, user: User, query: str,
               AND c.tsv @@ to_tsquery('simple', %s)
             ORDER BY ts_rank_cd(c.tsv, to_tsquery('simple', %s)) DESC, c.id
             LIMIT %s""",
-        (user.max_level, user.dept, tsquery, tsquery, settings.sparse_top),
+        (user.max_level, user.dept, user.max_level, user.dept,
+         tsquery, tsquery, settings.sparse_top),
     ).fetchall()
     return [_hit(row) for row in rows]
 
@@ -203,11 +210,15 @@ def _expand_table_neighbors(conn: Connection, user: User, hits: list[Hit], *,
                   AND c.classification IS NOT NULL
                   AND c.classification <= %s
                   AND (c.classification = 0 OR c.dept = %s)
+                  AND d.classification IS NOT NULL
+                  AND d.classification <= %s
+                  AND (d.classification = 0 OR d.dept = %s)
                   AND c.metadata->>'table_key' = %s
                   AND c.ordinal = ANY(%s)
                   AND NOT (c.id = ANY(%s))
                 ORDER BY c.ordinal""",
-            (hit.version_id, user.max_level, user.dept, table_key,
+            (hit.version_id, user.max_level, user.dept,
+             user.max_level, user.dept, table_key,
              [hit.ordinal - 1, hit.ordinal + 1], list(selected)),
         ).fetchall()
         for row in rows:

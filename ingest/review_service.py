@@ -137,36 +137,50 @@ def _start_embedding(conn: Connection, version_id: str, ir: DocModel,
     enqueue(conn, "embed", {"version_id": version_id}, priority=50)
 
 
+def _review_result(version_id: str, doc: dict, status: str, *, previous,
+                   reclassified: dict | None, pending_approvals: int = 0,
+                   open_items: int = 0) -> dict:
+    """复核响应的统一形状：除状态外带改密级前后值，审计直接取用。"""
+    return {
+        "version_id": version_id, "status": status,
+        "pending_approvals": pending_approvals, "open_items": open_items,
+        "document_id": str(doc["id"]),
+        "classification": doc["classification"],
+        "previous_classification": previous,
+        "reclassified": reclassified,
+    }
+
+
 def confirm(conn: Connection, version_id: str, payload, *, user: User,
             settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     version, doc = load_version_for_review(conn, version_id, user, write=True)
-    # 必须先记录复核前的密级：本次 payload 可能把秘密级改为低密级，
-    # 改后再看 doc 就丢了「这是降密」这一事实，从而绕过双人确认。
+    # 必须先记录复核前的密级：本次 payload 可能申请降密，改后再看 doc 就丢了
+    # 「这是降密」这一事实；秘密级在第二名复核人确认前绝不落库。
     previous = doc["classification"]
     ir = _ir_of(version)
     _apply_table_patches(ir, payload.tables, settings)
     ir = DocModel.model_validate(ir.model_dump(mode="json"))
 
-    updates: dict = {}
     meta = payload.meta
+    if meta.dept and "admin" not in user.roles and meta.dept != user.dept:
+        raise Forbidden("只能复核本部门文档")
+    if meta.classification is not None and meta.classification > user.max_level:
+        raise Forbidden("密级超过你的权限")
+
+    requested = meta.classification
+    target = requested if requested is not None else previous
+    target_dept = meta.dept or doc["dept"]
+
+    # 标题/生效日期与密级无关，任何分支都可以立即生效。
+    basic: dict = {}
     if meta.title:
-        updates["title"] = meta.title
-    if meta.dept:
-        if "admin" not in user.roles and meta.dept != user.dept:
-            raise Forbidden("只能复核本部门文档")
-        updates["dept"] = meta.dept
-    if meta.classification is not None:
-        if meta.classification > user.max_level:
-            raise Forbidden("密级超过你的权限")
-        updates["classification"] = meta.classification
+        basic["title"] = meta.title
     if meta.effective_date:
-        updates["effective_date"] = meta.effective_date
-    if updates:
-        repo.set_document_meta(conn, doc["id"], **updates)
-    doc = repo.get_document(conn, doc["id"])
-    if doc["classification"] is None:
-        raise ReviewRequired("必须先设置密级才能激活")
+        basic["effective_date"] = meta.effective_date
+    if basic:
+        repo.set_document_meta(conn, doc["id"], **basic)
+        doc = repo.get_document(conn, doc["id"])
 
     _resolve_open(conn, version_id, {"structure", "parse_warning"}, user)
 
@@ -179,23 +193,24 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
                       name=f"{doc['title']}-{table.table_key}",
                       scope_dept=doc["dept"], user=user, _commit=False)
 
-    open_classification = [i for i in repo.list_open_review_items(conn, version_id)
-                           if i["kind"] == "classification"]
-    # 降密已写入文档后 previous 不再可见；只要秘密级复核项还挂着未完成的双人票，
-    # 就必须继续走双人分支，避免同一人再 confirm 一次就被放行。
-    secret_pending = any(
-        (item["payload"] or {}).get("reason") in ("secret_two_person", "secret_downgrade")
-        or repo.count_approvals(conn, item["id"]) > 0
-        for item in open_classification
-    )
-    if doc["classification"] == 2 or (
-            previous == 2 and doc["classification"] < 2) or secret_pending:
-        # 秘密级，或从秘密级降密：都要求两名不同用户确认，防止单人降密绕过。
-        reason = ("secret_two_person" if doc["classification"] == 2
-                  else "secret_downgrade")
+    reclassified = None
+    if previous == 2 or target == 2:
+        # 秘密级（含降密）：dept/classification 一律挂起，等第二名有秘密权限的
+        # 复核人确认后再单事务落库，避免单人降密把内容提前暴露给低密级用户。
+        if user.max_level < 2:
+            raise Forbidden("无秘密级确认权限")
+        reason = "secret_two_person" if target == 2 else "secret_downgrade"
+        open_classification = [i for i in repo.list_open_review_items(conn, version_id)
+                               if i["kind"] == "classification"]
         item_id = (open_classification[0]["id"] if open_classification
                    else repo.ensure_review_item(
                        conn, version_id, "classification", {"reason": reason}))
+        # 每次投票都以本次请求覆盖目标值：最后一名复核人的明确选择才是生效值。
+        repo.update_review_item_payload(conn, item_id, {
+            "reason": reason,
+            "target_classification": target,
+            "target_dept": target_dept,
+        })
         # add_approval 对同一用户重复确认不插入新票，pending 以实际票数为准。
         repo.add_approval(conn, item_id, user.username)
         approvals = repo.count_approvals(conn, item_id)
@@ -203,13 +218,28 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
             repo.set_version_status(conn, version_id, "needs_review", ir=ir,
                                     warnings=version["warnings"])
             conn.commit()
-            return {"version_id": version_id, "status": "needs_review",
-                    "pending_approvals": approvals,
-                    "open_items": len(repo.list_open_review_items(conn, version_id)),
-                    "document_id": str(doc["id"]),
-                    "classification": doc["classification"]}
+            return _review_result(
+                version_id, doc, "needs_review", previous=previous,
+                reclassified=None, pending_approvals=approvals,
+                open_items=len(repo.list_open_review_items(conn, version_id)))
+        reclassified = repo.set_document_visibility(
+            conn, doc["id"], classification=target, dept=target_dept)
         repo.resolve_review_item(conn, item_id, resolved_by=user.username)
+        doc = repo.get_document(conn, doc["id"])
     else:
+        if ((requested is not None and requested != previous)
+                or target_dept != doc["dept"]):
+            if target is not None:
+                # 单事务同时更新 documents 与该文档所有版本的 chunks，
+                # 改密级/部门立即影响检索（设计 §10.1）。
+                reclassified = repo.set_document_visibility(
+                    conn, doc["id"], classification=target, dept=target_dept)
+            else:
+                # 尚未定级：只落部门（密级仍为 NULL），下面的守卫会拦住激活。
+                repo.set_document_meta(conn, doc["id"], dept=target_dept)
+            doc = repo.get_document(conn, doc["id"])
+        if doc["classification"] is None:
+            raise ReviewRequired("必须先设置密级才能激活")
         _resolve_open(conn, version_id, {"classification"}, user)
 
     items = repo.list_open_review_items(conn, version_id)
@@ -217,23 +247,20 @@ def confirm(conn: Connection, version_id: str, payload, *, user: User,
         repo.set_version_status(conn, version_id, "needs_review", ir=ir,
                                 warnings=version["warnings"])
         conn.commit()
-        return {"version_id": version_id, "status": "needs_review",
-                "pending_approvals": 0, "open_items": len(items),
-                "document_id": str(doc["id"]),
-                "classification": doc["classification"]}
+        return _review_result(version_id, doc, "needs_review", previous=previous,
+                              reclassified=reclassified, open_items=len(items))
     _start_embedding(conn, version_id, ir, version["warnings"], user)
-    return {"version_id": version_id, "status": "embedding",
-            "pending_approvals": 0, "open_items": 0,
-            "document_id": str(doc["id"]),
-            "classification": doc["classification"]}
+    return _review_result(version_id, doc, "embedding", previous=previous,
+                          reclassified=reclassified)
 
 
 def approve(conn: Connection, version_id: str, *, user: User) -> dict:
     version, doc = load_version_for_review(conn, version_id, user, write=True)
+    previous = doc["classification"]
     items = [i for i in repo.list_open_review_items(conn, version_id)
              if i["kind"] == "classification"]
-    # 降密已落库后文档不再是秘密级，但挂着的密级复核项仍需第二票才能完成；
-    # 只有确实存在这类复核项才放行，普通文档仍拒绝走 /approve。
+    # 降密在双人确认完成前不落库，因此以「挂着的秘密级复核项」而非文档当前
+    # 密级判断是否放行第二票；普通文档仍拒绝走 /approve。
     secret_item = any(
         (item["payload"] or {}).get("reason") in ("secret_two_person", "secret_downgrade")
         for item in items
@@ -250,25 +277,32 @@ def approve(conn: Connection, version_id: str, *, user: User) -> dict:
     approvals = repo.count_approvals(conn, item_id)
     if approvals < 2:
         conn.commit()
-        return {"version_id": version_id, "status": "needs_review",
-                "pending_approvals": approvals,
-                "document_id": str(doc["id"]),
-                "classification": doc["classification"]}
+        return _review_result(version_id, doc, "needs_review", previous=previous,
+                              reclassified=None, pending_approvals=approvals)
+
+    # 第二票落地时才应用挂起的目标密级/部门；payload 缺失时回退当前文档值。
+    payload = items[0]["payload"] or {}
+    target = payload.get("target_classification")
+    if target is None:
+        target = doc["classification"]
+    target_dept = payload.get("target_dept") or doc["dept"]
+    if target is None:
+        raise ReviewRequired("密级复核项缺少目标密级")
+    reclassified = repo.set_document_visibility(
+        conn, doc["id"], classification=int(target), dept=target_dept)
     repo.resolve_review_item(conn, item_id, resolved_by=user.username)
+    doc = repo.get_document(conn, doc["id"])
 
     remaining = repo.list_open_review_items(conn, version_id)
     if remaining:
         conn.commit()
-        return {"version_id": version_id, "status": "needs_review",
-                "pending_approvals": approvals, "open_items": len(remaining),
-                "document_id": str(doc["id"]),
-                "classification": doc["classification"]}
+        return _review_result(version_id, doc, "needs_review", previous=previous,
+                              reclassified=reclassified, pending_approvals=approvals,
+                              open_items=len(remaining))
     ir = _ir_of(version)
     _start_embedding(conn, version_id, ir, version["warnings"], user)
-    return {"version_id": version_id, "status": "embedding",
-            "pending_approvals": approvals, "open_items": 0,
-            "document_id": str(doc["id"]),
-            "classification": doc["classification"]}
+    return _review_result(version_id, doc, "embedding", previous=previous,
+                          reclassified=reclassified, pending_approvals=approvals)
 
 
 def waive(conn: Connection, version_id: str, *, reason: str,

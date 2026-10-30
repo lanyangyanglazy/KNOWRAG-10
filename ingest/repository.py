@@ -110,6 +110,34 @@ def set_document_meta(conn: Connection, document_id: str, **fields) -> None:
     )
 
 
+def set_document_visibility(conn: Connection, document_id, *,
+                            classification: int, dept: str) -> dict:
+    """同一事务更新文档与其全部切片（含所有历史版本）的密级/部门。
+
+    改密级必须立即影响检索（设计 §10.1）：只改 documents 会让已激活的旧切片
+    继续按旧密级被检索到，因此这里连带更新该文档名下所有版本的全部 chunks。
+    返回改前/改后值，供复核响应与审计记录 before/after。
+    """
+    before = conn.execute(
+        "SELECT classification, dept FROM documents WHERE id=%s FOR UPDATE",
+        (document_id,)).fetchone()
+    conn.execute(
+        "UPDATE documents SET classification=%s, dept=%s, updated_at=now() WHERE id=%s",
+        (classification, dept, document_id))
+    conn.execute(
+        "UPDATE chunks SET classification=%s, dept=%s WHERE document_id=%s",
+        (classification, dept, document_id))
+    return {"classification": {"from": before["classification"], "to": classification},
+            "dept": {"from": before["dept"], "to": dept}}
+
+
+def update_review_item_payload(conn: Connection, item_id: int, payload: dict) -> None:
+    """把 payload 浅合并进复核项；双人确认时每次投票都以最新请求覆盖目标值。"""
+    conn.execute(
+        "UPDATE review_items SET payload = COALESCE(payload, '{}'::jsonb) || %s "
+        "WHERE id=%s", (Jsonb(payload), item_id))
+
+
 def ensure_review_item(conn: Connection, version_id: str, kind: str,
                        payload: dict) -> int:
     reason = payload.get("reason")

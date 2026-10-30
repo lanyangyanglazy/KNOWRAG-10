@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import json
+import uuid
+from types import SimpleNamespace
 
 import psycopg
+import pytest
+from pgvector import Vector
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
+from app.users import User
 from ingest import repository as repo
+from ingest import retrieval, review_service
+from ingest.errors import Forbidden
 from ingest.ir import Block, Column, DocMeta, DocModel, ParserInfo, Table, Warning
 from tests.ingest.conftest import fetch_all
+
+DIM = 1024
 
 
 def build_ir(*, repeated_header: bool = False,
@@ -76,6 +86,32 @@ def seed(db_url: str, *, classification: int | None = 1,
                                     {"reason": "secret_two_person"})
         conn.commit()
         return str(doc["id"]), str(version["id"])
+
+
+def seed_chunks(db_url: str, doc_id: str, version_id: str, *,
+                classification: int = 2, dept: str = "财务处",
+                count: int = 2) -> None:
+    """给版本塞几片 active 切片，用于验证改密级会同步到所有切片。"""
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        for ordinal in range(count):
+            content = f"预算 片段{ordinal}"
+            conn.execute(
+                """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type,
+                       content, content_tokens, embed_model, dept, classification,
+                       metadata, chunk_hash, active)
+                   VALUES (%s,%s,%s,'text',%s,%s,'bge-m3',%s,%s,%s,%s,true)""",
+                (doc_id, version_id, ordinal, content, content, dept,
+                 classification, Jsonb({}), f"{ordinal:064d}"),
+            )
+        conn.commit()
+
+
+def chunk_levels(db_url: str, doc_id: str) -> list[int]:
+    rows = fetch_all(
+        db_url,
+        "SELECT classification FROM chunks WHERE document_id=%s ORDER BY version_id, ordinal",
+        (doc_id,))
+    return [row["classification"] for row in rows]
 
 
 def test_review_summary_and_preview(api):
@@ -451,3 +487,152 @@ def test_apply_template_is_audited(api, tmp_path, monkeypatch):
     assert applied[0]["version_id"] == version_id
     # 实际只为 tables[0] 保存了模板，审计不能把其余补丁表也算进去。
     assert applied[0]["detail"]["table_keys"] == ["t1"]
+
+
+def test_secret_downgrade_keeps_document_secret_until_second_approver(api):
+    make, db_url = api
+    doc_id, version_id = seed(db_url, classification=2, structure=False)
+    seed_chunks(db_url, doc_id, version_id, classification=2)
+    wang = make("wang")
+
+    first = wang.post(f"/api/versions/{version_id}/confirm",
+                      json={"meta": {"classification": 1}})
+    assert first.status_code == 200, first.text
+    body = first.json()
+    # 一票即降密 = 单人把秘密内容暴露给内部级用户：目标密级必须挂起，
+    # 文档与全部切片在第二票之前仍是秘密级（设计 §10.1）。
+    assert body["status"] == "needs_review"
+    assert body["pending_approvals"] == 1
+    assert body["classification"] == 2
+    assert body["previous_classification"] == 2
+    assert body["reclassified"] is None
+    assert fetch_all(db_url, "SELECT classification FROM documents WHERE id=%s",
+                     (doc_id,))[0]["classification"] == 2
+    assert chunk_levels(db_url, doc_id) == [2, 2]
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM jobs")[0]["n"] == 0
+
+    chen = make("chen")
+    final = chen.post(f"/api/versions/{version_id}/confirm",
+                      json={"meta": {"classification": 1}})
+    assert final.status_code == 200, final.text
+    assert final.json()["status"] == "embedding"
+    assert final.json()["classification"] == 1
+    assert final.json()["reclassified"] == {
+        "classification": {"from": 2, "to": 1},
+        "dept": {"from": "财务处", "to": "财务处"},
+    }
+    # 改密级要连该文档所有版本切片一起改，否则旧切片按旧密级继续可检索。
+    assert chunk_levels(db_url, doc_id) == [1, 1]
+
+
+def test_low_clearance_reviewer_cannot_vote_on_secret(api):
+    make, db_url = api
+    doc_id, version_id = seed(db_url, classification=2, structure=False,
+                              dept="综合处")
+    zhang = make("zhang")  # 同部门 reviewer，max_level=1
+
+    denied = zhang.post(f"/api/versions/{version_id}/confirm",
+                        json={"meta": {"classification": 1}})
+    assert denied.status_code == 404
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM review_approvals")[0]["n"] == 0
+    assert fetch_all(db_url, "SELECT classification FROM documents WHERE id=%s",
+                     (doc_id,))[0]["classification"] == 2
+
+    # 服务层兜底：即便以「管理员但密级不足」的身份绕过可见性检查，也不能替秘密级投票。
+    weak_admin = User(username="weak", display_name="越权管理员", dept="综合处",
+                      max_level=1, role="管理员", roles=("reviewer", "admin"))
+    payload = SimpleNamespace(
+        tables=[], apply_template=False,
+        meta=SimpleNamespace(title=None, dept=None, classification=None,
+                             effective_date=None))
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        with pytest.raises(Forbidden):
+            review_service.confirm(conn, version_id, payload, user=weak_admin)
+    assert fetch_all(db_url, "SELECT count(*) AS n FROM review_approvals")[0]["n"] == 0
+
+
+def test_downgrade_audit_records_before_and_after(api, tmp_path, monkeypatch):
+    from app import server
+
+    make, db_url = api
+    audit_file = tmp_path / "reclassify-audit.jsonl"
+    monkeypatch.setattr(server, "AUDIT_FILE", audit_file)
+    doc_id, version_id = seed(db_url, classification=2, structure=False)
+
+    assert make("wang").post(f"/api/versions/{version_id}/confirm",
+                             json={"meta": {"classification": 1}}).status_code == 200
+    assert make("chen").post(f"/api/versions/{version_id}/approve",
+                             json={"decision": "approve"}).status_code == 200
+
+    lines = [json.loads(line) for line in
+             audit_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # 同一文件里还有登录审计（只有 event、没有 action），必须用 .get 过滤。
+    events = [event for event in lines if event.get("action") == "review_submit"]
+    assert len(events) == 1
+    submit = events[0]
+    assert submit["detail"]["previous_classification"] == 2
+    assert submit["detail"]["reclassified"] is None
+
+    approvals = [event for event in lines if event.get("action") == "review_approve"]
+    assert len(approvals) == 1
+    approve = approvals[0]
+    assert approve["classification"] == 1
+    assert approve["detail"]["previous_classification"] == 2
+    assert approve["detail"]["reclassified"] == {
+        "classification": {"from": 2, "to": 1},
+        "dept": {"from": "财务处", "to": "财务处"},
+    }
+
+
+class _Embedder:
+    model = "bge-m3"
+    dim = DIM
+
+    def embed(self, texts):
+        return [[1.0] + [0.0] * (DIM - 1) for _ in texts]
+
+
+def test_completed_reclassify_changes_retrieval_immediately(api, conn):
+    """改密级「立即影响检索」（§10.1）：降密前低密级用户不可见，第二票后立即可见。"""
+    from ingest.chunking import tokenize
+
+    make, db_url = api
+    doc_id, version_id = seed(db_url, classification=2, structure=False)
+    content = "秘密预算 编制说明"
+    tokens = " ".join(tokenize(content))
+    conn.execute(
+        """INSERT INTO chunks (document_id, version_id, ordinal, chunk_type,
+               content, content_tokens, tsv, embedding, embed_model, dept,
+               classification, metadata, chunk_hash, active)
+           VALUES (%s,%s,0,'text',%s,%s,to_tsvector('simple', %s),%s,'bge-m3',
+                   '财务处',2,%s,%s,true)""",
+        (doc_id, version_id, content, tokens, tokens,
+         Vector([1.0] + [0.0] * (DIM - 1)),
+         Jsonb({"chunk_id": f"{doc_id}@v1#0", "source": "预算.xlsx"}),
+         uuid.uuid4().hex + uuid.uuid4().hex))
+    conn.execute(
+        "UPDATE documents SET status='active', current_version_id=%s WHERE id=%s",
+        (version_id, doc_id))
+    conn.commit()
+
+    finance_l1 = User(username="zha", display_name="财务科员", dept="财务处",
+                      max_level=1, role="工作人员", roles=("uploader",))
+    finance_l2 = User(username="wang", display_name="王强", dept="财务处",
+                      max_level=2, role="财务主管", roles=("reviewer", "admin"))
+
+    blocked = retrieval.retrieve(conn, finance_l1, "预算", embedder=_Embedder())
+    assert blocked.visible_chunks == 0
+    assert blocked.reason == "no_visible_docs"
+    assert retrieval.retrieve(conn, finance_l2, "预算",
+                              embedder=_Embedder()).grounded is True
+
+    assert make("wang").post(f"/api/versions/{version_id}/confirm",
+                             json={"meta": {"classification": 1}}).status_code == 200
+    assert make("chen").post(f"/api/versions/{version_id}/approve",
+                             json={"decision": "approve"}).status_code == 200
+
+    # 同一连接要看到别的事务写入的结果：先结束当前事务再检索。
+    conn.commit()
+    outcome = retrieval.retrieve(conn, finance_l1, "预算", embedder=_Embedder())
+    assert outcome.grounded is True
+    assert [h.classification for h in outcome.hits] == [1]
