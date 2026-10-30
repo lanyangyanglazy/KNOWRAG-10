@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from ingest.profiles import resolve_profile
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 
@@ -27,6 +29,8 @@ class Settings:
     max_cells_per_sheet: int = 200_000
     max_cells_per_workbook: int = 2_000_000
     include_hidden_sheets: bool = False
+    # 切片 profile 名称；具体数值由 profile 决定，环境变量可覆盖（见 ingest/profiles.py）
+    chunk_profile: str = "p400"
     chunk_size: int = 400
     chunk_overlap: int = 60
     table_rows_per_chunk: int = 10
@@ -57,19 +61,23 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    # profile 先定默认值，环境变量再逐项覆盖：RAG_CHUNK_PROFILE=p600 就能整体切换，
+    # 只改 INGEST_CHUNK_SIZE 则保留 profile 其余参数。
+    profile = resolve_profile(os.getenv("RAG_CHUNK_PROFILE"))
     return Settings(
         db_url=os.getenv("INGEST_DB_URL", ""),
         upload_dir=Path(os.getenv("INGEST_UPLOAD_DIR", str(BASE_DIR / "data" / "uploads"))),
         storage_backend=os.getenv("INGEST_STORAGE", "fs"),
         max_file_mb=_int("INGEST_MAX_FILE_MB", 50),
         max_pdf_pages=_int("INGEST_MAX_PDF_PAGES", 2000),
-        max_rows_per_table=_int("INGEST_MAX_ROWS_PER_TABLE", 5000),
+        max_rows_per_table=_int("INGEST_MAX_ROWS_PER_TABLE", profile.max_rows_per_table),
         max_cells_per_sheet=_int("INGEST_MAX_CELLS_PER_SHEET", 200_000),
         max_cells_per_workbook=_int("INGEST_MAX_CELLS_PER_WORKBOOK", 2_000_000),
         include_hidden_sheets=os.getenv("INGEST_INCLUDE_HIDDEN_SHEETS", "0") == "1",
-        chunk_size=_int("INGEST_CHUNK_SIZE", 400),
-        chunk_overlap=_int("INGEST_CHUNK_OVERLAP", 60),
-        table_rows_per_chunk=_int("INGEST_TABLE_ROWS_PER_CHUNK", 10),
+        chunk_profile=profile.profile_id,
+        chunk_size=_int("INGEST_CHUNK_SIZE", profile.chunk_size),
+        chunk_overlap=_int("INGEST_CHUNK_OVERLAP", profile.chunk_overlap),
+        table_rows_per_chunk=_int("INGEST_TABLE_ROWS_PER_CHUNK", profile.table_rows_per_chunk),
         header_accept=_float("HEADER_ACCEPT", 0.75),
         header_margin=_float("HEADER_MARGIN", 0.12),
         header_llm=os.getenv("HEADER_LLM", "auto"),

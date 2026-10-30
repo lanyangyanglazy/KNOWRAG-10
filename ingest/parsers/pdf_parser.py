@@ -148,6 +148,16 @@ def _grid_from_extracted(name: str, extracted: list[list] | None) -> SheetGrid |
     )
 
 
+def _is_numeric_key(text: str) -> bool:
+    """续页首列是否为数字行键（如 "3"、"15"）。
+
+    长表跨页时，续页第一行通常是数据行；如果它被误判成表头，会得到
+    "3 / 财务处 / 150" 这样的列名，比没有表头更难排查。
+    """
+    value = text.strip().replace(",", "")
+    return bool(value) and value.isdigit()
+
+
 def _usable_templates(templates: list[dict], ncols: int) -> list[dict]:
     """只保留列数与区域宽度一致的模板；坏模板不能进入 build_table。"""
     return [t for t in templates if len(template_columns(t)) == ncols]
@@ -300,6 +310,9 @@ class PdfParser:
         path_stack: list[str] = []
         table_no = 0
         llm_calls = 0
+        # 跨页续表：记录"上一页同列数表格"的列名，供下一页无表头时继承。
+        # key=ncols 而不是 table_key：不同表格可能跨页交错，列数是最稳的锚点。
+        last_columns: dict[int, tuple[int, list[dict]]] = {}
         for page_no, (text_blocks, tables) in enumerate(
                 zip(page_blocks, page_tables), start=1):
             for item in text_blocks:
@@ -330,18 +343,35 @@ class PdfParser:
                 header, forced_columns = self._resolve_header(
                     grid, region, decision)
 
+                llm_note: str | None = None
                 if header is None and self.settings.header_llm_enabled \
                         and self.llm is not None \
                         and llm_calls < _MAX_LLM_HEADER_CALLS:
                     header, raw = try_llm_header(grid, region, self.llm)
                     llm_calls += 1
                     if header is None:
+                        llm_note = raw
+
+                # 续表兜底：上一页存在同列数表格且已识别出表头，则沿用其列名。
+                # 这里只复用列名，不伪造 header_rows（本页网格里确实没有表头行）。
+                previous = last_columns.get(region.ncols)
+                adjacent = previous is not None and previous[0] == page_no - 1
+                if adjacent:
+                    # 续页首行是数字行键却被当成表头：这是误判，优先继承上一页列名。
+                    if (header is not None and header.start_row == region.start_row
+                            and _is_numeric_key(grid.cell(1, 1).text)):
+                        header = None
+                    if header is None and not forced_columns:
+                        forced_columns = previous[1]
+
+                if header is None and not forced_columns:
+                    if llm_note is not None:
                         warnings.append(Warning(
-                            code="ambiguous_header", detail=raw[:500]))
-                elif header is None and decision.candidate is not None:
-                    warnings.append(Warning(
-                        code="ambiguous_header",
-                        detail=f"置信度 {decision.candidate.confidence:.2f}"))
+                            code="ambiguous_header", detail=llm_note[:500]))
+                    elif decision.candidate is not None:
+                        warnings.append(Warning(
+                            code="ambiguous_header",
+                            detail=f"置信度 {decision.candidate.confidence:.2f}"))
 
                 try:
                     table, table_warnings = build_table(
@@ -357,6 +387,12 @@ class PdfParser:
                     Warning(code=w.code, detail=w.detail) for w in table_warnings)
                 table = table.model_copy(update={
                     "page": page_no, "bbox": table_info["bbox"]})
+                if table.header_rows:
+                    last_columns[region.ncols] = (
+                        page_no, [column.model_dump() for column in table.columns])
+                elif forced_columns is not None:
+                    # 连续多页续表：保持"上一页"指针跟着走，第 3 页也能继承。
+                    last_columns[region.ncols] = (page_no, forced_columns)
                 blocks_out.append(Block(
                     block_id=f"b{len(blocks_out) + 1}", type="table",
                     table=table, path=list(path_stack), page=page_no,

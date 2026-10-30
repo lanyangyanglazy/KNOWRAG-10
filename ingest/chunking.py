@@ -7,6 +7,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from ingest.config import Settings, get_settings
 from ingest.ir import DocModel, Table
+from ingest.profiles import ChunkProfile, profile_from_settings, resolve_profile
 
 try:
     import jieba
@@ -68,7 +69,8 @@ def _row_runs(numbers: list[int]) -> str:
                     for low, high in spans)
 
 
-def _split_body(text: str, limit: int, overlap: int) -> list[str]:
+def _split_body(text: str, limit: int, overlap: int, *,
+                min_chars: int = MIN_CHUNK_CHARS) -> list[str]:
     text = text.strip()
     if not text:
         return []
@@ -83,7 +85,7 @@ def _split_body(text: str, limit: int, overlap: int) -> list[str]:
     pieces = [piece.strip() for piece in splitter.split_text(text) if piece.strip()]
     merged: list[str] = []
     for piece in pieces:
-        if (merged and len(piece) < MIN_CHUNK_CHARS
+        if (merged and len(piece) < min_chars
                 and len(merged[-1]) + 1 + len(piece) <= limit):
             merged[-1] = f"{merged[-1]}\n{piece}"
         else:
@@ -98,7 +100,8 @@ def _column_label(column) -> str:
 class _Builder:
     def __init__(self, ir: DocModel, *, doc_id: str, version_no: int, title: str,
                  dept: str, classification: int | None, source_filename: str,
-                 settings: Settings, origin_id: str | None = None) -> None:
+                 settings: Settings, profile: ChunkProfile,
+                 origin_id: str | None = None) -> None:
         self.ir = ir
         # psycopg 返回的 UUID 不是 JSON 可序列化类型；metadata 要落 jsonb，统一转字符串
         self.doc_id = str(doc_id)
@@ -109,6 +112,7 @@ class _Builder:
         self.classification = classification
         self.source_filename = source_filename
         self.settings = settings
+        self.profile = profile
         self.drafts: list[ChunkDraft] = []
 
     def add(self, chunk_type: str, content: str, metadata: dict) -> None:
@@ -119,6 +123,8 @@ class _Builder:
             # doc_id 用于评测金标匹配：导入语料取源系统编号，上传文档退回 UUID
             "doc_id": self.origin_id or self.doc_id,
             "chunk_type": chunk_type,
+            # 切片参数留痕：换 profile 后能解释"为什么召回变了"
+            "chunk_profile": self.profile.profile_id,
             "title": self.title,
             "dept": self.dept,
             "classification": self.classification,
@@ -134,12 +140,13 @@ class _Builder:
         ))
 
     def emit_text(self, body: str, path: list[str]) -> None:
-        prefix = _prefix(self.title, path)
-        chunk_size = self.settings.chunk_size
+        prefix = _prefix(self.title, path) if self.profile.title_prefix else ""
+        chunk_size = self.profile.chunk_size
         if chunk_size < len(prefix) + 2:
             prefix = prefix[:max(0, chunk_size - 2)]
-        limit = max(1, chunk_size - len(prefix) - 1)
-        for piece in _split_body(body, limit, self.settings.chunk_overlap):
+        limit = max(1, chunk_size - len(prefix) - 1) if prefix else chunk_size
+        for piece in _split_body(body, limit, self.profile.chunk_overlap,
+                                 min_chars=self.profile.min_chunk_chars):
             self.add("text", f"{prefix}\n{piece}", {
                 "heading_path": list(path),
                 "block_id": None,
@@ -201,7 +208,7 @@ class _Builder:
                 if start + offset not in excluded]
 
     def _select_pairs(self, pairs: list[tuple[int, list[str]]]) -> list[tuple[int, list[str]]]:
-        if len(pairs) <= self.settings.max_rows_per_table:
+        if len(pairs) <= self.profile.max_rows_per_table:
             return pairs
         if len(pairs) <= SAMPLE_HEAD + SAMPLE_TAIL:
             return pairs
@@ -216,7 +223,7 @@ class _Builder:
         return [pair for pair in pairs if pair[0] in chosen]
 
     def _windows(self, pairs: list[tuple[int, list[str]]]):
-        size = max(1, self.settings.table_rows_per_chunk)
+        size = max(1, self.profile.table_rows_per_chunk)
         return [pairs[start:start + size] for start in range(0, len(pairs), size)]
 
     def _column_groups(self, table: Table) -> list[dict]:
@@ -272,12 +279,17 @@ def chunk_document(ir: DocModel, *, doc_id: str, version_no: int, title: str,
                    dept: str, classification: int | None,
                    source_filename: str,
                    settings: Settings | None = None,
+                   profile: ChunkProfile | str | None = None,
                    origin_id: str | None = None) -> list[ChunkDraft]:
     settings = settings or get_settings()
+    # 显式 profile 优先；否则由 settings 推导（settings 的默认值已按 profile 填好，
+    # 只有显式环境变量覆盖时才会出现 ``xxx+env`` 后缀）。
+    chunk_profile = (resolve_profile(profile) if profile is not None
+                     else profile_from_settings(settings))
     builder = _Builder(ir, doc_id=doc_id, version_no=version_no, title=title,
                        dept=dept, classification=classification,
                        source_filename=source_filename, settings=settings,
-                       origin_id=origin_id)
+                       profile=chunk_profile, origin_id=origin_id)
     stack: list[tuple[int, str]] = []
     section_path: list[str] = []
     buffer: list[str] = []
@@ -292,7 +304,7 @@ def chunk_document(ir: DocModel, *, doc_id: str, version_no: int, title: str,
         if carry:
             text = f"{carry}\n\n{text}".strip()
             carry = ""
-        if len(text) < MERGE_CHARS:
+        if len(text) < builder.profile.merge_chars:
             carry = text
             return
         builder.emit_text(text, section_path)

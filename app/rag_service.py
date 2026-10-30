@@ -32,7 +32,6 @@ import yaml
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document as LCDocument
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # app/ 在仓库根目录下；把根目录加入 sys.path，才能复用 main.py 的检索与生成组件
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -42,6 +41,14 @@ if str(BASE_DIR) not in sys.path:
 import main as core  # noqa: E402  （复用 tokenize / RRF / Prompt / strip_think_stream）
 
 from app.users import CLASSIFICATION_LEVELS, User, can_view  # noqa: E402
+from ingest.chunking import chunk_document  # noqa: E402
+from ingest.config import get_settings  # noqa: E402
+from ingest.parsers.markdown_parser import MarkdownParser  # noqa: E402
+from ingest.profiles import (  # noqa: E402
+    ChunkProfile,
+    profile_from_settings,
+    resolve_profile,
+)
 
 # ---------- 路径与参数 ----------
 GOV_DOCS_DIR = BASE_DIR / "data" / "gov_docs"
@@ -226,21 +233,46 @@ def load_gov_documents(
     *,
     strict: bool = True,
     issues: list[DocIssue] | None = None,
+    profile: ChunkProfile | str | None = None,
 ) -> list[LCDocument]:
-    """把带密级文档切成检索切片，每个切片携带完整的密级/部门元数据。"""
-    splitter = RecursiveCharacterTextSplitter(
-        separators=core.CHINESE_SEPARATORS,
-        chunk_size=core.CHUNK_SIZE,
-        chunk_overlap=core.CHUNK_OVERLAP,
-    )
+    """把带密级文档切成检索切片，每个切片携带完整的密级/部门元数据。
+
+    与摄取链路（``ingest.chunking``）共用同一套结构感知切片器：先解析成
+    ``DocModel``（标题层级 + 表格），再按 profile 切分。区别只在对外契约：
+    FAISS 路径保持旧的 ``{doc_id}#{idx}`` 切片 ID 与字符串密级，
+    老前端与评测金标无需改动。
+    """
+    chunk_profile = resolve_profile(profile)
+    parser = MarkdownParser()
     documents: list[LCDocument] = []
     for gov in load_gov_docs(docs_dir, strict=strict, issues=issues):
         meta = gov.metadata
-        chunks = [c for c in splitter.split_text(gov.body) if c.strip()]
-        for idx, chunk in enumerate(chunks):
+        try:
+            ir = parser.parse(gov.path)
+        except Exception as exc:  # 与 load_gov_docs 的宽松语义保持一致
+            if strict:
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning("跳过无法解析的文档 %s（%s）", gov.path.name, reason)
+            if issues is not None:
+                issues.append(DocIssue(path=gov.path, reason=reason))
+            continue
+
+        drafts = chunk_document(
+            ir,
+            doc_id=str(meta["doc_id"]),
+            version_no=1,
+            title=str(meta["title"]),
+            dept=str(meta["dept"]),
+            classification=int(meta["classification_level"]),
+            source_filename=gov.path.name,
+            profile=chunk_profile,
+            origin_id=str(meta["doc_id"]),
+        )
+        for idx, draft in enumerate(drafts):
             documents.append(
                 LCDocument(
-                    page_content=chunk,
+                    page_content=draft.content,
                     metadata={
                         "chunk_id": f"{meta['doc_id']}#{idx}",
                         "doc_id": meta["doc_id"],
@@ -250,6 +282,10 @@ def load_gov_documents(
                         "classification_level": meta["classification_level"],
                         "effective_date": str(meta.get("effective_date", "")),
                         "source": gov.path.name,
+                        "chunk_type": draft.chunk_type,
+                        "heading_path": list(draft.metadata.get("heading_path", [])),
+                        "chunk_profile": chunk_profile.profile_id,
+                        "char_count": len(draft.content),
                     },
                 )
             )
@@ -258,21 +294,46 @@ def load_gov_documents(
 
 # ---------- 索引指纹与构建 ----------
 
-def corpus_signature(docs_dir: Path = GOV_DOCS_DIR) -> dict:
-    """
-    语料指纹：所有文件内容 hash + 切分配置 + embedding 模型。
+def _profile_for_documents(documents: List[LCDocument]) -> ChunkProfile:
+    """从切片 metadata 还原 profile；``xxx+env`` 这类覆盖态按当前配置还原。"""
+    raw = documents[0].metadata.get("chunk_profile") if documents else None
+    try:
+        return resolve_profile(raw)
+    except ValueError:
+        return profile_from_settings(get_settings())
 
-    任一变化都会触发 FAISS 重建，避免「密级或正文改了、索引还是旧的」。
+
+def corpus_signature(docs_dir: Path = GOV_DOCS_DIR,
+                     profile: ChunkProfile | str | None = None) -> dict:
     """
+    语料指纹：文件内容 hash + 切片 profile + 分隔符 + embedding 模型。
+
+    任一变化都会触发 FAISS 重建。切片参数（含标题前缀开关）必须进指纹：
+    否则改了切分逻辑但指纹没变，会静默加载旧索引，表现为「改了没效果」。
+    """
+    chunk_profile = resolve_profile(profile)
     files = {
         p.name: hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(Path(docs_dir).glob("*.md"))
     }
+    separators = json.dumps(core.CHINESE_SEPARATORS, ensure_ascii=False)
     return {
         "files": files,
+        "chunk_profile": {
+            "profile_id": chunk_profile.profile_id,
+            "chunk_size": chunk_profile.chunk_size,
+            "chunk_overlap": chunk_profile.chunk_overlap,
+            "table_rows_per_chunk": chunk_profile.table_rows_per_chunk,
+            "max_rows_per_table": chunk_profile.max_rows_per_table,
+            "title_prefix": chunk_profile.title_prefix,
+            "min_chunk_chars": chunk_profile.min_chunk_chars,
+            "merge_chars": chunk_profile.merge_chars,
+        },
+        "separators_sha256": hashlib.sha256(separators.encode("utf-8")).hexdigest()[:16],
+        # 兼容旧指纹字段名：老版本 meta 缺 profile 时会自然不匹配并重建
         "chunk_config": {
-            "chunk_size": core.CHUNK_SIZE,
-            "chunk_overlap": core.CHUNK_OVERLAP,
+            "chunk_size": chunk_profile.chunk_size,
+            "chunk_overlap": chunk_profile.chunk_overlap,
         },
         "embed_model": core.EMBED_MODEL,
     }
@@ -297,11 +358,18 @@ def _save_meta(sig: dict, index_dir: str = WEB_INDEX_DIR, meta_file: str = WEB_I
 def build_or_load_index(
     documents: List[LCDocument],
     embed_model,
-    index_dir: str = WEB_INDEX_DIR,
-    meta_file: str = WEB_INDEX_META_FILE,
+    index_dir: str | None = None,
+    meta_file: str | None = None,
 ) -> FAISS:
-    """指纹一致则加载已有索引，否则重建并持久化（与 main.build_index 同思路）。"""
-    sig = corpus_signature()
+    """指纹一致则加载已有索引，否则重建并持久化（与 main.build_index 同思路）。
+
+    索引按 profile 分目录：切换 ``RAG_CHUNK_PROFILE`` 不会覆盖另一个 profile
+    的索引，也就不会出现「用 A 的参数查 B 的向量」这种难排查的错配。
+    """
+    profile = _profile_for_documents(documents)
+    index_dir = index_dir or os.path.join(WEB_INDEX_DIR, profile.profile_id)
+    meta_file = meta_file or os.path.join(index_dir, "index.meta.json")
+    sig = corpus_signature(profile=profile)
     faiss_ok = os.path.exists(os.path.join(index_dir, "index.faiss"))
 
     if faiss_ok and _load_meta(meta_file) == sig:
@@ -369,8 +437,11 @@ class RagService:
     def __init__(self, llm=None, embed_model=None,
                  history_turns: int = core.MAX_HISTORY_TURNS, *,
                  backend: str | None = None, conn_factory=None,
-                 embedder=None):
+                 embedder=None, chunk_profile: ChunkProfile | str | None = None):
         self.backend = resolve_backend(backend)
+        # faiss 路径用它切分语料；pg 路径的切片在入库时已按当时的 profile 切好，
+        # 这里只保留 id 供状态展示与排查（不能靠它改变已落库的切片）。
+        self.chunk_profile = resolve_profile(chunk_profile)
         self.llm = llm or core.init_llm()
         self.history_turns = history_turns
         self._history: dict[str, list] = {}
@@ -394,7 +465,8 @@ class RagService:
         self._conn_factory = None
         self.embed_model = embed_model or core.init_embedding()
         # 运行时用宽松模式：单个坏文件只跳过并留痕，不让整库不可用
-        self.documents = load_gov_documents(issues=self.load_issues)
+        self.documents = load_gov_documents(
+            issues=self.load_issues, profile=self.chunk_profile)
         if self.load_issues:
             logger.warning(
                 "语料加载跳过 %d 个文件（以部分文档启动）：%s",
@@ -721,14 +793,19 @@ class RagService:
 
     def _stats_faiss(self) -> dict:
         by_class: dict[str, int] = {}
+        by_type: dict[str, int] = {}
         for doc in self.documents:
             name = doc.metadata["classification"]
             by_class[name] = by_class.get(name, 0) + 1
+            chunk_type = doc.metadata.get("chunk_type", "text")
+            by_type[chunk_type] = by_type.get(chunk_type, 0) + 1
         return {
             "backend": "faiss",
             "docs": len({doc.metadata["doc_id"] for doc in self.documents}),
             "chunks": len(self.documents),
             "chunks_by_classification": by_class,
+            "chunks_by_type": by_type,
+            "chunk_profile": self.chunk_profile.profile_id,
             "load_issues": [issue.to_dict() for issue in self.load_issues],
             "embed_model": core.EMBED_MODEL,
             "llm_provider": core.LLM_PROVIDER,

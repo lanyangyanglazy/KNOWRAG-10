@@ -19,15 +19,25 @@ KEYWORDS = (
     "序号", "编号", "名称", "项目", "部门", "单位", "金额", "数量", "单价",
     "合计", "预算", "实际", "支出", "收入", "比例", "日期", "时间", "备注",
     "说明", "类型", "状态", "人数", "季度", "月份", "年度",
+    # 政务/监管表格高频表头词：缺了它们，"类别/事项/内容"这类无数字表头
+    # 会拿不到任何关键词信号，在 PDF（无样式）上被误判为低置信度。
+    "类别", "事项", "内容", "编码", "层级", "形式", "范围", "对象", "依据", "标准",
 )
 WEIGHTS = {
     "fill": 0.12, "type_contrast": 0.28, "uniqueness": 0.14, "style": 0.14,
     "keyword": 0.10, "length": 0.08, "context": 0.14,
 }
 PENALTIES = {
-    "data_above": 0.20, "duplicate_names": 0.20,
+    # 列名重复（如三列都叫"金额"）是强负信号：它几乎必然意味着选错了行，
+    # 因此惩罚要足以把分数压到阈值以下，而不是只扣一点点。
+    "data_above": 0.20, "duplicate_names": 0.25,
     "empty_headers": 0.30, "too_verbose": 0.20,
+    # 深度 >1 时，被并入表头的行如果出现长文本，大概率是首行数据被误吞
+    # （典型：PDF 表格第二行是"事项描述"这类长句），必须显著压低其分数。
+    "extension_looks_like_data": 0.10,
 }
+# 深度扩展行的单元格长度上限：表头单元格通常很短，数据描述往往超过该值。
+_MAX_EXTENSION_CELL_CHARS = 25
 _NUMBER_RE = re.compile(r"^[+-]?[\d,]+(\.\d+)?%?$")
 _MAX_SCAN_ROWS = 20
 _MAX_HEADER_DEPTH = 3
@@ -186,10 +196,33 @@ def score_candidate(sheet: SheetGrid, region: Region, start_row: int,
         penalties.append("empty_headers")
     if avg_len > 25:
         penalties.append("too_verbose")
+    # 只看"被扩展进来的行"：首行本身就是长文本的情况由 too_verbose 负责。
+    if depth > 1 and any(
+            len(_norm(cell.text)) > _MAX_EXTENSION_CELL_CHARS
+            for row in window[1:] for cell in row):
+        penalties.append("extension_looks_like_data")
+    # 首列是"序号/编号/项目号"这类行键时，下一行首格是纯数字几乎必然是数据行，
+    # 不是第二层表头。中文表格里这条信号非常稳定（Excel/PDF 都适用）。
+    if depth > 1:
+        first_header = _norm(window[0][0].text)
+        if (any(key in first_header for key in ("序号", "编号", "项目号", "项号"))
+                and any(_is_number(row[0].text) for row in window[1:])):
+            penalties.append("extension_looks_like_data")
 
-    score = sum(WEIGHTS[k] * features[k] for k in WEIGHTS) - sum(
-        PENALTIES[p] for p in penalties
-    )
+    # PDF 网格没有样式信息，style 恒为 0.5：它不提供区分度，却占着 14% 权重，
+    # 会把所有候选的分数整体压到阈值附近。无样式时按比例分摊给其余特征，
+    # 保证权重和仍为 1，且不同格式的分数可比。
+    weights = dict(WEIGHTS)
+    if not sheet.styles_available:
+        style_weight = weights.pop("style")
+        rest = sum(weights.values())
+        for key in weights:
+            weights[key] += style_weight * weights[key] / rest
+    # 位置先验：表头必然靠近表格顶部。没有这一项时，深层的"章节小标题行"
+    # 会拿到接近的分数，触发 margin_too_small 把正确表头否掉。
+    position_penalty = min(0.09, 0.015 * max(0, start_row - region.start_row))
+    score = sum(weights[k] * features[k] for k in weights) - sum(
+        PENALTIES[p] for p in penalties) - position_penalty
     return HeaderCandidate(
         start_row=start_row, depth=depth,
         confidence=max(0.0, min(1.0, score)),
@@ -227,7 +260,15 @@ def detect_header(sheet: SheetGrid, region: Region, settings: Settings) -> Heade
     if not candidates:
         return HeaderDecision(None, False, "no_candidates", [])
     top = candidates[0]
-    second = candidates[1].confidence if len(candidates) > 1 else 0.0
+    # margin 用来判断"表头起始行是否唯一"。同一 start_row 的 depth=1/2/3
+    # 是同一个假设的不同深度，不能用它来否掉 top——否则会出现
+    # "正确表头 0.803、它自己的两行版本 0.684，差 0.119 就拒绝"的荒谬结果。
+    # 深度选择由分数本身完成：更深的候选只有在明显更优时才会排到第一。
+    second = max(
+        (candidate.confidence for candidate in candidates[1:]
+         if candidate.start_row != top.start_row),
+        default=0.0,
+    )
     margin = top.confidence - second
     if top.confidence < settings.header_accept:
         return HeaderDecision(top, False, "low_confidence", candidates[:3])

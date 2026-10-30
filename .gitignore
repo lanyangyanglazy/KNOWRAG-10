@@ -32,6 +32,10 @@ web_index/
 # Runtime audit log (contains demo questions/answers, do not commit)
 logs/
 
+# Downloaded public test corpus and ingest object storage (local only)
+data/public_samples/
+data/uploads/
+
 # Local agent working notes (not part of the project)
 .workbuddy/
 

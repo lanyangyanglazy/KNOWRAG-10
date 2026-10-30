@@ -339,7 +339,8 @@ def _corpus_stats(service) -> dict:
             stats = stats_fn()
             return {
                 key: stats[key]
-                for key in ("docs", "chunks", "embed_model", "llm_model", "max_distance")
+                for key in ("docs", "chunks", "embed_model", "llm_model", "max_distance",
+                            "chunk_profile", "chunks_by_type")
                 if key in stats
             }
         except Exception:  # 服务未就绪时退回按切片估算，评测不该因此中断
@@ -351,11 +352,17 @@ def _corpus_stats(service) -> dict:
     }
 
 
-def _build_service(backend: str | None = None):
-    """构造真实的政务 RAG 服务（FAISS 需要 Ollama；pg 需要 PostgreSQL）。"""
+def _build_service(backend: str | None = None, profile: str | None = None):
+    """构造真实的政务 RAG 服务（FAISS 需要 Ollama；pg 需要 PostgreSQL）。
+
+    ``profile`` 只对 FAISS 后端生效：pg 的切片在入库时已经按当时的 profile
+    切好，改环境变量不会改变存量切片，需要重新入库才能对比。
+    """
     from app.rag_service import RagService
 
-    return RagService(backend=backend)
+    if backend == "pg" and profile:
+        print("⚠️ pg 后端的切片在入库时已确定，--profile 不会改变存量切片")
+    return RagService(backend=backend, chunk_profile=profile)
 
 
 def _validate_gold(cases: Sequence[EvalCase], service) -> list[str]:
@@ -386,6 +393,7 @@ def run(
     k: int = 5,
     save_baseline: bool = False,
     backend: str | None = None,
+    profile: str | None = None,
 ) -> tuple[int, dict | None, dict | None]:
     """
     跑一轮评测，返回 (退出码, 报告, 基线对比)。
@@ -401,7 +409,7 @@ def run(
         raise FileNotFoundError(f"基线报告不存在: {baseline_path}")
 
     cases = load_cases(cases_path)
-    service = service if service is not None else _build_service(backend)
+    service = service if service is not None else _build_service(backend, profile)
 
     problems = _validate_gold(cases, service)
     if problems:
@@ -421,6 +429,8 @@ def run(
             "cases_file": str(cases_path),
             "tolerance": tolerance,
             "backend": getattr(service, "backend", "faiss"),
+            "chunk_profile": getattr(
+                getattr(service, "chunk_profile", None), "profile_id", None) or profile,
         },
     )
 
@@ -456,6 +466,90 @@ def run(
     return 0, report, comparison
 
 
+def sweep(
+    profiles: Sequence[str],
+    *,
+    cases_path: str | Path = DEFAULT_CASES,
+    mode: str = "retrieval",
+    out_dir: str | Path | None = None,
+    k: int = 5,
+    tolerance: float = 0.03,
+    backend: str | None = None,
+) -> tuple[int, list[dict]]:
+    """逐个 profile 跑同一批用例，输出横向对比表。
+
+    这是"用数据定参数"的最小闭环：同一语料、同一用例、同一 embedding，
+    只改切片参数，看 Recall@K / MRR / 证据命中率怎么变。
+    """
+    base_out = Path(out_dir or DEFAULT_OUT_DIR)
+    rows: list[dict] = []
+    failed = False
+
+    for profile in profiles:
+        print(f"\n===== 切片 profile: {profile} =====")
+        code, report, _ = run(
+            cases_path=cases_path,
+            mode=mode,
+            out_dir=base_out / profile,
+            tolerance=tolerance,
+            k=k,
+            backend=backend,
+            profile=profile,
+        )
+        if code != 0 or report is None:
+            failed = True
+            rows.append({"profile": profile, "error": f"exit={code}"})
+            continue
+        metrics = report["metrics"]
+        corpus = report.get("corpus", {})
+        rows.append({
+            "profile": profile,
+            "docs": corpus.get("docs"),
+            "chunks": corpus.get("chunks"),
+            "evidence_recall": metrics["evidence_recall"],
+            "doc_recall": metrics["doc_recall"],
+            "mrr": metrics["mrr"],
+            "refusal_accuracy": metrics["refusal_accuracy"],
+            "false_refusal_rate": metrics["false_refusal_rate"],
+            "leaks": metrics["leaks"],
+            "p50_ms": metrics["latency_ms"]["p50"],
+            "p95_ms": metrics["latency_ms"]["p95"],
+            "failures": len(report.get("failures", [])),
+        })
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base_out.mkdir(parents=True, exist_ok=True)
+    json_path = base_out / f"profile-sweep-{stamp}.json"
+    md_path = base_out / f"profile-sweep-{stamp}.md"
+    json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lines = [
+        "# 切片 profile 对比",
+        "",
+        f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}",
+        f"- 用例：{cases_path}，模式：{mode}，Top-K={k}",
+        "",
+        "| profile | 文档 | 切片 | 证据命中 | 文档召回 | MRR | 拒答准确 | 误拒率 | 泄露 | p50 | p95 | 失败 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        if "error" in row:
+            lines.append(f"| {row['profile']} | - | - | - | - | - | - | - | - | - | - | {row['error']} |")
+            continue
+        lines.append(
+            f"| {row['profile']} | {row['docs']} | {row['chunks']} "
+            f"| {_pct(row['evidence_recall'])} | {_pct(row['doc_recall'])} "
+            f"| {_num(row['mrr'])} | {_pct(row['refusal_accuracy'])} "
+            f"| {_pct(row['false_refusal_rate'])} | {row['leaks']} "
+            f"| {_ms(row['p50_ms'])} | {_ms(row['p95_ms'])} | {row['failures']} |"
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print("\n" + "\n".join(lines))
+    print(f"\n📄 对比报告：{md_path}")
+    return (0 if not failed else 2), rows
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # Windows 控制台默认 GBK，中文报告摘要会 UnicodeEncodeError；统一切到 UTF-8
     for stream in (sys.stdout, sys.stderr):
@@ -473,9 +567,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--tolerance", type=float, default=0.03, help="允许的指标跌幅，默认 0.03")
     parser.add_argument("--backend", default=None, choices=["faiss", "pg"],
                         help="检索后端；不传时按 RETRIEVAL_BACKEND / INGEST_DB_URL 解析")
+    parser.add_argument("--profile", default=None,
+                        help="切片 profile（faiss 后端生效），如 p400 / p600 / legacy300")
+    parser.add_argument("--sweep", default=None,
+                        help="逗号分隔的 profile 列表，逐个跑并输出横向对比表，如 legacy300,p400,p600")
     parser.add_argument("--save-baseline", action="store_true",
                         help="把本次结果另存为基线（写在报告目录上一级，默认 evaluation/baseline.json）")
     args = parser.parse_args(argv)
+
+    if args.sweep:
+        profiles = [item.strip() for item in args.sweep.split(",") if item.strip()]
+        if not profiles:
+            parser.error("--sweep 至少需要一个 profile")
+        code, _ = sweep(
+            profiles,
+            cases_path=args.cases,
+            mode=args.mode,
+            out_dir=args.out,
+            tolerance=args.tolerance,
+            k=args.k,
+            backend=args.backend,
+        )
+        return code
 
     code, _, _ = run(
         cases_path=args.cases,
@@ -486,6 +599,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         k=args.k,
         save_baseline=args.save_baseline,
         backend=args.backend,
+        profile=args.profile,
     )
     return code
 

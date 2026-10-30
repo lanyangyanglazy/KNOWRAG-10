@@ -54,6 +54,18 @@ def _table_pdf(path, rows, *, top=100):
     _tables_pdf(path, [(top, rows)])
 
 
+def _paged_table_pdf(path, pages):
+    """每页一张同坐标表格，用于验证跨页续表的表头继承。"""
+    import pymupdf as fitz
+
+    doc = fitz.open()
+    for rows in pages:
+        page = doc.new_page()
+        _draw_table(page, 100, rows)
+    doc.save(path)
+    doc.close()
+
+
 def _template(columns_norm, names, *, relative_header_row=0):
     return {
         "id": "t1", "name": "测试模板", "scope_dept": None,
@@ -250,6 +262,30 @@ def test_llm_header_calls_capped_per_document(tmp_path):
     assert len(model.tables()) == 4
     assert llm.calls == 3
     assert sum(w.code == "ambiguous_header" for w in model.warnings) == 3
+
+
+def test_continuation_page_inherits_header(tmp_path):
+    # 长表跨页时，表头只在第一页出现；续页必须沿用第一页的列名，
+    # 否则检测列名会退化成 列1..列N，检索与引用都失去语义。
+    path = tmp_path / "continued.pdf"
+    # 用 ASCII 文本：测试 PDF 使用 helv 字体，中文需要 china-s 才能正确嵌入/提取。
+    header = ["No", "Dept", "Amount"]
+    _paged_table_pdf(path, [
+        [header, ["1", "HR", "120"], ["2", "Finance", "98"]],
+        [["3", "Audit", "150"], ["4", "Office", "80"]],
+        [["5", "Legal", "60"], ["6", "Admin", "70"]],
+    ])
+
+    model = PdfParser().parse(path)
+    tables = model.tables()
+    assert len(tables) == 3
+    assert tables[0].header_rows == [1]
+    assert [c.name for c in tables[0].columns] == header
+    for continuation in tables[1:]:
+        assert continuation.header_rows == []
+        assert [c.name for c in continuation.columns] == header
+        assert "header_inherited" in continuation.flags
+    assert not any(w.code == "table_no_header" for w in model.warnings)
 
 
 def test_table_failure_is_isolated(tmp_path):

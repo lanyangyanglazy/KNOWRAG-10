@@ -169,8 +169,15 @@ def build_table(sheet: SheetGrid, region: Region, header: HeaderCandidate | None
             code="ambiguous_header", detail="列名重复，已加后缀区分"))
 
     if header is None:
-        warnings.append(Warning(
-            code="table_no_header", detail="未识别到表头，使用列1..列N"))
+        if forced_columns:
+            # 跨页续表：本页没有表头行，但列名沿用上一页，必须与"完全没表头"区分开，
+            # 否则复核台会把可信的续表当成异常，检索侧也丢失列名。
+            warnings.append(Warning(
+                code="header_inherited",
+                detail="本页无表头行，列名沿用上一页同列数表格"))
+        else:
+            warnings.append(Warning(
+                code="table_no_header", detail="未识别到表头，使用列1..列N"))
     if sheet.merges:
         warnings.append(Warning(
             code="merged_cells", detail=f"{len(sheet.merges)} 个合并区间"))
@@ -180,6 +187,10 @@ def build_table(sheet: SheetGrid, region: Region, header: HeaderCandidate | None
     if forced_columns and header:
         source = "template"
         confidence = 0.95
+    elif forced_columns:
+        # 继承表头：列名可信，但本页没有表头行可核对，置信度低于自动识别。
+        source = "template"
+        confidence = 0.60
     if repeated_rows:
         confidence = min(confidence, 0.7)
 
